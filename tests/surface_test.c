@@ -85,6 +85,16 @@ static const char *PROG =
 "    %r = vadd v4i32 %v, %s\n"
 "    %x = vextract i32 %r, 2\n"
 "    ret %x\n"
+"}\n"
+"\n"
+"fn maybe_set(ptr, i32, i1) -> void {\n"
+"  entry(dst: ptr, val: i32, flag: i1):\n"
+"    condbr flag, set(dst, val), skip()\n"
+"  set(dst: ptr, val: i32):\n"
+"    store i32 dst, val\n"
+"    ret\n"
+"  skip():\n"
+"    ret\n"
 "}\n";
 
 static int failures = 0;
@@ -132,8 +142,33 @@ int main(void) {
         rv.lanes = lb[0] + 16;
         if (interp_call(it, "vfirst", av, 1, &rv) != 0) { printf("FAIL vfirst\n"); failures++; }
         else if (rv.lanes[0] != 303) { printf("FAIL vfirst: got %llu want 303\n", (unsigned long long)rv.lanes[0]); failures++; }
+        /* maybe_set: its set block ends in a bare ret with another
+         * block after it (regression: that ret once swallowed the
+         * following block's label and the parse failed) */
+        img[0] = 7;
+        av[0].lanes[0] = base; av[1].lanes[0] = 123; av[2].lanes[0] = 1;
+        if (interp_call(it, "maybe_set", av, 3, NULL) != 0) { printf("FAIL maybe_set interp\n"); failures++; }
+        else if (img[0] != 123) { printf("FAIL maybe_set set: got %u want 123\n", img[0]); failures++; }
+        av[0].lanes[0] = base; av[1].lanes[0] = 999; av[2].lanes[0] = 0;
+        if (interp_call(it, "maybe_set", av, 3, NULL) != 0) { printf("FAIL maybe_set interp 2\n"); failures++; }
+        else if (img[0] != 123) { printf("FAIL maybe_set skip: got %u want 123\n", img[0]); failures++; }
     }
     interp_free(it);
+    /* a condbr to a block that does not exist is a parse error,
+     * never a crash (regression: the target block was dereferenced
+     * before the lookup was checked) */
+    {
+        static const char *BAD =
+        "fn f(i32) -> i32 {\n"
+        "  entry(n: i32):\n"
+        "    %c = icmp.sgt i32 n, 0\n"
+        "    condbr %c, nowhere(n), done(n)\n"
+        "  done(n: i32):\n"
+        "    ret n\n"
+        "}\n";
+        Module *bm = surface_parse(BAD, err, sizeof err);
+        if (bm) { printf("FAIL badcondbr: missing block accepted\n"); failures++; mod_free(bm); }
+    }
     /* binary round-trip */
     size_t blen; uint8_t *bytes = mod_encode(m, &blen);
     Module *m2 = mod_decode(bytes, blen, err, sizeof err);
