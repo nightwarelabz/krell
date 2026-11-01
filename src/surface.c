@@ -42,6 +42,10 @@ typedef struct {
     /* queued function bodies, parsed after all shells exist */
     struct { int fi; const char *start, *end; } bodies[256];
     int nbodies;
+    /* function signatures captured at shell (header) parse time, so a call
+       can be typed before the callee's body has been parsed (forward refs) */
+    Type fsig_params[256][16];
+    int fsig_nparams[256];
 } P;
 
 static void perr(P *p, const char *msg) {
@@ -275,7 +279,7 @@ static bool parse_instr(P *p, Func *f, int blk) {
         /* args */
         const Type *ps; int np;
         if (ext) { ps = p->m->exts[ci].params; np = p->m->exts[ci].nparams; }
-        else { ps = p->m->funcs[ci].blocks[0].arg_types; np = p->m->funcs[ci].blocks[0].nargs; }
+        else { ps = p->fsig_params[ci]; np = p->fsig_nparams[ci]; }
         if (!eat_ch(p, '(')) { perr(p, "call ("); return false; }
         int32_t *args = NULL; int n = 0;
         skip_ws(p);
@@ -454,7 +458,7 @@ static bool parse_instr(P *p, Func *f, int blk) {
         if (ci < 0) { perr(p, "unknown callee"); return false; }
         const Type *ps; int np;
         if (ext) { ps = p->m->exts[ci].params; np = p->m->exts[ci].nparams; }
-        else { ps = p->m->funcs[ci].blocks[0].arg_types; np = p->m->funcs[ci].blocks[0].nargs; }
+        else { ps = p->fsig_params[ci]; np = p->fsig_nparams[ci]; }
         if (!eat_ch(p, '(')) { perr(p, "call ("); return false; }
         int32_t *args = NULL; int n = 0;
         skip_ws(p);
@@ -662,11 +666,13 @@ static bool parse_fn_header(P *p) {
     char name[64];
     if (!word(p, name, sizeof name)) { perr(p, "fn name"); return false; }
     if (!eat_ch(p, '(')) { perr(p, "fn ("); return false; }
+    Type pts[16]; int npt = 0;
     skip_ws(p);
     if (*p->p != ')') {
         for (;;) {
             Type t;
             if (!parse_type(p, &t)) return false;
+            if (npt < 16) pts[npt++] = t;
             if (!eat_ch(p, ',')) break;
         }
     }
@@ -677,6 +683,10 @@ static bool parse_fn_header(P *p) {
     Func *f = mod_add_func(p->m, name, rt, 0);
     int fi = p->m->nfuncs - 1;
     (void)f;
+    if (fi < 256) {
+        p->fsig_nparams[fi] = npt;
+        for (int i = 0; i < npt; i++) p->fsig_params[fi][i] = pts[i];
+    }
     /* body span: to the matching close brace */
     const char *start = p->p;
     const char *q = start;
