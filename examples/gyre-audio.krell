@@ -1,0 +1,151 @@
+; GYRE - SOUND
+; The sound of the dive, synthesized in Krell.
+;
+; A drone that turns with the picture. Two root oscillators at
+; 55 Hz and 55.11 Hz beat slowly against each other, a fifth at
+; 82.5 Hz holds the body, and a high partial at 554.37 Hz fades
+; in as the dive deepens, trembling at half a hertz. A whisper of
+; lowpassed noise grows with depth, like air getting thinner.
+; The whole score attacks over the first second and releases
+; over the last two.
+;
+; Krell has no sine in its op menu, so ksin is a Taylor
+; polynomial evaluated on phases the loop keeps wrapped to
+; [-pi, pi]. Envelopes are clamps and rational forms.
+;
+; Host services: write, malloc, free. Nothing else computes.
+; Output is raw PCM on stdout: 44100 Hz, mono, signed 16 bit
+; little endian, 12 seconds, 529200 samples.
+;
+; main: no arguments
+
+extern write(i32, ptr, i64) -> i64
+extern malloc(i64) -> ptr
+extern free(ptr) -> void
+
+fn rng(i64) -> i64 {
+  entry(s: i64):
+    %a = shl i64 s, 13
+    %b = xor i64 s, %a
+    %c = lshr i64 %b, 7
+    %d = xor i64 %b, %c
+    %e = shl i64 %d, 17
+    %f = xor i64 %d, %e
+    ret %f
+}
+
+fn unif(i64) -> f64 {
+  entry(s: i64):
+    %t = lshr i64 s, 11
+    %u = uitofp f64 %t
+    %r = fmul f64 %u, 0.00000000000000011102230246251565
+    ret %r
+}
+
+fn clamp01(f64) -> f64 {
+  entry(v: f64):
+    %lo = fcmp.olt f64 v, 0.0
+    %a = select f64 %lo, 0.0, v
+    %hi = fcmp.ogt f64 %a, 1.0
+    %b = select f64 %hi, 1.0, %a
+    ret %b
+}
+
+fn ksin(f64) -> f64 {
+  entry(x: f64):
+    %x2 = fmul f64 x, x
+    %c0 = fma f64 0.0000027557319223985893, %x2, -0.00019841269841269842
+    %c1 = fma f64 %c0, %x2, 0.008333333333333334
+    %c2 = fma f64 %c1, %x2, -0.16666666666666666
+    %c3 = fma f64 %c2, %x2, 1.0
+    %r = fmul f64 %c3, x
+    ret %r
+}
+
+fn main(i32, ptr) -> i32 {
+  entry(argc: i32, argv: ptr):
+    %one = iconst i64 1
+    %z32 = iconst i32 0
+    %o32 = iconst i32 1
+    %buf = call ptr malloc(1058400)
+    %pa = bitcast i64 %buf
+    %ok = icmp.ne i64 %pa, 0
+    condbr %ok, sloop(0, 2463534247765468713, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, %buf), fail()
+  sloop(n: i64, st: i64, pa: f64, pb: f64, pc: f64, pd: f64, pl: f64, lp: f64, buf: ptr):
+    %done = icmp.sge i64 n, 529200
+    condbr %done, finish(buf), sbody(n, st, pa, pb, pc, pd, pl, lp, buf)
+  sbody(n: i64, st: i64, pa: f64, pb: f64, pc: f64, pd: f64, pl: f64, lp: f64, buf: ptr):
+    %fn = sitofp f64 n
+    %t = fmul f64 %fn, 0.000022675736961451248
+    %depth = fmul f64 %t, 0.08333333333333333
+    ; root pair, beating
+    %pa1 = fadd f64 pa, 0.007836172151811284
+    %oa = fcmp.ogt f64 %pa1, 3.141592653589793
+    %pa2 = fadd f64 %pa1, -6.283185307179586
+    %pan = select f64 %oa, %pa2, %pa1
+    %va = call f64 ksin(%pan)
+    %pb1 = fadd f64 pb, 0.007851844496014907
+    %ob = fcmp.ogt f64 %pb1, 3.141592653589793
+    %pb2 = fadd f64 %pb1, -6.283185307179586
+    %pbn = select f64 %ob, %pb2, %pb1
+    %vb = call f64 ksin(%pbn)
+    %root = fadd f64 %va, %vb
+    %root2 = fmul f64 %root, 0.24
+    ; fifth
+    %pc1 = fadd f64 pc, 0.011754258227716926
+    %oc = fcmp.ogt f64 %pc1, 3.141592653589793
+    %pc2 = fadd f64 %pc1, -6.283185307179586
+    %pcn = select f64 %oc, %pc2, %pc1
+    %vc = call f64 ksin(%pcn)
+    %fifth = fmul f64 %vc, 0.15
+    ; shimmer: gain grows with depth, trembles at 0.5 Hz
+    %pd1 = fadd f64 pd, 0.07898434102036149
+    %od = fcmp.ogt f64 %pd1, 3.141592653589793
+    %pd2 = fadd f64 %pd1, -6.283185307179586
+    %pdn = select f64 %od, %pd2, %pd1
+    %vd = call f64 ksin(%pdn)
+    %pl1 = fadd f64 pl, 0.00007123792865282986
+    %ol = fcmp.ogt f64 %pl1, 3.141592653589793
+    %pl2 = fadd f64 %pl1, -6.283185307179586
+    %pln = select f64 %ol, %pl2, %pl1
+    %vl = call f64 ksin(%pln)
+    %tr0 = fma f64 0.15, %vl, 0.85
+    %sg0 = fma f64 0.1, %depth, 0.02
+    %sg = fmul f64 %sg0, %depth
+    %shim0 = fmul f64 %vd, %sg
+    %shim = fmul f64 %shim0, %tr0
+    ; whisper: lowpassed noise, growing with depth
+    %s1 = call i64 rng(st)
+    %un = call f64 unif(%s1)
+    %w = fma f64 2.0, %un, -1.0
+    %ld = fsub f64 %w, lp
+    %lp2 = fma f64 0.06, %ld, lp
+    %ng = fmul f64 %depth, 0.035
+    %noise = fmul f64 %lp2, %ng
+    ; master envelope: attack 1.2 s, release over the last 2 s
+    %at0 = fmul f64 %t, 0.8333333333333334
+    %atk = call f64 clamp01(%at0)
+    %rem = fsub f64 12.0, %t
+    %rel0 = fmul f64 %rem, 0.5
+    %rel = call f64 clamp01(%rel0)
+    %menv = fmul f64 %atk, %rel
+    %mix = fadd f64 %root2, %fifth
+    %mix2 = fadd f64 %mix, %shim
+    %mix3 = fadd f64 %mix2, %noise
+    %mm = fmul f64 %mix3, %menv
+    %am = fabs f64 %mm
+    %dn = fadd f64 %am, 1.0
+    %y = fdiv f64 %mm, %dn
+    %sc = fmul f64 %y, 24000.0
+    %sv = fptosi i16 %sc
+    %addr = gep i16 buf, n
+    store i16 %addr, %sv
+    %n2 = add i64 n, 1
+    br sloop(%n2, %s1, %pan, %pbn, %pcn, %pdn, %pln, %lp2, buf)
+  finish(buf: ptr):
+    %wr = call i64 write(1, buf, 1058400)
+    call void free(buf)
+    ret 0
+  fail():
+    ret 1
+}
