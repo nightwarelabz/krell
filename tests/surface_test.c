@@ -169,6 +169,53 @@ int main(void) {
         Module *bm = surface_parse(BAD, err, sizeof err);
         if (bm) { printf("FAIL badcondbr: missing block accepted\n"); failures++; mod_free(bm); }
     }
+    /* a call to a function defined later in the module resolves
+     * (regression: the callee's signature was read from its entry
+     * block, which does not exist until its body is parsed, and a
+     * forward reference segfaulted the parser). Mutual recursion
+     * exercises it in both directions. */
+    {
+        static const char *FWD =
+        "fn is_even(i32) -> i32 {\n"
+        "  entry(n: i32):\n"
+        "    %one = iconst i32 1\n"
+        "    %z = icmp.eq i32 n, 0\n"
+        "    condbr %z, yes(), no(n)\n"
+        "  yes():\n"
+        "    ret 1\n"
+        "  no(n: i32):\n"
+        "    %m = sub i32 n, 1\n"
+        "    %r = call i32 is_odd(%m)\n"
+        "    ret %r\n"
+        "}\n"
+        "fn is_odd(i32) -> i32 {\n"
+        "  entry(n: i32):\n"
+        "    %one = iconst i32 1\n"
+        "    %z = icmp.eq i32 n, 0\n"
+        "    condbr %z, no2(), yes2(n)\n"
+        "  no2():\n"
+        "    ret 0\n"
+        "  yes2(n: i32):\n"
+        "    %m = sub i32 n, 1\n"
+        "    %r = call i32 is_even(%m)\n"
+        "    ret %r\n"
+        "}\n";
+        Module *fm = surface_parse(FWD, err, sizeof err);
+        if (!fm) { printf("FAIL fwdref parse: %s\n", err); failures++; }
+        else {
+            const char *fve = mod_verify(fm);
+            if (fve) { printf("FAIL fwdref verify: %s\n", fve); failures++; }
+            else {
+                Interp *fit = interp_new(fm);
+                check(fit, "is_even", (uint64_t[]){ 10 }, 1, 1);
+                check(fit, "is_even", (uint64_t[]){ 7 }, 1, 0);
+                check(fit, "is_odd", (uint64_t[]){ 7 }, 1, 1);
+                check(fit, "is_odd", (uint64_t[]){ 10 }, 1, 0);
+                interp_free(fit);
+            }
+            mod_free(fm);
+        }
+    }
     /* binary round-trip */
     size_t blen; uint8_t *bytes = mod_encode(m, &blen);
     Module *m2 = mod_decode(bytes, blen, err, sizeof err);
