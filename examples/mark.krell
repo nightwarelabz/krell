@@ -1,0 +1,469 @@
+; THE MARK
+; The Krell symbol, rendered by Krell.
+;
+; Five glossy nodes joined by chrome tubes, spelling K as a graph:
+; a stem, a red junction (the root), and two arms. The geometry and
+; the shading recipe are the lab mark's own: per pixel sphere
+; normals, Blinn specular, cylinder gradient tubes, light from the
+; upper left, two by two supersampling.
+;
+; Krell has no square root in its op menu, so the program derives
+; one: ksqrt is Newton's method carried out in Krell arithmetic.
+; The specular powers (60 and 90) are built by repeated squaring.
+;
+; Host services: write, atoi, malloc, free. Nothing else computes.
+; Output is one raw RGBA frame, 1200 x 1200, on stdout.
+;
+; main: [mode]  0 = transparent background (default)
+;               1 = on near-black, with an analytic soft shadow
+
+extern write(i32, ptr, i64) -> i64
+extern atoi(ptr) -> i32
+extern malloc(i64) -> ptr
+extern free(ptr) -> void
+
+fn ksqrt(f64) -> f64 {
+  entry(a: f64):
+    %neg = fcmp.olt f64 a, 0.0
+    %ac = select f64 %neg, 0.0, a
+    %big = fcmp.ogt f64 %ac, 1.0
+    %seed = select f64 %big, %ac, 1.0
+    br it(6, %seed, %ac)
+  it(n: i64, x: f64, a: f64):
+    %q = fdiv f64 a, x
+    %s = fadd f64 x, %q
+    %x2 = fmul f64 %s, 0.5
+    %n2 = sub i64 n, 1
+    %more = icmp.sgt i64 %n2, 0
+    condbr %more, it(%n2, %x2, a), done(%x2, a)
+  done(x: f64, a: f64):
+    %zero = fcmp.oeq f64 a, 0.0
+    %r = select f64 %zero, 0.0, x
+    ret %r
+}
+
+fn clamp01(f64) -> f64 {
+  entry(v: f64):
+    %lo = fcmp.olt f64 v, 0.0
+    %a = select f64 %lo, 0.0, v
+    %hi = fcmp.ogt f64 %a, 1.0
+    %b = select f64 %hi, 1.0, %a
+    ret %b
+}
+
+fn pow60(f64) -> f64 {
+  entry(v: f64):
+    %v2 = fmul f64 v, v
+    %v4 = fmul f64 %v2, %v2
+    %v8 = fmul f64 %v4, %v4
+    %v16 = fmul f64 %v8, %v8
+    %v32 = fmul f64 %v16, %v16
+    %a = fmul f64 %v32, %v16
+    %b = fmul f64 %a, %v8
+    %c = fmul f64 %b, %v4
+    ret %c
+}
+
+fn pow90(f64) -> f64 {
+  entry(v: f64):
+    %v2 = fmul f64 v, v
+    %v4 = fmul f64 %v2, %v2
+    %v8 = fmul f64 %v4, %v4
+    %v16 = fmul f64 %v8, %v8
+    %v32 = fmul f64 %v16, %v16
+    %v64 = fmul f64 %v32, %v32
+    %a = fmul f64 %v64, %v16
+    %b = fmul f64 %a, %v8
+    %c = fmul f64 %b, %v2
+    ret %c
+}
+
+; Distance from (px, py) to segment (ax, ay)-(bx, by); len2 = |b-a|^2.
+fn dseg(f64, f64, f64, f64, f64, f64, f64) -> f64 {
+  entry(px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64, len2: f64):
+    %dx = fsub f64 bx, ax
+    %dy = fsub f64 by, ay
+    %ex = fsub f64 px, ax
+    %ey = fsub f64 py, ay
+    %n1 = fmul f64 %ex, %dx
+    %n2 = fmul f64 %ey, %dy
+    %num = fadd f64 %n1, %n2
+    %t0 = fdiv f64 %num, len2
+    %t = call f64 clamp01(%t0)
+    %cx = fma f64 %t, %dx, ax
+    %cy = fma f64 %t, %dy, ay
+    %ox = fsub f64 px, %cx
+    %oy = fsub f64 py, %cy
+    %o2 = fmul f64 %ox, %ox
+    %o3 = fmul f64 %oy, %oy
+    %o4 = fadd f64 %o2, %o3
+    %d = call f64 ksqrt(%o4)
+    ret %d
+}
+
+; Background layer into out[0..3].
+; Mode 0: transparent. Mode 1: (8, 8, 11) darkened by the mark's
+; silhouette, sampled at the shadow offset (10, 16), softened by a
+; 28 unit distance falloff at 55 percent strength.
+fn bgcol(f64, f64, i64, ptr) -> void {
+  entry(x: f64, y: f64, bgmode: i64, out: ptr):
+    %g0 = iconst i64 0
+    %g1 = iconst i64 1
+    %g2 = iconst i64 2
+    %g3 = iconst i64 3
+    %zm = icmp.eq i64 bgmode, 0
+    condbr %zm, clear(out), dark(x, y, out)
+  clear(out: ptr):
+    %a0 = gep f64 out, 0
+    store f64 %a0, 0.0
+    %a1 = gep f64 out, 1
+    store f64 %a1, 0.0
+    %a2 = gep f64 out, 2
+    store f64 %a2, 0.0
+    %a3 = gep f64 out, 3
+    store f64 %a3, 0.0
+    br done()
+  dark(x: f64, y: f64, out: ptr):
+    %sx = fadd f64 x, -10.0
+    %sy = fadd f64 y, -16.0
+    %t0 = call f64 dseg(%sx, %sy, 380.0, 290.0, 380.0, 910.0, 384400.0)
+    %e0 = fadd f64 %t0, -30.0
+    %t1 = call f64 dseg(%sx, %sy, 380.0, 600.0, 830.0, 250.0, 325000.0)
+    %e1 = fadd f64 %t1, -30.0
+    %t2 = call f64 dseg(%sx, %sy, 380.0, 600.0, 850.0, 950.0, 343400.0)
+    %e2 = fadd f64 %t2, -30.0
+    %n0x = fsub f64 %sx, 380.0
+    %n0y = fsub f64 %sy, 290.0
+    %n0a = fmul f64 %n0x, %n0x
+    %n0b = fmul f64 %n0y, %n0y
+    %n0c = fadd f64 %n0a, %n0b
+    %n0 = call f64 ksqrt(%n0c)
+    %v0 = fadd f64 %n0, -84.0
+    %n1x = fsub f64 %sx, 380.0
+    %n1y = fsub f64 %sy, 600.0
+    %n1a = fmul f64 %n1x, %n1x
+    %n1b = fmul f64 %n1y, %n1y
+    %n1c = fadd f64 %n1a, %n1b
+    %n1 = call f64 ksqrt(%n1c)
+    %v1 = fadd f64 %n1, -94.0
+    %n2x = fsub f64 %sx, 380.0
+    %n2y = fsub f64 %sy, 910.0
+    %n2a = fmul f64 %n2x, %n2x
+    %n2b = fmul f64 %n2y, %n2y
+    %n2c = fadd f64 %n2a, %n2b
+    %n2 = call f64 ksqrt(%n2c)
+    %v2 = fadd f64 %n2, -84.0
+    %n3x = fsub f64 %sx, 830.0
+    %n3y = fsub f64 %sy, 250.0
+    %n3a = fmul f64 %n3x, %n3x
+    %n3b = fmul f64 %n3y, %n3y
+    %n3c = fadd f64 %n3a, %n3b
+    %n3 = call f64 ksqrt(%n3c)
+    %v3 = fadd f64 %n3, -84.0
+    %n4x = fsub f64 %sx, 850.0
+    %n4y = fsub f64 %sy, 950.0
+    %n4a = fmul f64 %n4x, %n4x
+    %n4b = fmul f64 %n4y, %n4y
+    %n4c = fadd f64 %n4a, %n4b
+    %n4 = call f64 ksqrt(%n4c)
+    %v4 = fadd f64 %n4, -84.0
+    %m01 = fcmp.olt f64 %e0, %e1
+    %mm0 = select f64 %m01, %e0, %e1
+    %m02 = fcmp.olt f64 %mm0, %e2
+    %mm1 = select f64 %m02, %mm0, %e2
+    %m03 = fcmp.olt f64 %mm1, %v0
+    %mm2 = select f64 %m03, %mm1, %v0
+    %m04 = fcmp.olt f64 %mm2, %v1
+    %mm3 = select f64 %m04, %mm2, %v1
+    %m05 = fcmp.olt f64 %mm3, %v2
+    %mm4 = select f64 %m05, %mm3, %v2
+    %m06 = fcmp.olt f64 %mm4, %v3
+    %mm5 = select f64 %m06, %mm4, %v3
+    %m07 = fcmp.olt f64 %mm5, %v4
+    %d = select f64 %m07, %mm5, %v4
+    %f0 = fdiv f64 %d, 28.0
+    %f1 = fsub f64 1.0, %f0
+    %sh = call f64 clamp01(%f1)
+    %k = fmul f64 %sh, 0.55
+    %keep = fsub f64 1.0, %k
+    %r = fmul f64 0.0313725, %keep
+    %g = fmul f64 0.0313725, %keep
+    %b = fmul f64 0.0431373, %keep
+    %a0 = gep f64 out, 0
+    store f64 %a0, %r
+    %a1 = gep f64 out, 1
+    store f64 %a1, %g
+    %a2 = gep f64 out, 2
+    store f64 %a2, %b
+    %a3 = gep f64 out, 3
+    store f64 %a3, 1.0
+    br done()
+  done():
+    ret
+}
+
+; One chrome tube, radius 30, painted over out when the sample is
+; inside. (x, y, ax, ay, bx, by, len2, len, out)
+fn tube(f64, f64, f64, f64, f64, f64, f64, f64, ptr) -> void {
+  entry(x: f64, y: f64, ax: f64, ay: f64, bx: f64, by: f64, len2: f64, len: f64, out: ptr):
+    %dx = fsub f64 bx, ax
+    %dy = fsub f64 by, ay
+    %ex = fsub f64 x, ax
+    %ey = fsub f64 y, ay
+    %n1 = fmul f64 %ex, %dx
+    %n2 = fmul f64 %ey, %dy
+    %num = fadd f64 %n1, %n2
+    %t0 = fdiv f64 %num, len2
+    %t = call f64 clamp01(%t0)
+    %cx = fma f64 %t, %dx, ax
+    %cy = fma f64 %t, %dy, ay
+    %ox = fsub f64 x, %cx
+    %oy = fsub f64 y, %cy
+    %o2 = fmul f64 %ox, %ox
+    %o3 = fmul f64 %oy, %oy
+    %o4 = fadd f64 %o2, %o3
+    %dist = call f64 ksqrt(%o4)
+    %inside = fcmp.ole f64 %dist, 30.0
+    %nx0 = fneg f64 %dy
+    %nx = fdiv f64 %nx0, len
+    %ny = fdiv f64 %dx, len
+    %s1 = fmul f64 %ox, %nx
+    %s2 = fmul f64 %oy, %ny
+    %s3 = fadd f64 %s1, %s2
+    %s = fdiv f64 %s3, 30.0
+    %z1 = fmul f64 %s, %s
+    %z2 = fsub f64 1.0, %z1
+    %nz = call f64 ksqrt(%z2)
+    %nnx = fmul f64 %nx, %s
+    %nny = fmul f64 %ny, %s
+    %d1 = fmul f64 %nnx, -0.451129
+    %d2 = fmul f64 %nny, -0.551381
+    %d3 = fmul f64 %nz, 0.701757
+    %d4 = fadd f64 %d1, %d2
+    %d5 = fadd f64 %d4, %d3
+    %diff = call f64 clamp01(%d5)
+    %h1 = fmul f64 %nnx, -0.244527
+    %h2 = fmul f64 %nny, -0.298858
+    %h3 = fmul f64 %nz, 0.922373
+    %h4 = fadd f64 %h1, %h2
+    %h5 = fadd f64 %h4, %h3
+    %ndh = call f64 clamp01(%h5)
+    %sp0 = call f64 pow60(%ndh)
+    %spec = fmul f64 %sp0, 0.9
+    %sh0 = fmul f64 %diff, 0.75
+    %shade = fadd f64 0.25, %sh0
+    %r0 = fmul f64 0.62, %shade
+    %r = fadd f64 %r0, %spec
+    %g0 = fmul f64 0.66, %shade
+    %g = fadd f64 %g0, %spec
+    %b0 = fmul f64 0.72, %shade
+    %b = fadd f64 %b0, %spec
+    %a0 = gep f64 out, 0
+    %cr = load f64, %a0
+    %nr = select f64 %inside, %r, %cr
+    store f64 %a0, %nr
+    %a1 = gep f64 out, 1
+    %cg = load f64, %a1
+    %ng = select f64 %inside, %g, %cg
+    store f64 %a1, %ng
+    %a2 = gep f64 out, 2
+    %cb = load f64, %a2
+    %nb = select f64 %inside, %b, %cb
+    store f64 %a2, %nb
+    %a3 = gep f64 out, 3
+    %ca = load f64, %a3
+    %na = select f64 %inside, 1.0, %ca
+    store f64 %a3, %na
+    ret
+}
+
+; One glossy ball. (x, y, cx, cy, rad, base r, base g, base b, out)
+fn ball(f64, f64, f64, f64, f64, f64, f64, f64, ptr) -> void {
+  entry(x: f64, y: f64, cx: f64, cy: f64, rad: f64, br: f64, bgc: f64, bb: f64, out: ptr):
+    %ex = fsub f64 x, cx
+    %fx = fdiv f64 %ex, rad
+    %ey = fsub f64 y, cy
+    %fy = fdiv f64 %ey, rad
+    %f2 = fmul f64 %fx, %fx
+    %f3 = fmul f64 %fy, %fy
+    %d2 = fadd f64 %f2, %f3
+    %inside = fcmp.ole f64 %d2, 1.0
+    %z1 = fsub f64 1.0, %d2
+    %nz = call f64 ksqrt(%z1)
+    %d1 = fmul f64 %fx, -0.451129
+    %d2b = fmul f64 %fy, -0.551381
+    %d3 = fmul f64 %nz, 0.701757
+    %d4 = fadd f64 %d1, %d2b
+    %d5 = fadd f64 %d4, %d3
+    %diff = call f64 clamp01(%d5)
+    %h1 = fmul f64 %fx, -0.244527
+    %h2 = fmul f64 %fy, -0.298858
+    %h3 = fmul f64 %nz, 0.922373
+    %h4 = fadd f64 %h1, %h2
+    %h5 = fadd f64 %h4, %h3
+    %ndh = call f64 clamp01(%h5)
+    %spec = call f64 pow90(%ndh)
+    %rm0 = fsub f64 1.0, %nz
+    %rm1 = fmul f64 %rm0, %rm0
+    %rm2 = fmul f64 %rm1, %rm0
+    %rim = fmul f64 %rm2, 0.25
+    %sh0 = fmul f64 %diff, 0.85
+    %shade = fadd f64 0.18, %sh0
+    %r0 = fmul f64 br, %shade
+    %r1 = fadd f64 %r0, %spec
+    %r2 = fmul f64 %rim, 0.4
+    %r = fadd f64 %r1, %r2
+    %g0 = fmul f64 bgc, %shade
+    %g1 = fadd f64 %g0, %spec
+    %g2 = fmul f64 %rim, 0.45
+    %g = fadd f64 %g1, %g2
+    %b0 = fmul f64 bb, %shade
+    %b1 = fadd f64 %b0, %spec
+    %b2 = fmul f64 %rim, 0.55
+    %b = fadd f64 %b1, %b2
+    %a0 = gep f64 out, 0
+    %cr = load f64, %a0
+    %nr = select f64 %inside, %r, %cr
+    store f64 %a0, %nr
+    %a1 = gep f64 out, 1
+    %cg = load f64, %a1
+    %ng = select f64 %inside, %g, %cg
+    store f64 %a1, %ng
+    %a2 = gep f64 out, 2
+    %cb = load f64, %a2
+    %nb = select f64 %inside, %b, %cb
+    store f64 %a2, %nb
+    %a3 = gep f64 out, 3
+    %ca = load f64, %a3
+    %na = select f64 %inside, 1.0, %ca
+    store f64 %a3, %na
+    ret
+}
+
+; Full sample: background, tubes, then balls on top.
+fn shade(f64, f64, i64, ptr) -> void {
+  entry(x: f64, y: f64, bgmode: i64, out: ptr):
+    %one = iconst i64 1
+    call void bgcol(x, y, bgmode, out)
+    call void tube(x, y, 380.0, 290.0, 380.0, 910.0, 384400.0, 620.0, out)
+    call void tube(x, y, 380.0, 600.0, 830.0, 250.0, 325000.0, 570.0877, out)
+    call void tube(x, y, 380.0, 600.0, 850.0, 950.0, 343400.0, 586.0034, out)
+    call void ball(x, y, 380.0, 290.0, 84.0, 0.92, 0.91, 0.87, out)
+    call void ball(x, y, 380.0, 600.0, 94.0, 0.88, 0.03, 0.0, out)
+    call void ball(x, y, 380.0, 910.0, 84.0, 0.92, 0.91, 0.87, out)
+    call void ball(x, y, 830.0, 250.0, 84.0, 0.92, 0.91, 0.87, out)
+    call void ball(x, y, 850.0, 950.0, 84.0, 0.92, 0.91, 0.87, out)
+    ret
+}
+
+fn main(i32, ptr) -> i32 {
+  entry(argc: i32, argv: ptr):
+    %one = iconst i64 1
+    %z32 = iconst i32 0
+    %o32 = iconst i32 1
+    %buf = call ptr malloc(5760000)
+    %out = call ptr malloc(32)
+    %pa = bitcast i64 %buf
+    %ok = icmp.ne i64 %pa, 0
+    condbr %ok, args(%buf, %out, argc, argv), fail()
+  args(buf: ptr, out: ptr, argc: i32, argv: ptr):
+    %has = icmp.sgt i32 argc, 1
+    condbr %has, arg1(buf, out, argv), noarg(0, buf, out)
+  arg1(buf: ptr, out: ptr, argv: ptr):
+    %p = gep ptr argv, 1
+    %s = load ptr, %p
+    %mv = call i32 atoi(%s)
+    %m64 = sext i64 %mv
+    br noarg(%m64, buf, out)
+  noarg(mode: i64, buf: ptr, out: ptr):
+    br rows(0, buf, out, mode)
+  rows(py: i64, buf: ptr, out: ptr, mode: i64):
+    %done = icmp.sge i64 py, 1200
+    condbr %done, finish(buf, out), rowbody(py, buf, out, mode)
+  rowbody(py: i64, buf: ptr, out: ptr, mode: i64):
+    br cols(0, py, buf, out, mode)
+  cols(px: i64, py: i64, buf: ptr, out: ptr, mode: i64):
+    %done = icmp.sge i64 px, 1200
+    condbr %done, rownext(py, buf, out, mode), pix(px, py, buf, out, mode)
+  rownext(py: i64, buf: ptr, out: ptr, mode: i64):
+    %py2 = add i64 py, 1
+    br rows(%py2, buf, out, mode)
+  pix(px: i64, py: i64, buf: ptr, out: ptr, mode: i64):
+    %fx = sitofp f64 px
+    %fy = sitofp f64 py
+    %x0 = fadd f64 %fx, 0.25
+    %x1 = fadd f64 %fx, 0.75
+    %y0 = fadd f64 %fy, 0.25
+    %y1 = fadd f64 %fy, 0.75
+    call void shade(%x0, %y0, mode, out)
+    %q0 = gep f64 out, 0
+    %s0r = load f64, %q0
+    %q1 = gep f64 out, 1
+    %s0g = load f64, %q1
+    %q2 = gep f64 out, 2
+    %s0b = load f64, %q2
+    %q3 = gep f64 out, 3
+    %s0a = load f64, %q3
+    call void shade(%x1, %y0, mode, out)
+    %s1r = load f64, %q0
+    %s1g = load f64, %q1
+    %s1b = load f64, %q2
+    %s1a = load f64, %q3
+    call void shade(%x0, %y1, mode, out)
+    %s2r = load f64, %q0
+    %s2g = load f64, %q1
+    %s2b = load f64, %q2
+    %s2a = load f64, %q3
+    call void shade(%x1, %y1, mode, out)
+    %s3r = load f64, %q0
+    %s3g = load f64, %q1
+    %s3b = load f64, %q2
+    %s3a = load f64, %q3
+    %tr = fadd f64 %s0r, %s1r
+    %tr2 = fadd f64 %tr, %s2r
+    %tr3 = fadd f64 %tr2, %s3r
+    %ar = fmul f64 %tr3, 0.25
+    %tg = fadd f64 %s0g, %s1g
+    %tg2 = fadd f64 %tg, %s2g
+    %tg3 = fadd f64 %tg2, %s3g
+    %ag = fmul f64 %tg3, 0.25
+    %tb = fadd f64 %s0b, %s1b
+    %tb2 = fadd f64 %tb, %s2b
+    %tb3 = fadd f64 %tb2, %s3b
+    %ab = fmul f64 %tb3, 0.25
+    %ta = fadd f64 %s0a, %s1a
+    %ta2 = fadd f64 %ta, %s2a
+    %ta3 = fadd f64 %ta2, %s3a
+    %aa = fmul f64 %ta3, 0.25
+    %vr = call f64 clamp01(%ar)
+    %vg = call f64 clamp01(%ag)
+    %vb = call f64 clamp01(%ab)
+    %va = call f64 clamp01(%aa)
+    %wr = fmul f64 %vr, 255.0
+    %rb = fptosi i32 %wr
+    %wg = fmul f64 %vg, 255.0
+    %gb = fptosi i32 %wg
+    %wb = fmul f64 %vb, 255.0
+    %bb = fptosi i32 %wb
+    %wa = fmul f64 %va, 255.0
+    %ab8 = fptosi i32 %wa
+    %sh1 = shl i32 %ab8, 24
+    %sh2 = shl i32 %bb, 16
+    %sh3 = shl i32 %gb, 8
+    %pk0 = or i32 %sh1, %sh2
+    %pk1 = or i32 %pk0, %sh3
+    %pack = or i32 %pk1, %rb
+    %row = mul i64 py, 1200
+    %idx = add i64 %row, px
+    %addr = gep i32 buf, %idx
+    store i32 %addr, %pack
+    %px2 = add i64 px, 1
+    br cols(%px2, py, buf, out, mode)
+  finish(buf: ptr, out: ptr):
+    %wr = call i64 write(1, buf, 5760000)
+    call void free(buf)
+    call void free(out)
+    ret 0
+  fail():
+    ret 1
+}
