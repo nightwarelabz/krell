@@ -40,12 +40,12 @@ typedef struct {
     char argarena[1 << 16];
     int argarena_len;
     /* queued function bodies, parsed after all shells exist */
-    struct { int fi; const char *start, *end; } bodies[256];
+    struct { int fi; const char *start, *end; } bodies[1024];
     int nbodies;
     /* function signatures captured at shell (header) parse time, so a call
        can be typed before the callee's body has been parsed (forward refs) */
-    Type fsig_params[256][16];
-    int fsig_nparams[256];
+    Type fsig_params[1024][16];
+    int fsig_nparams[1024];
 } P;
 
 static void perr(P *p, const char *msg) {
@@ -683,7 +683,7 @@ static bool parse_fn_header(P *p) {
     Func *f = mod_add_func(p->m, name, rt, 0);
     int fi = p->m->nfuncs - 1;
     (void)f;
-    if (fi < 256) {
+    if (fi < 1024) {
         p->fsig_nparams[fi] = npt;
         for (int i = 0; i < npt; i++) p->fsig_params[fi][i] = pts[i];
     }
@@ -698,7 +698,7 @@ static bool parse_fn_header(P *p) {
         q++;
     }
     if (depth != 0) { perr(p, "unterminated fn body"); return false; }
-    if (p->nbodies >= 256) { perr(p, "too many functions"); return false; }
+    if (p->nbodies >= 1024) { perr(p, "too many functions"); return false; }
     p->bodies[p->nbodies].fi = fi;
     p->bodies[p->nbodies].start = start;
     p->bodies[p->nbodies].end = q - 1;   /* the matching '}' */
