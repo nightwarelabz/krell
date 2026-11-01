@@ -1,0 +1,155 @@
+; BIG BANG - SOUND
+; The sound of the event, synthesized in Krell.
+;
+; Three layers, each a pure function of the sample clock plus a
+; little carried state:
+;   a sub oscillator whose pitch glides from 65 Hz down to 27 Hz
+;     while its envelope decays (the bang itself),
+;   white noise through a one pole lowpass whose cutoff sweeps
+;     down as the fireball cools (the crack becoming a rumble),
+;   two quiet sines at 220 and 330 Hz that fade in after three
+;     seconds and hang in the air (structure, arriving late).
+; Krell has no sine in its op menu, so ksin is a Taylor polynomial
+; evaluated on a phase the loop keeps wrapped to [-pi, pi].
+; Envelopes are rational decays, 1/(1+t): no exponentials either.
+;
+; Host services: write, malloc, free. Nothing else computes.
+; Output is raw PCM on stdout: 44100 Hz, mono, signed 16 bit
+; little endian, 10 seconds, 441000 samples.
+;
+; main: no arguments
+
+extern write(i32, ptr, i64) -> i64
+extern malloc(i64) -> ptr
+extern free(ptr) -> void
+
+fn rng(i64) -> i64 {
+  entry(s: i64):
+    %a = shl i64 s, 13
+    %b = xor i64 s, %a
+    %c = lshr i64 %b, 7
+    %d = xor i64 %b, %c
+    %e = shl i64 %d, 17
+    %f = xor i64 %d, %e
+    ret %f
+}
+
+fn unif(i64) -> f64 {
+  entry(s: i64):
+    %t = lshr i64 s, 11
+    %u = uitofp f64 %t
+    %r = fmul f64 %u, 0.00000000000000011102230246251565
+    ret %r
+}
+
+fn clamp01(f64) -> f64 {
+  entry(v: f64):
+    %lo = fcmp.olt f64 v, 0.0
+    %a = select f64 %lo, 0.0, v
+    %hi = fcmp.ogt f64 %a, 1.0
+    %b = select f64 %hi, 1.0, %a
+    ret %b
+}
+
+; Sine on [-pi, pi] by Taylor polynomial, Horner form:
+; x + x^3 (-1/6 + x^2 (1/120 + x^2 (-1/5040 + x^2 / 362880)))
+fn ksin(f64) -> f64 {
+  entry(x: f64):
+    %x2 = fmul f64 x, x
+    %c0 = fma f64 0.0000027557319223985893, %x2, -0.00019841269841269842
+    %c1 = fma f64 %c0, %x2, 0.008333333333333334
+    %c2 = fma f64 %c1, %x2, -0.16666666666666666
+    %c3 = fma f64 %c2, %x2, 1.0
+    %r = fmul f64 %c3, x
+    ret %r
+}
+
+fn main(i32, ptr) -> i32 {
+  entry(argc: i32, argv: ptr):
+    %one = iconst i64 1
+    %z32 = iconst i32 0
+    %o32 = iconst i32 1
+    %buf = call ptr malloc(882000)
+    %pa = bitcast i64 %buf
+    %ok = icmp.ne i64 %pa, 0
+    condbr %ok, sloop(0, 98765432123456789, 0.0, 0.0, 0.0, 0.0, %buf), fail()
+  sloop(n: i64, st: i64, phs: f64, lp: f64, ph1: f64, ph2: f64, buf: ptr):
+    %done = icmp.sge i64 n, 441000
+    condbr %done, finish(buf), sbody(n, st, phs, lp, ph1, ph2, buf)
+  sbody(n: i64, st: i64, phs: f64, lp: f64, ph1: f64, ph2: f64, buf: ptr):
+    %fn = sitofp f64 n
+    %t = fmul f64 %fn, 0.000022675736961451248
+    %atk0 = fmul f64 %t, 250.0
+    %atk = call f64 clamp01(%atk0)
+    ; sub oscillator: pitch glide 65 -> 27 Hz, rational decay
+    %fd = fma f64 2.2, %t, 1.0
+    %fq = fdiv f64 38.0, %fd
+    %freq = fadd f64 %fq, 27.0
+    %dph = fmul f64 %freq, 0.00014247585730565971
+    %phs1 = fadd f64 phs, %dph
+    %over = fcmp.ogt f64 %phs1, 3.141592653589793
+    %phs2 = fadd f64 %phs1, -6.283185307179586
+    %phs3 = select f64 %over, %phs2, %phs1
+    %sub = call f64 ksin(%phs3)
+    %ed = fma f64 1.4, %t, 1.0
+    %er = fdiv f64 1.0, %ed
+    %env = fmul f64 %er, %er
+    %env2 = fmul f64 %env, %atk
+    %subterm = fmul f64 %sub, %env2
+    %subterm2 = fmul f64 %subterm, 0.95
+    ; noise: white through a one pole lowpass, cutoff sweeping down
+    %s1 = call i64 rng(st)
+    %un = call f64 unif(%s1)
+    %w = fma f64 2.0, %un, -1.0
+    %ad = fma f64 3.0, %t, 1.0
+    %aq = fdiv f64 0.5, %ad
+    %alp = fadd f64 %aq, 0.02
+    %ld = fsub f64 %w, lp
+    %lp2 = fma f64 %alp, %ld, lp
+    %nd = fma f64 0.9, %t, 1.0
+    %nenv = fdiv f64 %atk, %nd
+    %nterm = fmul f64 %lp2, %nenv
+    %nterm2 = fmul f64 %nterm, 1.4
+    ; choir: 220 and 330 Hz, fading in after 3 s
+    %ph1a = fadd f64 ph1, 0.031344688607645135
+    %o1 = fcmp.ogt f64 %ph1a, 3.141592653589793
+    %ph1b = fadd f64 %ph1a, -6.283185307179586
+    %ph1n = select f64 %o1, %ph1b, %ph1a
+    %ph2a = fadd f64 ph2, 0.047017032911467704
+    %o2 = fcmp.ogt f64 %ph2a, 3.141592653589793
+    %ph2b = fadd f64 %ph2a, -6.283185307179586
+    %ph2n = select f64 %o2, %ph2b, %ph2a
+    %cd = fadd f64 %t, -3.0
+    %cm = fmul f64 %cd, 0.4
+    %fade = call f64 clamp01(%cm)
+    %late = fcmp.ogt f64 %t, 6.0
+    %lt = fadd f64 %t, -6.0
+    %ldq = fma f64 0.25, %lt, 1.0
+    %ldec = fdiv f64 1.0, %ldq
+    %cdec = select f64 %late, %ldec, 1.0
+    %cenv = fmul f64 %fade, %cdec
+    %cenv2 = fmul f64 %cenv, 0.13
+    %v1 = call f64 ksin(%ph1n)
+    %v2 = call f64 ksin(%ph2n)
+    %v2s = fmul f64 %v2, 0.7
+    %vsum = fadd f64 %v1, %v2s
+    %cterm = fmul f64 %vsum, %cenv2
+    ; mix and soft clip: y = m / (1 + |m|)
+    %mix = fadd f64 %subterm2, %nterm2
+    %mix2 = fadd f64 %mix, %cterm
+    %am = fabs f64 %mix2
+    %dn = fadd f64 %am, 1.0
+    %y = fdiv f64 %mix2, %dn
+    %sc = fmul f64 %y, 23000.0
+    %sv = fptosi i16 %sc
+    %addr = gep i16 buf, n
+    store i16 %addr, %sv
+    %n2 = add i64 n, 1
+    br sloop(%n2, %s1, %phs3, %lp2, %ph1n, %ph2n, buf)
+  finish(buf: ptr):
+    %wr = call i64 write(1, buf, 882000)
+    call void free(buf)
+    ret 0
+  fail():
+    ret 1
+}

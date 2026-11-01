@@ -1,0 +1,532 @@
+; BIG BANG
+; The birth of a universe, computed in Krell.
+;
+; A singularity lets go. 42,000 particles are born at one point with
+; fixed identities (the same seed every frame, so a particle is the
+; same particle in every frame) and the film is the scale factor
+; doing its work: a(t) grows as t^(2/3), the temperature falls as the
+; expansion proceeds, and late in the film the particles begin to
+; fall toward nine gravitational wells seeded in comoving space, so
+; structure condenses out of the fireball.
+;
+; Nothing is drawn from a picture of the event. Each frame is a pure
+; function of cosmic time: zero the density planes, walk every
+; particle from its initial conditions to its position at time t,
+; splat its light, then tonemap. The opening flash is an analytic
+; glow field over a saturating core.
+;
+; Krell has no square root, no cube root, and no colour ramps in its
+; op menu, so all three are derived here: ksqrt and kcbrt are
+; Newton's method, tempcolor is a piecewise ramp through ember,
+; orange, warm white, and blue white.
+;
+; Host services: write, atoi, malloc, free. Nothing else computes.
+; Output is raw RGBA frames, 1280 x 720, on stdout.
+;
+; main: [frames]  frame count, default 240, clamped to 1..480
+
+extern write(i32, ptr, i64) -> i64
+extern atoi(ptr) -> i32
+extern malloc(i64) -> ptr
+extern free(ptr) -> void
+
+fn rng(i64) -> i64 {
+  entry(s: i64):
+    %a = shl i64 s, 13
+    %b = xor i64 s, %a
+    %c = lshr i64 %b, 7
+    %d = xor i64 %b, %c
+    %e = shl i64 %d, 17
+    %f = xor i64 %d, %e
+    ret %f
+}
+
+fn unif(i64) -> f64 {
+  entry(s: i64):
+    %t = lshr i64 s, 11
+    %u = uitofp f64 %t
+    %r = fmul f64 %u, 0.00000000000000011102230246251565
+    ret %r
+}
+
+fn clamp01(f64) -> f64 {
+  entry(v: f64):
+    %lo = fcmp.olt f64 v, 0.0
+    %a = select f64 %lo, 0.0, v
+    %hi = fcmp.ogt f64 %a, 1.0
+    %b = select f64 %hi, 1.0, %a
+    ret %b
+}
+
+fn ksqrt(f64) -> f64 {
+  entry(a: f64):
+    %neg = fcmp.olt f64 a, 0.0
+    %ac = select f64 %neg, 0.0, a
+    %big = fcmp.ogt f64 %ac, 1.0
+    %seed = select f64 %big, %ac, 1.0
+    br it(6, %seed, %ac)
+  it(n: i64, x: f64, a: f64):
+    %q = fdiv f64 a, x
+    %s = fadd f64 x, %q
+    %x2 = fmul f64 %s, 0.5
+    %n2 = sub i64 n, 1
+    %more = icmp.sgt i64 %n2, 0
+    condbr %more, it(%n2, %x2, a), done(%x2, a)
+  done(x: f64, a: f64):
+    %zero = fcmp.oeq f64 a, 0.0
+    %r = select f64 %zero, 0.0, x
+    ret %r
+}
+
+; Cube root by Newton's method: y <- (2y + a / y^2) / 3.
+fn kcbrt(f64) -> f64 {
+  entry(a: f64):
+    %neg = fcmp.olt f64 a, 0.0
+    %ac = select f64 %neg, 0.0, a
+    %big = fcmp.ogt f64 %ac, 1.0
+    %seed = select f64 %big, %ac, 1.0
+    br it(10, %seed, %ac)
+  it(n: i64, y: f64, a: f64):
+    %y2 = fmul f64 y, y
+    %q = fdiv f64 a, %y2
+    %s0 = fadd f64 y, y
+    %s = fadd f64 %s0, %q
+    %y3 = fmul f64 %s, 0.3333333333333333
+    %n2 = sub i64 n, 1
+    %more = icmp.sgt i64 %n2, 0
+    condbr %more, it(%n2, %y3, a), done(%y3, a)
+  done(y: f64, a: f64):
+    %zero = fcmp.oeq f64 a, 0.0
+    %r = select f64 %zero, 0.0, y
+    ret %r
+}
+
+; Temperature ramp. t is an effective temperature: near 0 an ember,
+; through orange and warm white, to blue white at the top.
+; Writes r, g, b as f64 in [0, 1] to out[0..2].
+fn tempcolor(f64, ptr) -> void {
+  entry(t: f64, out: ptr):
+    %g0 = iconst i64 0
+    %g1 = iconst i64 1
+    %g2 = iconst i64 2
+    %d1 = fsub f64 t, 0.38
+    %m1 = fmul f64 %d1, 4.166666666666667
+    %f1 = call f64 clamp01(%m1)
+    %d2 = fsub f64 t, 0.62
+    %m2 = fmul f64 %d2, 2.6315789473684213
+    %f2 = call f64 clamp01(%m2)
+    %d3 = fsub f64 t, 1.0
+    %m3 = fmul f64 %d3, 2.0
+    %f3 = call f64 clamp01(%m3)
+    %r0 = fma f64 0.5, %f1, 0.5
+    %gc0 = fma f64 0.4, %f1, 0.1
+    %b0 = fma f64 0.145, %f1, 0.015
+    %r1d = fsub f64 1.0, %r0
+    %r1 = fma f64 %r1d, %f2, %r0
+    %g1d = fsub f64 0.86, %gc0
+    %g1v = fma f64 %g1d, %f2, %gc0
+    %b1d = fsub f64 0.62, %b0
+    %b1 = fma f64 %b1d, %f2, %b0
+    %r2d = fsub f64 0.84, %r1
+    %r2 = fma f64 %r2d, %f3, %r1
+    %g2d = fsub f64 0.9, %g1v
+    %g2 = fma f64 %g2d, %f3, %g1v
+    %b2d = fsub f64 1.0, %b1
+    %b2 = fma f64 %b2d, %f3, %b1
+    %a0 = gep f64 out, 0
+    store f64 %a0, %r2
+    %a1 = gep f64 out, 1
+    store f64 %a1, %g2
+    %a2 = gep f64 out, 2
+    store f64 %a2, %b2
+    ret
+}
+
+; Build one frame's density planes at the cosmic time of frame f
+; of F. planes: 3 x 921600 i32 (r, g, b). wells: 9 x 2 f64 in
+; comoving space. scratch: 3 f64 for tempcolor.
+fn build_frame(ptr, ptr, ptr, i64, i64) -> void {
+  entry(planes: ptr, wells: ptr, scratch: ptr, f: i64, F: i64):
+    %one = iconst i64 1
+    %ff = sitofp f64 f
+    %fF = sitofp f64 F
+    %den = fsub f64 %fF, 1.0
+    %maxd = fcmp.olt f64 %den, 1.0
+    %den2 = select f64 %maxd, 1.0, %den
+    %s = fdiv f64 %ff, %den2
+    %tau = fma f64 0.99, %s, 0.01
+    %cb = call f64 kcbrt(%tau)
+    %a = fmul f64 %cb, %cb
+    %tbase = fsub f64 1.35, %a
+    %tglob = fmul f64 %tbase, 0.95
+    %std = fsub f64 %tau, 0.22
+    %stm = fmul f64 %std, 1.5873015873015872
+    %stf = call f64 clamp01(%stm)
+    %struct = fmul f64 %stf, %stf
+    %af0 = fmul f64 %a, %a
+    %af1 = fma f64 1.4, %af0, 0.35
+    %afade = fdiv f64 1.0, %af1
+    br zero(0, planes, wells, scratch, %a, %tglob, %struct, %afade)
+  zero(i: i64, planes: ptr, wells: ptr, scratch: ptr, a: f64, tglob: f64, struct: f64, afade: f64):
+    %done = icmp.sge i64 i, 2764800
+    condbr %done, wellseed(planes, wells, scratch, a, tglob, struct, afade), zbody(i, planes, wells, scratch, a, tglob, struct, afade)
+  zbody(i: i64, planes: ptr, wells: ptr, scratch: ptr, a: f64, tglob: f64, struct: f64, afade: f64):
+    %addr = gep i32 planes, i
+    store i32 %addr, 0
+    %i2 = add i64 i, 1
+    br zero(%i2, planes, wells, scratch, a, tglob, struct, afade)
+  wellseed(planes: ptr, wells: ptr, scratch: ptr, a: f64, tglob: f64, struct: f64, afade: f64):
+    br wloop(0, 88172645463325252, planes, wells, scratch, a, tglob, struct, afade)
+  wloop(k: i64, st: i64, planes: ptr, wells: ptr, scratch: ptr, a: f64, tglob: f64, struct: f64, afade: f64):
+    %done = icmp.sge i64 k, 9
+    condbr %done, parts(planes, wells, scratch, a, tglob, struct, afade), wbody(k, st, planes, wells, scratch, a, tglob, struct, afade)
+  wbody(k: i64, st: i64, planes: ptr, wells: ptr, scratch: ptr, a: f64, tglob: f64, struct: f64, afade: f64):
+    %s1 = call i64 rng(st)
+    %ux = call f64 unif(%s1)
+    %s2 = call i64 rng(%s1)
+    %uy = call f64 unif(%s2)
+    %wx0 = fma f64 1.56, %ux, -0.78
+    %wy0 = fma f64 1.56, %uy, -0.78
+    %l2 = fmul f64 %wx0, %wx0
+    %l3 = fmul f64 %wy0, %wy0
+    %l4 = fadd f64 %l2, %l3
+    %len = call f64 ksqrt(%l4)
+    br wstore(k, %s2, planes, wells, scratch, a, tglob, struct, afade, %wx0, %wy0, %len)
+  wstore(k: i64, st: i64, planes: ptr, wells: ptr, scratch: ptr, a: f64, tglob: f64, struct: f64, afade: f64, wx0: f64, wy0: f64, len: f64):
+    %far = fcmp.ogt f64 len, 0.8
+    %sc = fdiv f64 0.8, len
+    %use = select f64 %far, %sc, 1.0
+    %wx = fmul f64 wx0, %use
+    %wy = fmul f64 wy0, %use
+    %k2 = shl i64 k, 1
+    %a0 = gep f64 wells, %k2
+    store f64 %a0, %wx
+    %k3 = add i64 %k2, 1
+    %a1 = gep f64 wells, %k3
+    store f64 %a1, %wy
+    %k4 = add i64 k, 1
+    br wloop(%k4, st, planes, wells, scratch, a, tglob, struct, afade)
+  parts(planes: ptr, wells: ptr, scratch: ptr, a: f64, tglob: f64, struct: f64, afade: f64):
+    br ploop(0, 1442695040888963407, planes, wells, scratch, a, tglob, struct, afade)
+  ploop(i: i64, st: i64, planes: ptr, wells: ptr, scratch: ptr, a: f64, tglob: f64, struct: f64, afade: f64):
+    %done = icmp.sge i64 i, 42000
+    condbr %done, pdone(), pbody(i, st, planes, wells, scratch, a, tglob, struct, afade)
+  pdone():
+    ret
+  pbody(i: i64, st: i64, planes: ptr, wells: ptr, scratch: ptr, a: f64, tglob: f64, struct: f64, afade: f64):
+    %s1 = call i64 rng(st)
+    %ux = call f64 unif(%s1)
+    %s2 = call i64 rng(%s1)
+    %uy = call f64 unif(%s2)
+    %s3 = call i64 rng(%s2)
+    %ue = call f64 unif(%s3)
+    %s4 = call i64 rng(%s3)
+    %uw = call f64 unif(%s4)
+    %s5 = call i64 rng(%s4)
+    %uj = call f64 unif(%s5)
+    %vx = fma f64 2.0, %ux, -1.0
+    %vy = fma f64 2.0, %uy, -1.0
+    %l2 = fmul f64 %vx, %vx
+    %l3 = fmul f64 %vy, %vy
+    %l4 = fadd f64 %l2, %l3
+    %len = call f64 ksqrt(%l4)
+    br pdir(i, %s5, planes, wells, scratch, a, tglob, struct, afade, %vx, %vy, %len, %ue, %uw, %uj)
+  pdir(i: i64, st: i64, planes: ptr, wells: ptr, scratch: ptr, a: f64, tglob: f64, struct: f64, afade: f64, vx: f64, vy: f64, len: f64, ue: f64, uw: f64, uj: f64):
+    %tiny = fcmp.olt f64 len, 0.05
+    %dx = fdiv f64 vx, len
+    %dy = fdiv f64 vy, len
+    %dx2 = select f64 %tiny, 1.0, %dx
+    %dy2 = select f64 %tiny, 0.0, %dy
+    %rho0 = fma f64 0.95, len, 0.03
+    %spd = fma f64 0.75, uj, 0.55
+    %rho = fmul f64 %rho0, %spd
+    %qx = fmul f64 %dx2, %rho
+    %qy = fmul f64 %dy2, %rho
+    %wkf = fmul f64 uw, 8.999
+    %wk = fptosi i64 %wkf
+    %wk2 = shl i64 %wk, 1
+    %wa0 = gep f64 wells, %wk2
+    %wx = load f64, %wa0
+    %wk3 = add i64 %wk2, 1
+    %wa1 = gep f64 wells, %wk3
+    %wy = load f64, %wa1
+    %ox = fsub f64 %wx, %qx
+    %oy = fsub f64 %wy, %qy
+    %d2a = fmul f64 %ox, %ox
+    %d2b = fmul f64 %oy, %oy
+    %d2w = fadd f64 %d2a, %d2b
+    %nr0 = fma f64 -0.9, %d2w, 1.15
+    %near = call f64 clamp01(%nr0)
+    %pf = fma f64 0.65, uj, 0.35
+    %pull0 = fmul f64 struct, %pf
+    %pull = fmul f64 %pull0, %near
+    %qx2 = fma f64 %pull, %ox, %qx
+    %qy2 = fma f64 %pull, %oy, %qy
+    %xa = fmul f64 700.0, a
+    %X = fma f64 %xa, %qx2, 640.0
+    %ys = fmul f64 a, 393.75
+    %Y = fma f64 %ys, %qy2, 360.0
+    %px = fptosi i64 %X
+    %py = fptosi i64 %Y
+    %tef0 = fma f64 0.9, ue, 0.55
+    %teff = fmul f64 tglob, %tef0
+    call void tempcolor(%teff, scratch)
+    %c0 = gep f64 scratch, 0
+    %cr = load f64, %c0
+    %c1 = gep f64 scratch, 1
+    %cg = load f64, %c1
+    %c2 = gep f64 scratch, 2
+    %cb2 = load f64, %c2
+    %lum = fma f64 90.0, ue, 26.0
+    %lfac = fma f64 -0.45, %rho, 1.18
+    %bright0 = fmul f64 %lum, afade
+    %bright = fmul f64 %bright0, %lfac
+    %vr = fmul f64 %cr, %bright
+    %vg = fmul f64 %cg, %bright
+    %vb = fmul f64 %cb2, %bright
+    br splat(i, st, planes, wells, scratch, a, tglob, struct, afade, %px, %py, %vr, %vg, %vb)
+  splat(i: i64, st: i64, planes: ptr, wells: ptr, scratch: ptr, a: f64, tglob: f64, struct: f64, afade: f64, px: i64, py: i64, vr: f64, vg: f64, vb: f64):
+    %ir = fptosi i32 vr
+    %ig = fptosi i32 vg
+    %ib = fptosi i32 vb
+    %x0 = icmp.sge i64 px, 0
+    %x1 = icmp.slt i64 px, 1280
+    %x2 = and i1 %x0, %x1
+    %y0 = icmp.sge i64 py, 0
+    %y1 = icmp.slt i64 py, 720
+    %y2 = and i1 %y0, %y1
+    %inb = and i1 %x2, %y2
+    condbr %inb, splat2(i, st, planes, wells, scratch, a, tglob, struct, afade, px, py, %ir, %ig, %ib), pnext(i, st, planes, wells, scratch, a, tglob, struct, afade)
+  splat2(i: i64, st: i64, planes: ptr, wells: ptr, scratch: ptr, a: f64, tglob: f64, struct: f64, afade: f64, px: i64, py: i64, ir: i32, ig: i32, ib: i32):
+    %row = mul i64 py, 1280
+    %idx = add i64 %row, px
+    %r4 = mul i32 ir, 4
+    %g4 = mul i32 ig, 4
+    %b4 = mul i32 ib, 4
+    %a0 = gep i32 planes, %idx
+    %o0 = load i32, %a0
+    %n0 = add i32 %o0, %r4
+    store i32 %a0, %n0
+    %j1 = add i64 %idx, 921600
+    %a1 = gep i32 planes, %j1
+    %o1 = load i32, %a1
+    %n1 = add i32 %o1, %g4
+    store i32 %a1, %n1
+    %j2 = add i64 %idx, 1843200
+    %a2 = gep i32 planes, %j2
+    %o2 = load i32, %a2
+    %n2 = add i32 %o2, %b4
+    store i32 %a2, %n2
+    %e0 = icmp.sge i64 px, 1
+    %e1 = icmp.slt i64 px, 1279
+    %e2 = and i1 %e0, %e1
+    %e3 = icmp.sge i64 py, 1
+    %e4 = icmp.slt i64 py, 719
+    %e5 = and i1 %e3, %e4
+    %inner = and i1 %e2, %e5
+    condbr %inner, splat3(i, st, planes, wells, scratch, a, tglob, struct, afade, %idx, ir, ig, ib), pnext(i, st, planes, wells, scratch, a, tglob, struct, afade)
+  splat3(i: i64, st: i64, planes: ptr, wells: ptr, scratch: ptr, a: f64, tglob: f64, struct: f64, afade: f64, idx: i64, ir: i32, ig: i32, ib: i32):
+    %l = sub i64 idx, 1
+    %a0 = gep i32 planes, %l
+    %o0 = load i32, %a0
+    %n0 = add i32 %o0, ir
+    store i32 %a0, %n0
+    %r = add i64 idx, 1
+    %a1 = gep i32 planes, %r
+    %o1 = load i32, %a1
+    %n1 = add i32 %o1, ir
+    store i32 %a1, %n1
+    %u = sub i64 idx, 1280
+    %a2 = gep i32 planes, %u
+    %o2 = load i32, %a2
+    %n2 = add i32 %o2, ir
+    store i32 %a2, %n2
+    %d = add i64 idx, 1280
+    %a3 = gep i32 planes, %d
+    %o3 = load i32, %a3
+    %n3 = add i32 %o3, ir
+    store i32 %a3, %n3
+    %lg = add i64 %l, 921600
+    %a4 = gep i32 planes, %lg
+    %o4 = load i32, %a4
+    %n4 = add i32 %o4, ig
+    store i32 %a4, %n4
+    %rg = add i64 %r, 921600
+    %a5 = gep i32 planes, %rg
+    %o5 = load i32, %a5
+    %n5 = add i32 %o5, ig
+    store i32 %a5, %n5
+    %ug = add i64 %u, 921600
+    %a6 = gep i32 planes, %ug
+    %o6 = load i32, %a6
+    %n6 = add i32 %o6, ig
+    store i32 %a6, %n6
+    %dg = add i64 %d, 921600
+    %a7 = gep i32 planes, %dg
+    %o7 = load i32, %a7
+    %n7 = add i32 %o7, ig
+    store i32 %a7, %n7
+    %lb = add i64 %l, 1843200
+    %a8 = gep i32 planes, %lb
+    %o8 = load i32, %a8
+    %n8 = add i32 %o8, ib
+    store i32 %a8, %n8
+    %rb = add i64 %r, 1843200
+    %a9 = gep i32 planes, %rb
+    %o9 = load i32, %a9
+    %n9 = add i32 %o9, ib
+    store i32 %a9, %n9
+    %ub = add i64 %u, 1843200
+    %a10 = gep i32 planes, %ub
+    %o10 = load i32, %a10
+    %n10 = add i32 %o10, ib
+    store i32 %a10, %n10
+    %db = add i64 %d, 1843200
+    %a11 = gep i32 planes, %db
+    %o11 = load i32, %a11
+    %n11 = add i32 %o11, ib
+    store i32 %a11, %n11
+    br pnext(i, st, planes, wells, scratch, a, tglob, struct, afade)
+  pnext(i: i64, st: i64, planes: ptr, wells: ptr, scratch: ptr, a: f64, tglob: f64, struct: f64, afade: f64):
+    %i2 = add i64 i, 1
+    br ploop(%i2, st, planes, wells, scratch, a, tglob, struct, afade)
+}
+
+; Tonemap the planes into the frame buffer, adding the flash:
+; an analytic glow field plus a hot core, both strongest at the
+; start. Exposure is fixed; particle brightness already fades with
+; the expansion, so the arc reads as cooling, not dimming lights.
+fn render(ptr, ptr, i64, i64) -> void {
+  entry(planes: ptr, buf: ptr, f: i64, F: i64):
+    %one = iconst i64 1
+    %ff = sitofp f64 f
+    %fF = sitofp f64 F
+    %den = fsub f64 %fF, 1.0
+    %maxd = fcmp.olt f64 %den, 1.0
+    %den2 = select f64 %maxd, 1.0, %den
+    %s = fdiv f64 %ff, %den2
+    %tau = fma f64 0.99, %s, 0.01
+    %cb = call f64 kcbrt(%tau)
+    %a = fmul f64 %cb, %cb
+    %gu = fma f64 -2.4, %tau, 1.0
+    %guc = call f64 clamp01(%gu)
+    %gs = fmul f64 %guc, %guc
+    %glow = fmul f64 %gs, 2100.0
+    %cr0 = fma f64 70.0, %a, 12.0
+    %cr2 = fmul f64 %cr0, %cr0
+    %cs0 = fma f64 -2.857142857142857, %tau, 1.0
+    %csc = call f64 clamp01(%cs0)
+    %cstr = fmul f64 %csc, 1000.0
+    br rloop(0, planes, buf, %glow, %cr2, %cstr)
+  rloop(idx: i64, planes: ptr, buf: ptr, glow: f64, cr2: f64, cstr: f64):
+    %done = icmp.sge i64 idx, 921600
+    condbr %done, rdone(), rbody(idx, planes, buf, glow, cr2, cstr)
+  rdone():
+    ret
+  rbody(idx: i64, planes: ptr, buf: ptr, glow: f64, cr2: f64, cstr: f64):
+    %py = udiv i64 idx, 1280
+    %rem = mul i64 %py, 1280
+    %px = sub i64 idx, %rem
+    %fx = sitofp f64 %px
+    %fy = sitofp f64 %py
+    %dx = fadd f64 %fx, -640.0
+    %dy = fadd f64 %fy, -360.0
+    %d2a = fmul f64 %dx, %dx
+    %d2b = fmul f64 %dy, %dy
+    %d2 = fadd f64 %d2a, %d2b
+    %gd = fma f64 0.0035, %d2, 1.0
+    %g = fdiv f64 glow, %gd
+    %cf0 = fdiv f64 %d2, cr2
+    %cf1 = fsub f64 1.0, %cf0
+    %cf = call f64 clamp01(%cf1)
+    %core = fmul f64 %cf, cstr
+    %add = fadd f64 %g, %core
+    %ar = fmul f64 %add, 0.88
+    %ag = fmul f64 %add, 0.93
+    %ab = fmul f64 %add, 1.0
+    %p0 = gep i32 planes, idx
+    %iv0 = load i32, %p0
+    %fv0 = sitofp f64 %iv0
+    %j1 = add i64 idx, 921600
+    %p1 = gep i32 planes, %j1
+    %iv1 = load i32, %p1
+    %fv1 = sitofp f64 %iv1
+    %j2 = add i64 idx, 1843200
+    %p2 = gep i32 planes, %j2
+    %iv2 = load i32, %p2
+    %fv2 = sitofp f64 %iv2
+    %vr = fadd f64 %fv0, %ar
+    %vg = fadd f64 %fv1, %ag
+    %vb = fadd f64 %fv2, %ab
+    %er = fmul f64 %vr, 0.055
+    %eg = fmul f64 %vg, 0.055
+    %eb = fmul f64 %vb, 0.055
+    %dr = fadd f64 %er, 1.0
+    %tr = fdiv f64 %er, %dr
+    %dg = fadd f64 %eg, 1.0
+    %tg = fdiv f64 %eg, %dg
+    %db = fadd f64 %eb, 1.0
+    %tb = fdiv f64 %eb, %db
+    %wr = fmul f64 %tr, 255.0
+    %rb = fptosi i32 %wr
+    %wg = fmul f64 %tg, 255.0
+    %gb = fptosi i32 %wg
+    %wb = fmul f64 %tb, 255.0
+    %bb = fptosi i32 %wb
+    %sh1 = shl i32 255, 24
+    %sh2 = shl i32 %bb, 16
+    %sh3 = shl i32 %gb, 8
+    %pk0 = or i32 %sh1, %sh2
+    %pk1 = or i32 %pk0, %sh3
+    %pack = or i32 %pk1, %rb
+    %addr = gep i32 buf, idx
+    store i32 %addr, %pack
+    %idx2 = add i64 idx, 1
+    br rloop(%idx2, planes, buf, glow, cr2, cstr)
+}
+
+fn main(i32, ptr) -> i32 {
+  entry(argc: i32, argv: ptr):
+    %one = iconst i64 1
+    %z32 = iconst i32 0
+    %o32 = iconst i32 1
+    %planes = call ptr malloc(11059200)
+    %buf = call ptr malloc(3686400)
+    %wells = call ptr malloc(144)
+    %scratch = call ptr malloc(24)
+    %pa = bitcast i64 %planes
+    %ok = icmp.ne i64 %pa, 0
+    condbr %ok, args(%planes, %buf, %wells, %scratch, argc, argv), fail()
+  args(planes: ptr, buf: ptr, wells: ptr, scratch: ptr, argc: i32, argv: ptr):
+    %has = icmp.sgt i32 argc, 1
+    condbr %has, arg1(planes, buf, wells, scratch, argv), noarg(240, planes, buf, wells, scratch)
+  arg1(planes: ptr, buf: ptr, wells: ptr, scratch: ptr, argv: ptr):
+    %p = gep ptr argv, 1
+    %s = load ptr, %p
+    %fv = call i32 atoi(%s)
+    br noarg(%fv, planes, buf, wells, scratch)
+  noarg(frames: i32, planes: ptr, buf: ptr, wells: ptr, scratch: ptr):
+    %lo = icmp.slt i32 frames, 1
+    %f1 = select i32 %lo, 1, frames
+    %hi = icmp.sgt i32 %f1, 480
+    %f2 = select i32 %hi, 480, %f1
+    %F = sext i64 %f2
+    br floop(0, planes, buf, wells, scratch, %F)
+  floop(f: i64, planes: ptr, buf: ptr, wells: ptr, scratch: ptr, F: i64):
+    %done = icmp.sge i64 f, F
+    condbr %done, finish(planes, buf, wells, scratch), fbody(f, planes, buf, wells, scratch, F)
+  fbody(f: i64, planes: ptr, buf: ptr, wells: ptr, scratch: ptr, F: i64):
+    call void build_frame(planes, wells, scratch, f, F)
+    call void render(planes, buf, f, F)
+    %wr = call i64 write(1, buf, 3686400)
+    %f2 = add i64 f, 1
+    br floop(%f2, planes, buf, wells, scratch, F)
+  finish(planes: ptr, buf: ptr, wells: ptr, scratch: ptr):
+    call void free(planes)
+    call void free(buf)
+    call void free(wells)
+    call void free(scratch)
+    ret 0
+  fail():
+    ret 1
+}
