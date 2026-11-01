@@ -271,7 +271,7 @@ const char *mod_verify(Module *m) {
                     bool okd = (db == bi) ? (defpos[v] < ii || defpos[v] == -1) : (DOM(db, bi) && db != bi);
                     if (db == bi) okd = defpos[v] == -1 || defpos[v] < ii;
                     else okd = DOM(db, bi) != 0;
-                    if (!okd) { free(defblk); free(defpos); free(doms); return fail("verifier: use not dominated by definition"); }
+                    if (!okd) { snprintf(ERR, sizeof ERR, "verifier: use not dominated by definition (func %s block %d ins %d val %d defblock %d)", f->name, bi, ii, v, db); free(defblk); free(defpos); free(doms); return ERR; }
                 }
             }
         }
