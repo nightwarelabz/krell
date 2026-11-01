@@ -1,0 +1,14 @@
+fn sumsq(i64) -> i64 {
+  entry(n: i64):
+    br loop(1, 0, n)
+  loop(i: i64, acc: i64, n: i64):
+    %c = icmp.sle i64 i, n
+    condbr %c, body(i, acc, n), exit(acc)
+  body(i: i64, acc: i64, n: i64):
+    %sq = mul i64 i, i
+    %a2 = add i64 acc, %sq
+    %i2 = add i64 i, 1
+    br loop(%i2, %a2, n)
+  exit(acc: i64):
+    ret acc
+}

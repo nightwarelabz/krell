@@ -1,0 +1,5 @@
+*.o
+*.a
+/krellc
+/build/
+__pycache__/

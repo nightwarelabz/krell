@@ -1,0 +1,710 @@
+/* Krell — optimizer: semantics-preserving rewrite passes over the IR.
+ *
+ * Method: per function, one forward pass rebuilds each block's
+ * instruction list applying local rules (constant folding with the
+ * interpreter's exact semantics, identities, strength reduction,
+ * div-by-constant via validated magic numbers, chain collapsing), with
+ * a substitution map for values replaced by existing values. A marking
+ * DCE then drops unmarked pure instructions. All rules are
+ * dominance-safe by construction: substitutions only ever point to
+ * values defined before the replaced instruction, expansions live in
+ * the same block at the same position, and the module is snapshot /
+ * restored if the verifier rejects the result. */
+#include "krell.h"
+#include <string.h>
+#include <math.h>
+
+static uint64_t msk64(int bits) { return bits >= 64 ? ~0ull : ((1ull << bits) - 1ull); }
+static int64_t sx64(uint64_t v, int bits) {
+    if (bits >= 64) return (int64_t)v;
+    return (int64_t)(v << (64 - bits)) >> (64 - bits);
+}
+
+typedef struct { Instr *v; int n, cap; } InsVec;
+static void iv_push(InsVec *iv, Instr in) {
+    if (iv->n == iv->cap) { iv->cap = iv->cap ? iv->cap * 2 : 16; iv->v = realloc(iv->v, sizeof(Instr) * (size_t)iv->cap); }
+    iv->v[iv->n++] = in;
+}
+
+typedef struct {
+    Func *f;
+    const Cost *cost;
+    OptStats *st;
+    int32_t *subst;        /* value -> replacement value (identity default) */
+    int *usecount;
+    int64_t *konst;        /* known integer constant per value */
+    uint8_t *hask;
+    int cap;               /* allocated length of the per-value arrays */
+} Opt;
+
+static void opt_grow(Opt *o, int v) {
+    if (v < o->cap) return;
+    int nc = o->cap ? o->cap : 64;
+    while (v >= nc) nc *= 2;
+    o->subst = realloc(o->subst, sizeof(int32_t) * (size_t)nc);
+    o->usecount = realloc(o->usecount, sizeof(int) * (size_t)nc);
+    o->konst = realloc(o->konst, sizeof(int64_t) * (size_t)nc);
+    o->hask = realloc(o->hask, (size_t)nc);
+    for (int i = o->cap; i < nc; i++) { o->subst[i] = i; o->usecount[i] = 0; o->konst[i] = 0; o->hask[i] = 0; }
+    o->cap = nc;
+}
+/* fresh value id with a registered type (mirrors ir.c's growth) */
+static int opt_new_value(Opt *o, Type t) {
+    Func *f = o->f;
+    if (f->nvalues >= f->vcap) {
+        f->vcap = f->vcap ? f->vcap * 2 : 32;
+        f->vtypes  = realloc(f->vtypes,  (size_t)f->vcap * sizeof(Type));
+        f->cval    = realloc(f->cval,    (size_t)f->vcap * sizeof(uint64_t));
+        f->isconst = realloc(f->isconst, (size_t)f->vcap);
+    }
+    int v = f->nvalues++;
+    f->vtypes[v] = t;
+    f->cval[v] = 0;
+    f->isconst[v] = 0;
+    opt_grow(o, v);
+    return v;
+}
+static int sub(Opt *o, int v) { return v < 0 ? v : o->subst[v]; }
+static bool isk(Opt *o, int v, int64_t *out) {
+    if (v < 0 || !o->hask[v]) return false;
+    *out = o->konst[v];
+    return true;
+}
+/* per-block iconst cache (constants are created in the block that uses
+ * them, ahead of the user, so dominance is trivially satisfied) */
+typedef struct { Type ty; int64_t imm; int val; } KEnt;
+typedef struct { KEnt *v; int n, cap; } KCache;
+static int block_iconst(Opt *o, InsVec *nb, KCache *kc, Type ty, int64_t imm) {
+    for (int i = 0; i < kc->n; i++)
+        if (ty_eq(kc->v[i].ty, ty) && kc->v[i].imm == imm) return kc->v[i].val;
+    int v = opt_new_value(o, ty);
+    Instr in = ins_iconst(ty, imm);
+    in.result = v;
+    iv_push(nb, in);
+    if (kc->n == kc->cap) { kc->cap = kc->cap ? kc->cap * 2 : 8; kc->v = realloc(kc->v, sizeof(KEnt) * (size_t)kc->cap); }
+    kc->v[kc->n++] = (KEnt){ ty, imm, v };
+    o->hask[v] = 1; o->konst[v] = imm;
+    return v;
+}
+
+/* ---- interpreter-exact integer evaluation for folding ---- */
+static uint64_t eval_bin(int op, Type t, uint64_t A, uint64_t B) {
+    int bits = t.bits;
+    uint64_t m = msk64(bits);
+    A &= m; B &= m;
+    switch (op) {
+    case OP_ADD: return (A + B) & m;
+    case OP_SUB: return (A - B) & m;
+    case OP_MUL: return (A * B) & m;
+    case OP_AND: return A & B;
+    case OP_OR:  return A | B;
+    case OP_XOR: return A ^ B;
+    case OP_UDIV: return B ? (A / B) & m : 0;
+    case OP_UREM: return B ? (A % B) & m : 0;
+    case OP_SDIV: {
+        int64_t sa = sx64(A, bits), sb = sx64(B, bits);
+        if (!sb) return 0;
+        if (sb == -1 && sa == sx64(m & (1ull << (bits - 1)), bits)) return (uint64_t)sa & m;
+        return (uint64_t)(sa / sb) & m;
+    }
+    case OP_SREM: {
+        int64_t sa = sx64(A, bits), sb = sx64(B, bits);
+        if (!sb) return 0;
+        if (sb == -1 && sa == sx64(m & (1ull << (bits - 1)), bits)) return 0;
+        return (uint64_t)(sa % sb) & m;
+    }
+    case OP_SHL:  return (A << (B % (uint64_t)bits)) & m;
+    case OP_LSHR: return (A >> (B % (uint64_t)bits)) & m;
+    case OP_ASHR: return (uint64_t)(sx64(A, bits) >> (B % (uint64_t)bits)) & m;
+    }
+    return 0;
+}
+static uint64_t eval_un(int op, Type t, uint64_t A) {
+    int bits = t.bits;
+    uint64_t m = msk64(bits);
+    A &= m;
+    switch (op) {
+    case OP_NEG: return (0 - A) & m;
+    case OP_NOT: return (~A) & m;
+    case OP_POPCOUNT: { int n = 0; for (int i = 0; i < bits; i++) n += (int)((A >> i) & 1); return (uint64_t)n; }
+    case OP_CLZ: { for (int i = bits - 1; i >= 0; i--) if ((A >> i) & 1) return (uint64_t)(bits - 1 - i); return (uint64_t)bits; }
+    case OP_CTZ: { for (int i = 0; i < bits; i++) if ((A >> i) & 1) return (uint64_t)i; return (uint64_t)bits; }
+    case OP_BSWAP: {
+        uint64_t r = 0;
+        for (int i = 0; i < bits / 8; i++) r |= ((A >> (8 * i)) & 0xff) << (8 * (bits / 8 - 1 - i));
+        return r & m;
+    }
+    }
+    return 0;
+}
+static int eval_icmp(int pred, Type t, uint64_t A, uint64_t B) {
+    int bits = t.bits;
+    A &= msk64(bits); B &= msk64(bits);
+    int64_t sa = sx64(A, bits), sb = sx64(B, bits);
+    switch (pred) {
+    case IC_EQ: return A == B; case IC_NE: return A != B;
+    case IC_ULT: return A < B; case IC_ULE: return A <= B;
+    case IC_UGT: return A > B; case IC_UGE: return A >= B;
+    case IC_SLT: return sa < sb; case IC_SLE: return sa <= sb;
+    case IC_SGT: return sa > sb; case IC_SGE: return sa >= sb;
+    }
+    return 0;
+}
+/* float -> int with SEMANTICS.md saturation (NaN -> 0) */
+static uint64_t f2i_fold(double d, int bits, int unsig) {
+    if (isnan(d)) return 0;
+    if (!unsig) {
+        if (bits == 64) {
+            if (d >= 9223372036854775808.0) return (uint64_t)INT64_MAX;
+            if (d < -9223372036854775808.0) return (uint64_t)INT64_MIN;
+            return (uint64_t)(int64_t)d;
+        }
+        double hi = ldexp(1.0, bits - 1);          /* 2^(bits-1), bits <= 63 */
+        if (d >= hi) return (uint64_t)(int64_t)(hi - 1) & msk64(bits);
+        if (d < -hi) return (uint64_t)(int64_t)(-hi) & msk64(bits);
+        return (uint64_t)(int64_t)d & msk64(bits);
+    } else {
+        double hi = ldexp(1.0, bits);              /* 2^bits */
+        if (d >= hi) return msk64(bits);
+        if (d <= 0) return 0;
+        if (bits == 64) return (uint64_t)d;
+        return (uint64_t)(uint64_t)d & msk64(bits);
+    }
+}
+
+/* ---- magic-number unsigned division (Hacker's Delight family) ----
+ * Finds (M, s) with q = mulhi32(x, M) >> s == x / d for all x, using the
+ * add-free variant; the candidate is then PROVEN on edge cases plus
+ * 200k deterministic random probes before it is used. */
+static bool magic_u32(uint32_t d, uint32_t *Mp, int *sp) {
+    if (d == 0 || (d & (d - 1)) == 0) return false;
+    for (int s = 0; s <= 32; s++) {
+        unsigned __int128 P = (unsigned __int128)1 << (32 + s);
+        uint64_t M = (uint64_t)(P / d) + 1;
+        uint64_t rem = (uint64_t)(P % d);
+        if (M > 0xFFFFFFFFull) continue;
+        if (rem > (uint64_t)(P >> 32)) continue;   /* error bound for add-free form */
+        /* proof by probes */
+        uint32_t M32 = (uint32_t)M;
+        bool ok = true;
+        uint32_t probes[8] = { 0, 1, d - 1, d, d + 1, 0x80000000u, 0xFFFFFFFEu, 0xFFFFFFFFu };
+        for (int i = 0; i < 8 && ok; i++) {
+            uint32_t x = probes[i];
+            uint32_t q = (uint32_t)(((uint64_t)x * M32) >> 32) >> s;
+            if (q != x / d) ok = false;
+        }
+        uint64_t rs = 0x123456789abcdef0ull ^ d;
+        for (int i = 0; i < 200000 && ok; i++) {
+            rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17;
+            uint32_t x = (uint32_t)rs;
+            uint32_t q = (uint32_t)(((uint64_t)x * M32) >> 32) >> s;
+            if (q != x / d) ok = false;
+        }
+        if (ok) { *Mp = M32; *sp = s; return true; }
+    }
+    return false;
+}
+
+static bool is_pow2_u64(uint64_t v, int *k) {
+    if (!v || (v & (v - 1))) return false;
+    int n = 0; while ((v >> n) > 1) n++;
+    *k = n; return true;
+}
+static int lat_of(Opt *o, int op, Type t) {
+    int v = cost_lat(o->cost, op, t);
+    return v < 0 ? 3 : v;   /* neutral default when no oracle row */
+}
+
+/* operand rewriting with dynamic use counts */
+static void rw_op(Opt *o, int32_t *p) {
+    if (*p < 0) return;
+    int nv = sub(o, *p);
+    if (nv != *p) { o->usecount[*p]--; o->usecount[nv]++; *p = nv; }
+}
+static void drop_uses(Opt *o, Instr *w) {
+    if (w->a >= 0) o->usecount[w->a]--;
+    if (w->b >= 0) o->usecount[w->b]--;
+    if (w->c >= 0 && w->op != OP_ALLOCA) o->usecount[w->c]--;
+    for (int i = 0; i < w->nargs; i++) o->usecount[w->args[i]]--;
+    for (int i = 0; i < w->nargs2; i++) o->usecount[w->args2[i]]--;
+}
+
+/* find the instruction producing v in the already-rebuilt prefix of the
+ * current block (for same-block def-chain rules); NULL if not local */
+static Instr *local_def(InsVec *nb, int v) {
+    for (int i = nb->n - 1; i >= 0; i--)
+        if (nb->v[i].result == v) return &nb->v[i];
+    return NULL;
+}
+
+static void optimize_func(Opt *o) {
+    Func *f = o->f;
+    /* phase 1: original constant map + use counts */
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = &f->blocks[bi];
+        for (int ii = 0; ii < b->nins; ii++) {
+            Instr *in = &b->ins[ii];
+            if (in->op == OP_ICONST && in->result >= 0) {
+                o->hask[in->result] = 1;
+                o->konst[in->result] = in->imm;
+            }
+            if (in->a >= 0) o->usecount[in->a]++;
+            if (in->b >= 0) o->usecount[in->b]++;
+            if (in->c >= 0 && in->op != OP_ALLOCA) o->usecount[in->c]++;
+            for (int i = 0; i < in->nargs; i++) o->usecount[in->args[i]]++;
+            for (int i = 0; i < in->nargs2; i++) o->usecount[in->args2[i]]++;
+        }
+    }
+    /* phase 2: rebuild each block with rewrites */
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = &f->blocks[bi];
+        InsVec nb = { 0 };
+        KCache kc = { 0 };
+        for (int ii = 0; ii < b->nins; ii++) {
+            Instr w = b->ins[ii];
+            /* rewrite operands through the substitution map */
+            rw_op(o, &w.a); rw_op(o, &w.b);
+            if (w.op != OP_ALLOCA) rw_op(o, &w.c);
+            for (int i = 0; i < w.nargs; i++) rw_op(o, &w.args[i]);
+            for (int i = 0; i < w.nargs2; i++) rw_op(o, &w.args2[i]);
+            Type t = w.ty;
+            int64_t ka = 0, kb = 0, kcst = 0;
+            bool ha = isk(o, w.a, &ka), hb = isk(o, w.b, &kb), hc = isk(o, w.c, &kcst);
+            (void)hc;
+            bool keep = true;
+            /* commutative normalization: constant goes to operand b */
+            if ((w.op == OP_ADD || w.op == OP_MUL || w.op == OP_AND || w.op == OP_OR || w.op == OP_XOR)
+                && ha && !hb) {
+                int32_t tv = w.a; w.a = w.b; w.b = tv;
+                ka = kb; kb = kcst = 0; ha = hb; hb = isk(o, w.b, &kb);
+            }
+            switch (w.op) {
+            case OP_FREEZE:
+                o->subst[w.result] = w.a; drop_uses(o, &w); keep = false; o->st->rewritten++;
+                break;
+            case OP_ADD: case OP_SUB: case OP_MUL: case OP_UDIV: case OP_SDIV:
+            case OP_UREM: case OP_SREM: case OP_AND: case OP_OR: case OP_XOR:
+            case OP_SHL: case OP_LSHR: case OP_ASHR: {
+                if (ha && hb) {   /* full fold */
+                    uint64_t r = eval_bin(w.op, t, (uint64_t)ka, (uint64_t)kb);
+                    w = ins_iconst(t, (int64_t)(r & msk64(t.bits)));
+                    w.result = b->ins[ii].result;
+                    o->hask[w.result] = 1; o->konst[w.result] = (int64_t)(r & msk64(t.bits));
+                    o->st->folded++;
+                    break;
+                }
+                if (hb) {
+                    uint64_t C = (uint64_t)kb & msk64(t.bits);
+                    int64_t sC = sx64(C, t.bits);
+                    int pk;
+                    switch (w.op) {
+                    case OP_ADD:
+                        if (C == 0) { o->subst[w.result] = w.a; drop_uses(o, &w); keep = false; }
+                        else {   /* (x + C1) + C2 chain, single use */
+                            Instr *d = local_def(&nb, w.a);
+                            int64_t c1;
+                            if (d && d->op == OP_ADD && isk(o, d->b, &c1) && o->usecount[w.a] == 1) {
+                                int da = d->a, dres = d->result;   /* before any iv_push realloc */
+                                w.a = da;
+                                w.b = block_iconst(o, &nb, &kc, t, (int64_t)(((uint64_t)c1 + C) & msk64(t.bits)));
+                                o->usecount[dres]--;
+                                o->st->rewritten++;
+                            }
+                        }
+                        break;
+                    case OP_SUB:
+                        if (C == 0) { o->subst[w.result] = w.a; drop_uses(o, &w); keep = false; }
+                        else if (w.a == w.b) { w = ins_iconst(t, 0); w.result = b->ins[ii].result; o->hask[w.result] = 1; o->konst[w.result] = 0; o->st->folded++; }
+                        break;
+                    case OP_MUL:
+                        if (C == 0) { w = ins_iconst(t, 0); w.result = b->ins[ii].result; o->hask[w.result] = 1; o->konst[w.result] = 0; o->st->folded++; }
+                        else if (C == 1) { o->subst[w.result] = w.a; drop_uses(o, &w); keep = false; }
+                        else if (sC == -1) { w.op = OP_NEG; w.b = -1; o->st->rewritten++; }
+                        else if (is_pow2_u64(C, &pk)) {
+                            w.op = OP_SHL; w.b = block_iconst(o, &nb, &kc, t, pk); o->st->rewritten++;
+                        } else if (sC > 2 && lat_of(o, OP_MUL, t) > lat_of(o, OP_SHL, t) + lat_of(o, OP_ADD, t)) {
+                            /* x*(2^k+1) = (x<<k)+x ; x*(2^k-1) = (x<<k)-x */
+                            uint64_t Cp = C + 1, Cm = C - 1;
+                            int kp, km;
+                            int form = 0; int kk = 0;
+                            if (is_pow2_u64(Cp, &kp) && kp >= 2) { form = 1; kk = kp; }        /* C = 2^k-1 */
+                            else if (is_pow2_u64(Cm, &km) && km >= 1) { form = 2; kk = km; }    /* C = 2^k+1 */
+                            if (form) {
+                                int tmp = opt_new_value(o, t);
+                                Instr sh = ins_bin(OP_SHL, t, w.a, block_iconst(o, &nb, &kc, t, kk));
+                                sh.result = tmp; iv_push(&nb, sh);
+                                o->usecount[w.a]++;
+                                w.op = form == 1 ? OP_SUB : OP_ADD;
+                                w.b = w.a; w.a = tmp;
+                                o->st->rewritten++;
+                            }
+                        }
+                        break;
+                    case OP_AND:
+                        if (C == 0) { w = ins_iconst(t, 0); w.result = b->ins[ii].result; o->hask[w.result] = 1; o->konst[w.result] = 0; o->st->folded++; }
+                        else if (C == msk64(t.bits)) { o->subst[w.result] = w.a; drop_uses(o, &w); keep = false; }
+                        else if (w.a == w.b) { o->subst[w.result] = w.a; drop_uses(o, &w); keep = false; }
+                        break;
+                    case OP_OR:
+                        if (C == 0) { o->subst[w.result] = w.a; drop_uses(o, &w); keep = false; }
+                        else if (C == msk64(t.bits)) { w = ins_iconst(t, (int64_t)C); w.result = b->ins[ii].result; o->hask[w.result] = 1; o->konst[w.result] = (int64_t)C; o->st->folded++; }
+                        else if (w.a == w.b) { o->subst[w.result] = w.a; drop_uses(o, &w); keep = false; }
+                        break;
+                    case OP_XOR:
+                        if (C == 0) { o->subst[w.result] = w.a; drop_uses(o, &w); keep = false; }
+                        else if (w.a == w.b) { w = ins_iconst(t, 0); w.result = b->ins[ii].result; o->hask[w.result] = 1; o->konst[w.result] = 0; o->st->folded++; }
+                        break;
+                    case OP_SHL: case OP_LSHR: case OP_ASHR:
+                        if ((C % (uint64_t)t.bits) == 0) { o->subst[w.result] = w.a; drop_uses(o, &w); keep = false; }
+                        break;
+                    case OP_UDIV:
+                        if (C == 1) { o->subst[w.result] = w.a; drop_uses(o, &w); keep = false; }
+                        else if (C != 0 && is_pow2_u64(C, &pk)) { w.op = OP_LSHR; w.b = block_iconst(o, &nb, &kc, t, pk); o->st->rewritten++; }
+                        else if (C != 0 && t.bits == 32) {
+                            uint32_t M; int s;
+                            if (magic_u32((uint32_t)C, &M, &s)
+                                && lat_of(o, OP_UDIV, t) > lat_of(o, OP_MUL, ty_i64()) + 3) {
+                                int zx = opt_new_value(o, ty_i64());
+                                Instr z = ins_make(OP_ZEXT, ty_i64()); z.a = w.a; z.result = zx; iv_push(&nb, z);
+                                int pm = opt_new_value(o, ty_i64());
+                                Instr p = ins_bin(OP_MUL, ty_i64(), zx, block_iconst(o, &nb, &kc, ty_i64(), (int64_t)(uint64_t)M));
+                                p.result = pm; iv_push(&nb, p);
+                                int hh = opt_new_value(o, ty_i64());
+                                Instr h = ins_bin(OP_LSHR, ty_i64(), pm, block_iconst(o, &nb, &kc, ty_i64(), 32 + s));
+                                h.result = hh; iv_push(&nb, h);
+                                o->usecount[w.a]++;
+                                w = ins_make(OP_TRUNC, t); w.a = hh; w.result = b->ins[ii].result;
+                                o->st->rewritten++;
+                            }
+                        }
+                        break;
+                    case OP_UREM:
+                        if (C == 1) { w = ins_iconst(t, 0); w.result = b->ins[ii].result; o->hask[w.result] = 1; o->konst[w.result] = 0; o->st->folded++; }
+                        else if (C != 0 && is_pow2_u64(C, &pk)) { w.op = OP_AND; w.b = block_iconst(o, &nb, &kc, t, (int64_t)(C - 1)); o->st->rewritten++; }
+                        else if (C != 0 && t.bits == 32) {
+                            uint32_t M; int s;
+                            if (magic_u32((uint32_t)C, &M, &s)
+                                && lat_of(o, OP_UDIV, t) > lat_of(o, OP_MUL, ty_i64()) + 3) {
+                                int zx = opt_new_value(o, ty_i64());
+                                Instr z = ins_make(OP_ZEXT, ty_i64()); z.a = w.a; z.result = zx; iv_push(&nb, z);
+                                int pm = opt_new_value(o, ty_i64());
+                                Instr p = ins_bin(OP_MUL, ty_i64(), zx, block_iconst(o, &nb, &kc, ty_i64(), (int64_t)(uint64_t)M));
+                                p.result = pm; iv_push(&nb, p);
+                                int hh = opt_new_value(o, ty_i64());
+                                Instr h = ins_bin(OP_LSHR, ty_i64(), pm, block_iconst(o, &nb, &kc, ty_i64(), 32 + s));
+                                h.result = hh; iv_push(&nb, h);
+                                int qq = opt_new_value(o, t);
+                                Instr q = ins_make(OP_TRUNC, t); q.a = hh; q.result = qq; iv_push(&nb, q);
+                                int mm = opt_new_value(o, t);
+                                Instr mi = ins_bin(OP_MUL, t, qq, block_iconst(o, &nb, &kc, t, (int64_t)C));
+                                mi.result = mm; iv_push(&nb, mi);
+                                o->usecount[w.a]++;
+                                w = ins_bin(OP_SUB, t, w.a, mm); w.result = b->ins[ii].result;
+                                o->st->rewritten++;
+                            }
+                        }
+                        break;
+                    case OP_SDIV:
+                        if (C == 1) { o->subst[w.result] = w.a; drop_uses(o, &w); keep = false; }
+                        else if (sC == -1) { w.op = OP_NEG; w.b = -1; o->st->rewritten++; }
+                        else if (C != 0 && is_pow2_u64(C, &pk) && pk >= 1
+                                 && lat_of(o, OP_SDIV, t) > 4) {
+                            /* truncating divide by 2^k via bias + ashr */
+                            int s1 = opt_new_value(o, t);
+                            Instr i1 = ins_bin(OP_ASHR, t, w.a, block_iconst(o, &nb, &kc, t, t.bits - 1));
+                            i1.result = s1; iv_push(&nb, i1);
+                            int s2 = opt_new_value(o, t);
+                            Instr i2 = ins_bin(OP_LSHR, t, s1, block_iconst(o, &nb, &kc, t, t.bits - pk));
+                            i2.result = s2; iv_push(&nb, i2);
+                            int s3 = opt_new_value(o, t);
+                            Instr i3 = ins_bin(OP_ADD, t, w.a, s2);
+                            i3.result = s3; iv_push(&nb, i3);
+                            o->usecount[w.a] += 2;
+                            w = ins_bin(OP_ASHR, t, s3, block_iconst(o, &nb, &kc, t, pk));
+                            w.result = b->ins[ii].result;
+                            o->st->rewritten++;
+                        }
+                        break;
+                    case OP_SREM:
+                        if (C == 1 || sC == -1) { w = ins_iconst(t, 0); w.result = b->ins[ii].result; o->hask[w.result] = 1; o->konst[w.result] = 0; o->st->folded++; }
+                        break;
+                    }
+                    if (!keep) break;
+                } else if (w.op == OP_SUB && w.a == w.b) {
+                    w = ins_iconst(t, 0); w.result = b->ins[ii].result;
+                    o->hask[w.result] = 1; o->konst[w.result] = 0; o->st->folded++;
+                } else if ((w.op == OP_AND || w.op == OP_OR) && w.a == w.b) {
+                    o->subst[w.result] = w.a; drop_uses(o, &w); keep = false;
+                } else if (w.op == OP_XOR && w.a == w.b) {
+                    w = ins_iconst(t, 0); w.result = b->ins[ii].result;
+                    o->hask[w.result] = 1; o->konst[w.result] = 0; o->st->folded++;
+                }
+                break;
+            }
+            case OP_NEG: case OP_NOT: case OP_POPCOUNT: case OP_CLZ: case OP_CTZ: case OP_BSWAP: {
+                if (ha) {
+                    uint64_t r = eval_un(w.op, t, (uint64_t)ka);
+                    w = ins_iconst(t, (int64_t)(r & msk64(t.bits)));
+                    w.result = b->ins[ii].result;
+                    o->hask[w.result] = 1; o->konst[w.result] = (int64_t)(r & msk64(t.bits));
+                    o->st->folded++;
+                } else if (w.op == OP_NEG || w.op == OP_NOT) {
+                    Instr *d = local_def(&nb, w.a);
+                    if (d && d->op == w.op) { o->subst[w.result] = d->a; drop_uses(o, &w); keep = false; o->st->rewritten++; }
+                }
+                break;
+            }
+            case OP_ICMP: {
+                Type at = f->vtypes[w.a];
+                if (ha && hb) {
+                    int r = eval_icmp(w.pred, at, (uint64_t)ka, (uint64_t)kb);
+                    w = ins_iconst(t, r); w.result = b->ins[ii].result;
+                    o->hask[w.result] = 1; o->konst[w.result] = r; o->st->folded++;
+                } else if (w.a == w.b) {
+                    int r = (w.pred == IC_EQ || w.pred == IC_ULE || w.pred == IC_UGE || w.pred == IC_SLE || w.pred == IC_SGE) ? 1 : 0;
+                    w = ins_iconst(t, r); w.result = b->ins[ii].result;
+                    o->hask[w.result] = 1; o->konst[w.result] = r; o->st->folded++;
+                }
+                break;
+            }
+            case OP_TRUNC: case OP_ZEXT: case OP_SEXT: {
+                Type at = f->vtypes[w.a];
+                if (ha) {
+                    uint64_t r = w.op == OP_TRUNC ? ((uint64_t)ka & msk64(t.bits))
+                               : w.op == OP_ZEXT ? ((uint64_t)ka & msk64(at.bits))
+                               : (uint64_t)sx64((uint64_t)ka, at.bits) & msk64(t.bits);
+                    w = ins_iconst(t, (int64_t)r); w.result = b->ins[ii].result;
+                    o->hask[w.result] = 1; o->konst[w.result] = (int64_t)r; o->st->folded++;
+                } else {
+                    Instr *d = local_def(&nb, w.a);
+                    if (d && (d->op == OP_ZEXT || d->op == OP_SEXT) && w.op == OP_TRUNC) {
+                        Type inner = f->vtypes[d->a];
+                        if (t.bits == inner.bits) { o->subst[w.result] = d->a; drop_uses(o, &w); keep = false; o->st->rewritten++; }
+                        else if (t.bits > inner.bits) { w.op = d->op; w.a = d->a; o->st->rewritten++; }
+                        else { w.op = OP_TRUNC; w.a = d->a; o->st->rewritten++; }
+                    } else if (d && d->op == w.op && w.op != OP_TRUNC) {
+                        w.a = d->a; o->st->rewritten++;   /* ext(ext(x)) collapses */
+                    }
+                }
+                break;
+            }
+            case OP_SELECT: {
+                if (ha) {
+                    o->subst[w.result] = ka ? w.b : w.c;
+                    drop_uses(o, &w); keep = false; o->st->rewritten++;
+                } else if (w.b == w.c) {
+                    o->subst[w.result] = w.b;
+                    drop_uses(o, &w); keep = false; o->st->rewritten++;
+                }
+                break;
+            }
+            case OP_CONDBR: {
+                if (ha) {
+                    int32_t *args = ka ? w.args : w.args2;
+                    int n = ka ? w.nargs : w.nargs2;
+                    int32_t tgt = ka ? w.blk : w.blk2;
+                    if (ka) { free(w.args2); } else { free(w.args); }
+                    w.op = OP_BR; w.blk = tgt; w.args = args; w.nargs = (uint16_t)n;
+                    w.args2 = NULL; w.nargs2 = 0; w.a = -1;
+                    o->st->rewritten++;
+                }
+                break;
+            }
+            case OP_GEP: {
+                if (hb && kb == 0) { o->subst[w.result] = w.a; drop_uses(o, &w); keep = false; o->st->rewritten++; }
+                else {
+                    Instr *d = local_def(&nb, w.a);
+                    int64_t c2;
+                    if (d && d->op == OP_GEP && ty_eq(d->ety, w.ety) && o->usecount[w.a] == 1
+                        && isk(o, d->b, &c2) && hb) {
+                        /* gep(gep(p, c1), c2) = gep(p, c1 + c2) with same ety */
+                        int da = d->a, dres = d->result;   /* before any iv_push realloc */
+                        w.a = da;
+                        w.b = block_iconst(o, &nb, &kc, f->vtypes[w.b], c2 + kb);
+                        o->usecount[dres]--;
+                        o->st->rewritten++;
+                    }
+                }
+                break;
+            }
+            case OP_BITCAST: {
+                Instr *d = local_def(&nb, w.a);
+                if (d && d->op == OP_BITCAST && ty_eq(f->vtypes[d->a], t)) {
+                    o->subst[w.result] = d->a; drop_uses(o, &w); keep = false; o->st->rewritten++;
+                }
+                break;
+            }
+            case OP_FNEG: {
+                Instr *d = local_def(&nb, w.a);
+                if (d && d->op == OP_FNEG) { o->subst[w.result] = d->a; drop_uses(o, &w); keep = false; o->st->rewritten++; }
+                break;
+            }
+            case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FDIV: case OP_FMA: {
+                /* float folds run in the optimizer's own IEEE arithmetic,
+                 * which is the interpreter's arithmetic on every host we
+                 * target; NaN results are skipped (payload is target-
+                 * defined, so a folded NaN could diverge) */
+                double da = 0, db = 0, dc = 0;
+                bool oka = false, okb = false, okc = false;
+                if (w.a >= 0 && f->isconst[w.a] && f->vtypes[w.a].kind == TY_FLOAT) { uint64_t u = f->cval[w.a]; if (f->vtypes[w.a].bits == 32) { float fv; uint32_t x = (uint32_t)u; memcpy(&fv, &x, 4); da = fv; } else memcpy(&da, &u, 8); oka = true; }
+                if (w.b >= 0 && f->isconst[w.b] && f->vtypes[w.b].kind == TY_FLOAT) { uint64_t u = f->cval[w.b]; if (f->vtypes[w.b].bits == 32) { float fv; uint32_t x = (uint32_t)u; memcpy(&fv, &x, 4); db = fv; } else memcpy(&db, &u, 8); okb = true; }
+                if (w.c >= 0 && f->isconst[w.c] && f->vtypes[w.c].kind == TY_FLOAT) { uint64_t u = f->cval[w.c]; if (f->vtypes[w.c].bits == 32) { float fv; uint32_t x = (uint32_t)u; memcpy(&fv, &x, 4); dc = fv; } else memcpy(&dc, &u, 8); okc = true; }
+                bool all = oka && okb && (w.op != OP_FMA || okc);
+                if (all && t.bits == 64) {
+                    double r = w.op == OP_FADD ? da + db : w.op == OP_FSUB ? da - db :
+                               w.op == OP_FMUL ? da * db : w.op == OP_FDIV ? da / db : fma(da, db, dc);
+                    if (!isnan(r)) {
+                        uint64_t u; memcpy(&u, &r, 8);
+                        w = ins_fconst(t, u); w.result = b->ins[ii].result;
+                        f->isconst[w.result] = 1; f->cval[w.result] = u;
+                        o->st->folded++;
+                    }
+                } else if (all && t.bits == 32) {
+                    /* compute in float precision, exactly like the interp */
+                    float fa = (float)da, fb = (float)db, fc = (float)dc;
+                    float r = w.op == OP_FADD ? fa + fb : w.op == OP_FSUB ? fa - fb :
+                              w.op == OP_FMUL ? fa * fb : w.op == OP_FDIV ? fa / fb : fmaf(fa, fb, fc);
+                    if (!isnan(r)) {
+                        uint32_t u; memcpy(&u, &r, 4);
+                        w = ins_fconst(t, u); w.result = b->ins[ii].result;
+                        f->isconst[w.result] = 1; f->cval[w.result] = u;
+                        o->st->folded++;
+                    }
+                }
+                break;
+            }
+            case OP_FPTOSI: case OP_FPTOUI: {
+                if (w.a >= 0 && f->isconst[w.a] && f->vtypes[w.a].kind == TY_FLOAT) {
+                    uint64_t u = f->cval[w.a];
+                    double d;
+                    if (f->vtypes[w.a].bits == 32) { float fv; uint32_t x = (uint32_t)u; memcpy(&fv, &x, 4); d = fv; }
+                    else memcpy(&d, &u, 8);
+                    uint64_t r = f2i_fold(d, t.bits, w.op == OP_FPTOUI);
+                    w = ins_iconst(t, (int64_t)r); w.result = b->ins[ii].result;
+                    o->hask[w.result] = 1; o->konst[w.result] = (int64_t)r;
+                    o->st->folded++;
+                }
+                break;
+            }
+            default: break;
+            }
+            if (keep) iv_push(&nb, w);
+            else if (w.args && w.op != OP_BR) { /* dropped instr owns arg arrays */ }
+        }
+        free(b->ins);
+        b->ins = nb.v; b->nins = nb.n; b->cap = nb.cap;
+        free(kc.v);
+    }
+    /* phase 3: DCE — mark from roots, sweep */
+    {
+        int nv = f->nvalues;
+        int *defblk = malloc(sizeof(int) * (size_t)(nv ? nv : 1));
+        int *defidx = malloc(sizeof(int) * (size_t)(nv ? nv : 1));
+        for (int i = 0; i < nv; i++) { defblk[i] = -1; defidx[i] = -1; }
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            Block *b = &f->blocks[bi];
+            for (int ii = 0; ii < b->nins; ii++)
+                if (b->ins[ii].result >= 0) { defblk[b->ins[ii].result] = bi; defidx[b->ins[ii].result] = ii; }
+        }
+        uint8_t *mark = calloc((size_t)(nv ? nv : 1), 1);
+        uint8_t *imark = NULL;   /* per-instruction mark, flattened lazily */
+        (void)imark;
+        /* instruction-level marking via a worklist over (block, idx) */
+        typedef struct { int b, i; } Pos;
+        Pos *wl = NULL; int wn = 0, wcap = 0;
+        uint8_t **bmark = malloc(sizeof(uint8_t *) * (size_t)f->nblocks);
+        for (int bi = 0; bi < f->nblocks; bi++) bmark[bi] = calloc((size_t)(f->blocks[bi].nins ? f->blocks[bi].nins : 1), 1);
+        #define PUSH(bb, ii2) do { if (wn == wcap) { wcap = wcap ? wcap * 2 : 64; wl = realloc(wl, sizeof(Pos) * (size_t)wcap); } wl[wn++] = (Pos){ (bb), (ii2) }; } while (0)
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            Block *b = &f->blocks[bi];
+            for (int ii = 0; ii < b->nins; ii++) {
+                Instr *in = &b->ins[ii];
+                bool root = op_is_terminator(in->op)
+                    || in->op == OP_STORE || in->op == OP_VSTORE || in->op == OP_CALL
+                    || in->op == OP_MEMCPY || in->op == OP_MEMSET
+                    || in->op == OP_ASTORE || in->op == OP_AADD;
+                if (root && !bmark[bi][ii]) { bmark[bi][ii] = 1; PUSH(bi, ii); }
+            }
+        }
+        while (wn) {
+            Pos p = wl[--wn];
+            Instr *in = &f->blocks[p.b].ins[p.i];
+            int ops[3] = { in->a, in->b, in->op == OP_ALLOCA ? -1 : in->c };
+            for (int k = 0; k < 3; k++) {
+                int v = ops[k];
+                if (v >= 0 && defblk[v] >= 0 && !mark[v]) {
+                    mark[v] = 1;
+                    if (!bmark[defblk[v]][defidx[v]]) { bmark[defblk[v]][defidx[v]] = 1; PUSH(defblk[v], defidx[v]); }
+                }
+            }
+            for (int k = 0; k < in->nargs; k++) {
+                int v = in->args[k];
+                if (v >= 0 && defblk[v] >= 0 && !mark[v]) { mark[v] = 1; if (!bmark[defblk[v]][defidx[v]]) { bmark[defblk[v]][defidx[v]] = 1; PUSH(defblk[v], defidx[v]); } }
+            }
+            for (int k = 0; k < in->nargs2; k++) {
+                int v = in->args2[k];
+                if (v >= 0 && defblk[v] >= 0 && !mark[v]) { mark[v] = 1; if (!bmark[defblk[v]][defidx[v]]) { bmark[defblk[v]][defidx[v]] = 1; PUSH(defblk[v], defidx[v]); } }
+            }
+        }
+        #undef PUSH
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            Block *b = &f->blocks[bi];
+            int w2 = 0;
+            for (int ii = 0; ii < b->nins; ii++) {
+                Instr *in = &b->ins[ii];
+                bool pure = op_is_pure(in->op) || in->op == OP_LOAD || in->op == OP_ALOAD || in->op == OP_FREEZE;
+                if (!bmark[bi][ii] && pure && in->op != OP_ASSUME) {
+                    if (in->args) free(in->args);
+                    if (in->args2) free(in->args2);
+                    o->st->dce++;
+                    continue;
+                }
+                if (in->op == OP_ASSUME && !bmark[bi][ii]) {
+                    if (in->args) free(in->args);
+                    if (in->args2) free(in->args2);
+                    o->st->dce++;
+                    continue;
+                }
+                b->ins[w2++] = *in;
+            }
+            b->nins = w2;
+            free(bmark[bi]);
+        }
+        free(bmark); free(wl); free(mark); free(defblk); free(defidx);
+    }
+}
+
+void opt_optimize(Module *m, const Cost *cost, OptStats *st) {
+    OptStats local = { 0, 0, 0, 0 };
+    if (!st) st = &local;
+    /* snapshot for the restore-on-reject safety net */
+    size_t slen = 0;
+    uint8_t *snap = mod_encode(m, &slen);
+    for (int fi = 0; fi < m->nfuncs; fi++) {
+        Func *f = &m->funcs[fi];
+        Opt o = { 0 };
+        o.f = f; o.cost = cost; o.st = st;
+        opt_grow(&o, f->nvalues);
+        for (int i = 0; i < f->nvalues; i++) o.subst[i] = i;
+        /* seed float constant knowledge for the fold rules */
+        optimize_func(&o);
+        free(o.subst); free(o.usecount); free(o.konst); free(o.hask);
+    }
+    const char *ve = mod_verify(m);
+    if (ve && snap) {
+        /* restore: decode the snapshot into a fresh module and move its
+         * contents over (the optimizer bug path; cons tables of the
+         * broken module are deliberately leaked rather than freed
+         * through the wrong owner) */
+        char err[128];
+        Module *fresh = mod_decode(snap, slen, err, sizeof err);
+        if (fresh) {
+            Module old = *m;
+            (void)old;
+            *m = *fresh;
+            free(fresh);
+            st->folded = st->dce = st->rewritten = st->blocks_removed = 0;
+        }
+    }
+    free(snap);
+}

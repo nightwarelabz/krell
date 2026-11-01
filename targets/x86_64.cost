@@ -1,0 +1,74 @@
+# RUNG cost oracle — x86_64 (Skylake-class core, SSE2 baseline vectors)
+# lat = latency cycles (representative), thr = reciprocal throughput.
+# cliff 1 = no reasonable implementation on this target; the verifier's
+# target gate rejects modules using cliff ops for this target.
+vl 4
+op add.i lat 1 thr 1
+op sub.i lat 1 thr 1
+op mul.i lat 3 thr 1
+op udiv.i lat 26 thr 10
+op sdiv.i lat 26 thr 10
+op urem.i lat 26 thr 10
+op srem.i lat 26 thr 10
+op neg.i lat 1 thr 1
+op and.i lat 1 thr 1
+op or.i lat 1 thr 1
+op xor.i lat 1 thr 1
+op not.i lat 1 thr 1
+op shl.i lat 1 thr 1
+op lshr.i lat 1 thr 1
+op ashr.i lat 1 thr 1
+op icmp.i lat 1 thr 1
+op popcount.i lat 3 thr 1
+op clz.i lat 3 thr 1
+op ctz.i lat 3 thr 1
+op bswap.i lat 1 thr 1
+op trunc.i lat 0 thr 1
+op zext.i lat 0 thr 1
+op sext.i lat 1 thr 1
+op select.i lat 2 thr 1
+op fadd.f lat 4 thr 1
+op fsub.f lat 4 thr 1
+op fmul.f lat 4 thr 1
+op fdiv.f lat 14 thr 5
+op fneg.f lat 1 thr 1
+op fabs.f lat 1 thr 1
+op fma.f lat 30 thr 10
+op fcmp.f lat 3 thr 1
+op fcmp.i lat 3 thr 1
+op ftrunc.f lat 3 thr 1
+op fext.f lat 2 thr 1
+op fptosi.i lat 8 thr 3
+op fptoui.i lat 10 thr 4
+op sitofp.f lat 5 thr 2
+op uitofp.f lat 6 thr 2
+op bitcast.i lat 1 thr 1
+op alloca.i lat 0 thr 1
+op load.i lat 4 thr 1
+op store.i lat 1 thr 1
+op gep.i lat 1 thr 1
+op memcpy.i lat 30 thr 10
+op memset.i lat 30 thr 10
+op aload.i lat 4 thr 1
+op astore.i lat 1 thr 1
+op aadd.i lat 12 thr 6
+op vsplat.v lat 4 thr 2
+op vadd.v lat 1 thr 1
+op vsub.v lat 1 thr 1
+op vmul.v lat 3 thr 1
+op vudiv.v lat 100 thr 50 cliff 1
+op vfadd.v lat 4 thr 1
+op vfsub.v lat 4 thr 1
+op vfmul.v lat 4 thr 1
+op vfdiv.v lat 40 thr 20
+op vand.v lat 1 thr 1
+op vor.v lat 1 thr 1
+op vxor.v lat 1 thr 1
+op vload.v lat 4 thr 1
+op vstore.v lat 1 thr 1
+op vextract.i lat 2 thr 1
+op vinsert.v lat 3 thr 1
+fn memcpy cost 30
+fn memset cost 30
+fn fma cost 30
+fn fmaf cost 30
