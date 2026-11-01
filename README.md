@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="brand/krell-mark-90s.png" alt="Krell mark" width="220">
+  <img src="brand/krell-mark-1280x640-transparent.png" alt="Krell mark" width="640">
 </p>
 
 # Krell
