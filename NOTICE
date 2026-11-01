@@ -8,7 +8,4 @@ not use this product except in compliance with the License. A copy of
 the License is in the LICENSE file and at
 https://www.apache.org/licenses/LICENSE-2.0
 
-Output exception: programs encoded in Krell form, and code produced by
-compiling such programs with this toolchain, are outputs of the
-toolchain. The license of the toolchain imposes no obligations on those
-outputs; they may be used, modified, and distributed under any terms.
+Krell Encoding Exception. Programs, modules, and fragments expressed or encoded in the Krell representation are not derivative works of Krell, and no obligation under the Apache License 2.0 arises from authoring, encoding, distributing, or executing them. The output of Krell tools, where that output is a translation of such a program into another representation or into machine code, may likewise be used and distributed under any terms. This exception applies only to programs and their translations; the Krell toolchain, specification, and documentation themselves remain under the Apache License 2.0.
