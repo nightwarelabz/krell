@@ -1,0 +1,306 @@
+; NEBULA
+; A Nebulabrot computed entirely in Krell surface syntax.
+;
+; The Mandelbrot set is never drawn. Instead, millions of points c are
+; sampled at random; each escaping orbit is walked a second time and
+; every point it visited votes into one of three density planes, split
+; by escape speed: slow escapes (red), medium (green), fast (blue).
+; The set's own interior stays black. What glows is where orbits travel.
+;
+; Frames are snapshots of one accumulating field: early frames are a
+; sparse starfield, and the figure condenses out of the noise as the
+; sample count grows quadratically toward the total.
+;
+; Host services: write, atoi, malloc, free. Nothing else computes.
+; Output is raw RGBA, 960 x 720, one frame after another, on stdout.
+;
+; main: [frames, default 120, clamp 1..240]
+;       [exposure, default 1000, in thousandths]
+;       [total samples, default 48, in millions]
+; ./nebula 1            -> one still frame at full accumulation
+; ./nebula 120 | ffmpeg ... -> the condensing animation
+
+extern write(i32, ptr, i64) -> i64
+extern atoi(ptr) -> i32
+extern malloc(i64) -> ptr
+extern free(ptr) -> void
+
+; xorshift64: full period, three shifts and no multiply.
+fn rng(i64) -> i64 {
+  entry(x: i64):
+    %a = lshr i64 x, 12
+    %x1 = xor i64 x, %a
+    %b = shl i64 %x1, 25
+    %x2 = xor i64 %x1, %b
+    %c = lshr i64 %x2, 27
+    %x3 = xor i64 %x2, %c
+    ret %x3
+}
+
+; Top 53 bits of the state as a uniform double in [0, 1).
+fn unif(i64) -> f64 {
+  entry(x: i64):
+    %s = lshr i64 x, 11
+    %f = uitofp f64 %s
+    %u = fdiv f64 %f, 9007199254740992.0
+    ret %u
+}
+
+; accumulate(planes, state, count) -> new state.
+; planes holds 3 * 960 * 720 i32 counters: red at 0, green at 691200,
+; blue at 1382400.
+fn accumulate(ptr, i64, i64) -> i64 {
+  entry(planes: ptr, state: i64, count: i64):
+    %one = iconst i64 1
+    br sloop(planes, 0, state, count)
+  sloop(planes: ptr, s: i64, st: i64, count: i64):
+    %done = icmp.sge i64 s, count
+    condbr %done, exit(st), draw(planes, s, st, count)
+  draw(planes: ptr, s: i64, st: i64, count: i64):
+    %x1 = call i64 rng(st)
+    %u1 = call f64 unif(%x1)
+    %x2 = call i64 rng(%x1)
+    %u2 = call f64 unif(%x2)
+    %t1 = fmul f64 %u1, 3.3
+    %cr = fadd f64 %t1, -2.2
+    %t2 = fmul f64 %u2, 2.475
+    %ci = fadd f64 %t2, -1.2375
+    br card(planes, s, %x2, count, %cr, %ci)
+  card(planes: ptr, s: i64, st: i64, count: i64, cr: f64, ci: f64):
+    %dx = fadd f64 cr, -0.25
+    %dx2 = fmul f64 %dx, %dx
+    %ci2 = fmul f64 ci, ci
+    %q = fadd f64 %dx2, %ci2
+    %qa = fadd f64 %q, %dx
+    %lhs = fmul f64 %q, %qa
+    %rhs = fmul f64 0.25, %ci2
+    %in1 = fcmp.ole f64 %lhs, %rhs
+    condbr %in1, next(planes, s, st, count), bulb(planes, s, st, count, cr, ci)
+  bulb(planes: ptr, s: i64, st: i64, count: i64, cr: f64, ci: f64):
+    %ex = fadd f64 cr, 1.0
+    %ex2 = fmul f64 %ex, %ex
+    %ci2 = fmul f64 ci, ci
+    %bs = fadd f64 %ex2, %ci2
+    %in2 = fcmp.ole f64 %bs, 0.0625
+    condbr %in2, next(planes, s, st, count), p1(0, 0.0, 0.0, planes, s, st, count, cr, ci)
+  p1(n: i64, zr: f64, zi: f64, planes: ptr, s: i64, st: i64, count: i64, cr: f64, ci: f64):
+    %zr2 = fmul f64 zr, zr
+    %zi2 = fmul f64 zi, zi
+    %d = fsub f64 %zr2, %zi2
+    %nzr = fadd f64 %d, cr
+    %p = fmul f64 zr, zi
+    %p2 = fadd f64 %p, %p
+    %nzi = fadd f64 %p2, ci
+    %n2 = add i64 n, 1
+    %a = fmul f64 %nzr, %nzr
+    %b = fmul f64 %nzi, %nzi
+    %m = fadd f64 %a, %b
+    %esc = fcmp.ogt f64 %m, 4.0
+    condbr %esc, escaped(%n2, planes, s, st, count, cr, ci), cont(%n2, %nzr, %nzi, planes, s, st, count, cr, ci)
+  cont(n: i64, zr: f64, zi: f64, planes: ptr, s: i64, st: i64, count: i64, cr: f64, ci: f64):
+    %max = icmp.sge i64 n, 4000
+    condbr %max, next(planes, s, st, count), p1(n, zr, zi, planes, s, st, count, cr, ci)
+  escaped(n: i64, planes: ptr, s: i64, st: i64, count: i64, cr: f64, ci: f64):
+    %fast = icmp.slt i64 n, 64
+    condbr %fast, gotband(1382400, n, planes, s, st, count, cr, ci), band2(n, planes, s, st, count, cr, ci)
+  band2(n: i64, planes: ptr, s: i64, st: i64, count: i64, cr: f64, ci: f64):
+    %mid = icmp.slt i64 n, 640
+    condbr %mid, gotband(691200, n, planes, s, st, count, cr, ci), gotband(0, n, planes, s, st, count, cr, ci)
+  gotband(base: i64, n: i64, planes: ptr, s: i64, st: i64, count: i64, cr: f64, ci: f64):
+    br p2(0, 0.0, 0.0, base, n, planes, s, st, count, cr, ci)
+  p2(k: i64, zr: f64, zi: f64, base: i64, n: i64, planes: ptr, s: i64, st: i64, count: i64, cr: f64, ci: f64):
+    %zr2 = fmul f64 zr, zr
+    %zi2 = fmul f64 zi, zi
+    %d = fsub f64 %zr2, %zi2
+    %nzr = fadd f64 %d, cr
+    %p = fmul f64 zr, zi
+    %p2 = fadd f64 %p, %p
+    %nzi = fadd f64 %p2, ci
+    %k2 = add i64 k, 1
+    %a = fmul f64 %nzr, %nzr
+    %b = fmul f64 %nzi, %nzi
+    %m = fadd f64 %a, %b
+    br plot(%k2, %nzr, %nzi, %m, base, n, planes, s, st, count, cr, ci)
+  plot(k: i64, zr: f64, zi: f64, m: f64, base: i64, n: i64, planes: ptr, s: i64, st: i64, count: i64, cr: f64, ci: f64):
+    %inb = fcmp.ole f64 m, 4.0
+    condbr %inb, clip1(k, zr, zi, base, n, planes, s, st, count, cr, ci), after(k, zr, zi, base, n, planes, s, st, count, cr, ci)
+  clip1(k: i64, zr: f64, zi: f64, base: i64, n: i64, planes: ptr, s: i64, st: i64, count: i64, cr: f64, ci: f64):
+    %lo = fcmp.oge f64 zi, -1.65
+    condbr %lo, clip2(k, zr, zi, base, n, planes, s, st, count, cr, ci), after(k, zr, zi, base, n, planes, s, st, count, cr, ci)
+  clip2(k: i64, zr: f64, zi: f64, base: i64, n: i64, planes: ptr, s: i64, st: i64, count: i64, cr: f64, ci: f64):
+    %hi = fcmp.olt f64 zi, 1.65
+    condbr %hi, clip3(k, zr, zi, base, n, planes, s, st, count, cr, ci), after(k, zr, zi, base, n, planes, s, st, count, cr, ci)
+  clip3(k: i64, zr: f64, zi: f64, base: i64, n: i64, planes: ptr, s: i64, st: i64, count: i64, cr: f64, ci: f64):
+    %lo = fcmp.oge f64 zr, -1.7875
+    condbr %lo, clip4(k, zr, zi, base, n, planes, s, st, count, cr, ci), after(k, zr, zi, base, n, planes, s, st, count, cr, ci)
+  clip4(k: i64, zr: f64, zi: f64, base: i64, n: i64, planes: ptr, s: i64, st: i64, count: i64, cr: f64, ci: f64):
+    %hi = fcmp.olt f64 zr, 0.6875
+    condbr %hi, doplot(k, zr, zi, base, n, planes, s, st, count, cr, ci), after(k, zr, zi, base, n, planes, s, st, count, cr, ci)
+  doplot(k: i64, zr: f64, zi: f64, base: i64, n: i64, planes: ptr, s: i64, st: i64, count: i64, cr: f64, ci: f64):
+    %xs = fadd f64 zi, 1.65
+    %xf = fmul f64 %xs, 290.6060606060606
+    %px = fptosi i64 %xf
+    %ys = fadd f64 zr, 1.7875
+    %yf = fmul f64 %ys, 290.5050505050505
+    %py = fptosi i64 %yf
+    %row = mul i64 %py, 960
+    %idx0 = add i64 %row, %px
+    %idx = add i64 base, %idx0
+    %addr = gep i32 planes, %idx
+    %old = load i32, %addr
+    %new = add i32 %old, 1
+    store i32 %addr, %new
+    br after(k, zr, zi, base, n, planes, s, st, count, cr, ci)
+  after(k: i64, zr: f64, zi: f64, base: i64, n: i64, planes: ptr, s: i64, st: i64, count: i64, cr: f64, ci: f64):
+    %more = icmp.slt i64 k, n
+    condbr %more, p2(k, zr, zi, base, n, planes, s, st, count, cr, ci), next(planes, s, st, count)
+  next(planes: ptr, s: i64, st: i64, count: i64):
+    %s2 = add i64 s, 1
+    br sloop(planes, %s2, st, count)
+  exit(st: i64):
+    ret st
+}
+
+; render(planes, buf, er, eg, eb): Reinhard tonemap of the three
+; density planes into packed RGBA (alpha 255).
+fn render(ptr, ptr, f64, f64, f64) -> void {
+  entry(planes: ptr, buf: ptr, er: f64, eg: f64, eb: f64):
+    br px(0, planes, buf, er, eg, eb)
+  px(i: i64, planes: ptr, buf: ptr, er: f64, eg: f64, eb: f64):
+    %done = icmp.sge i64 i, 691200
+    condbr %done, done(), body(i, planes, buf, er, eg, eb)
+  body(i: i64, planes: ptr, buf: ptr, er: f64, eg: f64, eb: f64):
+    %rp = gep i32 planes, i
+    %r = load i32, %rp
+    %gi = add i64 i, 691200
+    %gp = gep i32 planes, %gi
+    %g = load i32, %gp
+    %bi = add i64 i, 1382400
+    %bp = gep i32 planes, %bi
+    %b = load i32, %bp
+    %rf = uitofp f64 %r
+    %rx = fmul f64 %rf, er
+    %rd = fadd f64 %rx, 1.0
+    %rv = fdiv f64 %rx, %rd
+    %rs = fmul f64 %rv, 255.0
+    %rb = fptosi i32 %rs
+    %gf = uitofp f64 %g
+    %gx = fmul f64 %gf, eg
+    %gd = fadd f64 %gx, 1.0
+    %gv = fdiv f64 %gx, %gd
+    %gsc = fmul f64 %gv, 255.0
+    %gb = fptosi i32 %gsc
+    %bf = uitofp f64 %b
+    %bx = fmul f64 %bf, eb
+    %bd = fadd f64 %bx, 1.0
+    %bv = fdiv f64 %bx, %bd
+    %bsc = fmul f64 %bv, 255.0
+    %bb = fptosi i32 %bsc
+    %a = shl i32 255, 24
+    %bp16 = shl i32 %bb, 16
+    %gp8 = shl i32 %gb, 8
+    %t = or i32 %a, %bp16
+    %t2 = or i32 %t, %gp8
+    %pack = or i32 %t2, %rb
+    %addr = gep i32 buf, i
+    store i32 %addr, %pack
+    %i2 = add i64 i, 1
+    br px(%i2, planes, buf, er, eg, eb)
+  done():
+    ret
+}
+
+fn main(i32, ptr) -> i32 {
+  entry(argc: i32, argv: ptr):
+    %one = iconst i64 1
+    %z32 = iconst i32 0
+    %o32 = iconst i32 1
+    %planes = call ptr malloc(8294400)
+    %buf = call ptr malloc(2764800)
+    %pa = bitcast i64 %planes
+    %ok = icmp.ne i64 %pa, 0
+    condbr %ok, zero(0, %planes, %buf, argc, argv), fail()
+  zero(i: i64, planes: ptr, buf: ptr, argc: i32, argv: ptr):
+    %done = icmp.sge i64 i, 2073600
+    condbr %done, args(planes, buf, argc, argv), zbody(i, planes, buf, argc, argv)
+  zbody(i: i64, planes: ptr, buf: ptr, argc: i32, argv: ptr):
+    %addr = gep i32 planes, i
+    store i32 %addr, 0
+    %i2 = add i64 i, 1
+    br zero(%i2, planes, buf, argc, argv)
+  args(planes: ptr, buf: ptr, argc: i32, argv: ptr):
+    %has1 = icmp.sgt i32 argc, 1
+    condbr %has1, arg1(planes, buf, argc, argv), noarg1(120, planes, buf, argc, argv)
+  arg1(planes: ptr, buf: ptr, argc: i32, argv: ptr):
+    %p = gep ptr argv, 1
+    %s = load ptr, %p
+    %f = call i32 atoi(%s)
+    br noarg1(%f, planes, buf, argc, argv)
+  noarg1(f0: i32, planes: ptr, buf: ptr, argc: i32, argv: ptr):
+    %lo = icmp.slt i32 f0, 1
+    %f1 = select i32 %lo, 1, f0
+    %hi = icmp.sgt i32 %f1, 240
+    %frames = select i32 %hi, 240, %f1
+    %has2 = icmp.sgt i32 argc, 2
+    condbr %has2, arg2(%frames, planes, buf, argc, argv), noarg2(%frames, 1000, planes, buf, argc, argv)
+  arg2(frames: i32, planes: ptr, buf: ptr, argc: i32, argv: ptr):
+    %p = gep ptr argv, 2
+    %s = load ptr, %p
+    %e = call i32 atoi(%s)
+    br noarg2(frames, %e, planes, buf, argc, argv)
+  noarg2(frames: i32, emilli: i32, planes: ptr, buf: ptr, argc: i32, argv: ptr):
+    %has3 = icmp.sgt i32 argc, 3
+    condbr %has3, arg3(frames, emilli, planes, buf, argc, argv), noarg3(frames, emilli, 48, planes, buf)
+  arg3(frames: i32, emilli: i32, planes: ptr, buf: ptr, argc: i32, argv: ptr):
+    %p = gep ptr argv, 3
+    %s = load ptr, %p
+    %m = call i32 atoi(%s)
+    br noarg3(frames, emilli, %m, planes, buf)
+  noarg3(frames: i32, emilli: i32, smill: i32, planes: ptr, buf: ptr):
+    %total = mul i64 1000000, 48
+    %sm = sext i64 smill
+    %total2 = mul i64 %sm, 1000000
+    %pos = icmp.sgt i32 smill, 0
+    %totalf = select i64 %pos, %total2, %total
+    %ef = sitofp f64 emilli
+    %kf = fmul f64 %ef, 0.001
+    %f64 = sext i64 frames
+    br floop(1, 0, 88172645463325252, planes, buf, %f64, %kf, %totalf)
+  floop(f: i64, cum: i64, st: i64, planes: ptr, buf: ptr, frames: i64, kf: f64, total: i64):
+    %ff = mul i64 f, f
+    %num = mul i64 total, %ff
+    %den = mul i64 frames, frames
+    %target = udiv i64 %num, %den
+    %chunk = sub i64 %target, cum
+    %st2 = call i64 accumulate(planes, st, %chunk)
+    %ff2 = sitofp f64 f
+    %fr2 = sitofp f64 frames
+    %ph = fdiv f64 %ff2, %fr2
+    %tf = uitofp f64 %target
+    %e0 = fmul f64 kf, 48000.0
+    %e1 = fdiv f64 %e0, %tf
+    %rp7 = fmul f64 %ph, 0.7
+    %ramp = fadd f64 0.3, %rp7
+    %e = fmul f64 %e1, %ramp
+    %tt = fmul f64 %ph, 2.0
+    %tt2 = fsub f64 %tt, 1.0
+    %ta = fabs f64 %tt2
+    %tri = fsub f64 1.0, %ta
+    %er = fmul f64 %e, 1.12
+    %gg = fadd f64 0.72, %tri
+    %eg = fmul f64 %e, %gg
+    %gs = fmul f64 %ph, 0.3
+    %gb2 = fsub f64 1.05, %gs
+    %eb = fmul f64 %e, %gb2
+    call void render(planes, buf, %er, %eg, %eb)
+    %wr = call i64 write(1, buf, 2764800)
+    %fnext = add i64 f, 1
+    %last = icmp.sge i64 f, frames
+    condbr %last, finish(planes, buf), floop(%fnext, %target, %st2, planes, buf, frames, kf, total)
+  finish(planes: ptr, buf: ptr):
+    call void free(planes)
+    call void free(buf)
+    ret 0
+  fail():
+    ret 1
+}
