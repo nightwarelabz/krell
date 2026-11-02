@@ -47,11 +47,9 @@ BeFunc *be_analyze(Module *m, Func *f, const Pools *pools) {
     }
     /* positions */
     int pos = 0;
-    int total_ins = 0;
     for (int b = 0; b < f->nblocks; b++) {
         bf->blkstart[b] = pos;
         pos += 1 + f->blocks[b].nins;
-        total_ins += f->blocks[b].nins;
     }
     bf->maxpos = pos;
     bf->allo_off = malloc(sizeof(int) * (size_t)(pos > 0 ? pos : 1));
