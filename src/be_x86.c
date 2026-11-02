@@ -14,10 +14,6 @@ static const char *G8[15]  = { "al","cl","dl","bl","sil","dil","r8b","r9b","r10b
 static const char **gname(int sz) { return sz == 8 ? G64 : sz == 4 ? G32 : sz == 2 ? G16 : G8; }
 static const int ARG_GP[6] = { RDI, RSI, RDX, RCX, R8, R9 };
 
-static const PoolReg POOL_GP[] = {
-    { RSI, 0 }, { RDI, 0 }, { R8, 0 }, { R9, 0 }, { R10, 0 },
-    { RBX, 1 }, { R12, 1 }, { R13, 1 }, { R14, 1 }, { R15, 1 },
-};
 static const PoolReg POOL_FP[] = {
     { 0,0 },{ 1,0 },{ 2,0 },{ 3,0 },{ 4,0 },{ 5,0 },{ 6,0 },{ 7,0 },
     { 8,0 },{ 9,0 },{ 10,0 },{ 11,0 },{ 12,0 },{ 13,0 },{ 14,0 },
@@ -55,20 +51,94 @@ static void locstr(Ctx *c, char *buf, size_t cap, int v, int sz) {
     locstr_off(buf, cap, &c->bf->loc[v], sz);
 }
 
+static inline uint64_t msk64(int bits) { return bits >= 64 ? ~0ull : ((1ull << bits) - 1ull); }
 static int mem_size_of(Type t, int vl);
+static void load_gp(Ctx *c, int reg, int v);
 
-static void resolve_addr(Ctx *c, int ptr_v, int *base_v, int *disp_out) {
-    *base_v = ptr_v;
-    *disp_out = 0;
+typedef struct {
+    int base_v;
+    int idx_v;
+    int scale;
+    int disp;
+} X86Addr;
+
+static void resolve_x86_addr(Ctx *c, int ptr_v, X86Addr *out) {
+    out->base_v = ptr_v;
+    out->idx_v = -1;
+    out->scale = 0;
+    out->disp = 0;
     if (ptr_v < 0 || ptr_v >= c->f->nvalues || !c->defins) return;
+
     Instr *d = c->defins[ptr_v];
-    if (d && d->op == OP_GEP) {
-        int64_t imm;
-        if (be_iconst_val(c->f, d->b, &imm)) {
-            int esz = (int)mem_size_of(d->ety, c->vl);
-            *base_v = d->a;
-            *disp_out = (int)(imm * esz);
+    if (!d || d->op != OP_GEP) return;
+
+    int esz = (int)mem_size_of(d->ety, c->vl);
+    int64_t imm;
+    if (be_iconst_val(c->f, d->b, &imm)) {
+        out->disp += (int)(imm * esz);
+        out->base_v = d->a;
+        if (d->a >= 0 && d->a < c->f->nvalues && c->defins[d->a] && c->defins[d->a]->op == OP_GEP) {
+            Instr *d2 = c->defins[d->a];
+            int esz2 = (int)mem_size_of(d2->ety, c->vl);
+            if (be_iconst_val(c->f, d2->b, &imm)) {
+                out->disp += (int)(imm * esz2);
+                out->base_v = d2->a;
+            } else if (esz2 == 1 || esz2 == 2 || esz2 == 4 || esz2 == 8) {
+                out->idx_v = d2->b;
+                out->scale = esz2;
+                out->base_v = d2->a;
+            }
         }
+    } else if (esz == 1 || esz == 2 || esz == 4 || esz == 8) {
+        out->base_v = d->a;
+        out->idx_v = d->b;
+        out->scale = esz;
+        if (d->a >= 0 && d->a < c->f->nvalues && c->defins[d->a] && c->defins[d->a]->op == OP_GEP) {
+            Instr *d2 = c->defins[d->a];
+            if (be_iconst_val(c->f, d2->b, &imm)) {
+                int esz2 = (int)mem_size_of(d2->ety, c->vl);
+                out->disp += (int)(imm * esz2);
+                out->base_v = d2->a;
+            }
+        }
+    }
+}
+
+static bool can_fold_gep(Ctx *c, const X86Addr *a) {
+    if (a->idx_v < 0) return true;
+    if (!c->bf) return true;
+    bool base_reg = (a->base_v >= 0 && c->bf->loc[a->base_v].is_reg);
+    bool idx_reg = (a->idx_v >= 0 && c->bf->loc[a->idx_v].is_reg);
+    return base_reg || idx_reg;
+}
+
+static void format_x86_addr(Ctx *c, char *buf, size_t cap, const X86Addr *a) {
+    const char *basereg = "rax";
+    if (a->base_v >= 0) {
+        Loc *bl = &c->bf->loc[a->base_v];
+        if (bl->is_reg && bl->cls == BCLS_GP) basereg = G64[bl->idx];
+        else load_gp(c, RAX, a->base_v);
+    }
+    const char *idxreg = NULL;
+    if (a->idx_v >= 0) {
+        Loc *il = &c->bf->loc[a->idx_v];
+        if (il->is_reg && il->cls == BCLS_GP) idxreg = G64[il->idx];
+        else { load_gp(c, R11, a->idx_v); idxreg = "r11"; }
+    }
+    if (idxreg) {
+        if (a->scale == 1) {
+            if (a->disp == 0) snprintf(buf, cap, "[%s + %s]", basereg, idxreg);
+            else if (a->disp > 0) snprintf(buf, cap, "[%s + %s + %d]", basereg, idxreg, a->disp);
+            else snprintf(buf, cap, "[%s + %s - %d]", basereg, idxreg, -a->disp);
+        } else {
+            if (a->disp == 0) snprintf(buf, cap, "[%s + %s*%d]", basereg, idxreg, a->scale);
+            else if (a->disp > 0) snprintf(buf, cap, "[%s + %s*%d + %d]", basereg, idxreg, a->scale, a->disp);
+            else snprintf(buf, cap, "[%s + %s*%d - %d]", basereg, idxreg, a->scale, -a->disp);
+        }
+    } else {
+        if (a->disp == 0) snprintf(buf, cap, "[%s]", basereg);
+        else if (a->disp > 0) snprintf(buf, cap, "[%s + %d]", basereg, a->disp);
+        else snprintf(buf, cap, "[%s - %d]", basereg, -a->disp);
     }
 }
 
@@ -115,7 +185,15 @@ static void copy_value(Ctx *c, int dst, int src) {
     if (dst == src) return;
     Type t = c->f->vtypes[src];
     int cls = be_class_of(t);
-    if (cls == BCLS_GP) { load_gp(c, R11, src); store_gp(c, dst, R11); }
+    if (cls == BCLS_GP) {
+        Loc *dl = &c->bf->loc[dst], *sl = &c->bf->loc[src];
+        if (dl->is_reg && sl->is_reg) {
+            if (dl->idx != sl->idx) E(c, "  mov %s, %s", G64[dl->idx], G64[sl->idx]);
+        } else {
+            load_gp(c, R11, src);
+            store_gp(c, dst, R11);
+        }
+    }
     else if (cls == BCLS_FP) {
         Loc *dl = &c->bf->loc[dst], *sl = &c->bf->loc[src];
         if (dl->is_reg && sl->is_reg) {
@@ -411,9 +489,16 @@ static void emit_instr(Ctx *c, int bi, int ii) {
     char sb[64], sb2[64];
     switch (in->op) {
     case OP_ICONST: {
-        E(c, "  mov r11, %lld", (long long)in->imm);
-        mask_r11(c, t);
-        store_gp(c, in->result, R11);
+        Loc *dl = &c->bf->loc[in->result];
+        int dreg = (dl->is_reg && dl->cls == BCLS_GP) ? dl->idx : -1;
+        int dreg_use = (dreg >= 0) ? dreg : R11;
+        if (t.bits == 64) {
+            E(c, "  mov %s, %lld", G64[dreg_use], (long long)in->imm);
+        } else {
+            uint32_t imm32 = (uint32_t)(in->imm & msk64(t.bits));
+            E(c, "  mov %s, %u", G32[dreg_use], imm32);
+        }
+        if (dreg < 0) store_gp(c, in->result, R11);
         break;
     }
     case OP_FCONST: {
@@ -448,12 +533,35 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         const char *nm = in->op == OP_ADD ? "add" : in->op == OP_SUB ? "sub" :
                          in->op == OP_AND ? "and" : in->op == OP_OR ? "or" :
                          in->op == OP_XOR ? "xor" : "imul";
-        load_gp(c, R11, in->a);
-        locstr(c, sb, sizeof sb, in->b, t.bits == 64 ? 8 : 4);
-        if (t.bits == 64) E(c, "  %s r11, %s", nm, sb);
-        else E(c, "  %s r11d, %s", nm, sb);
-        mask_r11(c, t);
-        store_gp(c, in->result, R11);
+        Loc *dl = &c->bf->loc[in->result];
+        int dreg = (dl->is_reg && dl->cls == BCLS_GP) ? dl->idx : -1;
+        int dreg_use = (dreg >= 0) ? dreg : R11;
+        int64_t imm;
+        if (in->op != OP_MUL && be_iconst_val(f, in->b, &imm) && imm >= -2147483648LL && imm <= 2147483647LL) {
+            snprintf(sb, sizeof sb, "%lld", (long long)imm);
+        } else {
+            locstr(c, sb, sizeof sb, in->b, t.bits == 64 ? 8 : 4);
+        }
+
+        if (t.bits == 64) {
+            load_gp(c, dreg_use, in->a);
+            E(c, "  %s %s, %s", nm, G64[dreg_use], sb);
+        } else {
+            Loc *al = &c->bf->loc[in->a];
+            if (al->is_reg && al->cls == BCLS_GP && al->idx == dreg_use) {
+                /* already in dreg_use */
+            } else {
+                char ab[64]; locstr(c, ab, sizeof ab, in->a, 4);
+                E(c, "  mov %s, %s", G32[dreg_use], ab);
+            }
+            E(c, "  %s %s, %s", nm, G32[dreg_use], sb);
+            if (t.bits < 32) {
+                int k = 64 - t.bits;
+                E(c, "  shl %s, %d", G64[dreg_use], k);
+                E(c, "  shr %s, %d", G64[dreg_use], k);
+            }
+        }
+        if (dreg < 0) store_gp(c, in->result, R11);
         break;
     }
     case OP_NEG:
@@ -470,22 +578,47 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         break;
     case OP_SHL: case OP_LSHR: case OP_ASHR: {
         const char *nm = in->op == OP_SHL ? "shl" : in->op == OP_LSHR ? "shr" : "sar";
-        load_gp(c, R11, in->a);
-        if (in->op == OP_ASHR) sext_r11(c, t.bits);
+        Loc *dl = &c->bf->loc[in->result];
+        int dreg = (dl->is_reg && dl->cls == BCLS_GP) ? dl->idx : -1;
+        int dreg_use = (dreg >= 0) ? dreg : R11;
         int64_t k;
-        if (be_iconst_val(f, in->b, &k)) {
-            /* mathematical mod: C's % keeps the sign, semantics don't */
-            int amt = t.bits ? (int)(((k % t.bits) + t.bits) % t.bits) : 0;
-            if (t.bits == 64) E(c, "  %s r11, %d", nm, amt);
-            else E(c, "  %s r11d, %d", nm, amt);
+        bool is_const = be_iconst_val(f, in->b, &k);
+        int amt = t.bits ? (int)(((k % t.bits) + t.bits) % t.bits) : 0;
+
+        if (t.bits == 64) {
+            load_gp(c, dreg_use, in->a);
+            if (in->op == OP_ASHR && t.bits < 64) sext_r11(c, t.bits);
+            if (is_const) E(c, "  %s %s, %d", nm, G64[dreg_use], amt);
+            else {
+                load_gp(c, RCX, in->b);
+                E(c, "  %s %s, cl", nm, G64[dreg_use]);
+            }
         } else {
-            load_gp(c, RCX, in->b);
-            if (t.bits < 64) E(c, "  and ecx, %d", t.bits - 1);
-            if (t.bits == 64) E(c, "  %s r11, cl", nm);
-            else E(c, "  %s r11d, cl", nm);
+            Loc *al = &c->bf->loc[in->a];
+            if (al->is_reg && al->cls == BCLS_GP && al->idx == dreg_use) {
+                /* already in dreg_use */
+            } else {
+                char ab[64]; locstr(c, ab, sizeof ab, in->a, 4);
+                E(c, "  mov %s, %s", G32[dreg_use], ab);
+            }
+            if (in->op == OP_ASHR && t.bits < 32) {
+                int sgn_k = 64 - t.bits;
+                E(c, "  shl %s, %d", G64[dreg_use], sgn_k);
+                E(c, "  sar %s, %d", G64[dreg_use], sgn_k);
+            }
+            if (is_const) E(c, "  %s %s, %d", nm, G32[dreg_use], amt);
+            else {
+                load_gp(c, RCX, in->b);
+                E(c, "  and ecx, %d", t.bits - 1);
+                E(c, "  %s %s, cl", nm, G32[dreg_use]);
+            }
+            if (t.bits < 32) {
+                int k_bits = 64 - t.bits;
+                E(c, "  shl %s, %d", G64[dreg_use], k_bits);
+                E(c, "  shr %s, %d", G64[dreg_use], k_bits);
+            }
         }
-        mask_r11(c, t);
-        store_gp(c, in->result, R11);
+        if (dreg < 0) store_gp(c, in->result, R11);
         break;
     }
     case OP_UDIV: emit_div(c, in, false, false); break;
@@ -495,11 +628,34 @@ static void emit_instr(Ctx *c, int bi, int ii) {
     case OP_ICMP: {
         static const char *CC[10] = { "e","ne","b","be","a","ae","l","le","g","ge" };
         bool sgn = in->pred >= IC_SLT;
-        load_gp(c, R11, in->a);
-        if (sgn) sext_r11(c, f->vtypes[in->a].bits);
-        load_gp(c, RAX, in->b);
-        if (sgn) sext_rax(c, f->vtypes[in->b].bits);
-        E(c, "  cmp r11, rax");
+        int bits = f->vtypes[in->a].bits;
+        Loc *al = &c->bf->loc[in->a];
+        int areg = (al->is_reg && al->cls == BCLS_GP) ? al->idx : -1;
+        int use_reg = -1;
+        if (areg >= 0 && (bits == 32 || bits == 64)) {
+            use_reg = areg;
+        } else {
+            load_gp(c, R11, in->a);
+            if (sgn) sext_r11(c, bits);
+            use_reg = R11;
+        }
+        const char *reg_str = (bits == 32) ? G32[use_reg] : G64[use_reg];
+        int64_t imm;
+        if (be_iconst_val(f, in->b, &imm) && imm >= -2147483648LL && imm <= 2147483647LL) {
+            E(c, "  cmp %s, %lld", reg_str, (long long)imm);
+        } else {
+            Loc *bl = &c->bf->loc[in->b];
+            int breg = (bl->is_reg && bl->cls == BCLS_GP) ? bl->idx : -1;
+            if (breg >= 0 && (bits == 32 || bits == 64)) {
+                const char *breg_str = (bits == 32) ? G32[breg] : G64[breg];
+                E(c, "  cmp %s, %s", reg_str, breg_str);
+            } else {
+                load_gp(c, RAX, in->b);
+                if (sgn) sext_rax(c, bits);
+                const char *rax_str = (bits == 32) ? "eax" : "rax";
+                E(c, "  cmp %s, %s", reg_str, rax_str);
+            }
+        }
         if (c->cmp_fuse && in->result >= 0 && c->cmp_fuse[in->result]) break;
         E(c, "  set%s al", CC[in->pred]);
         E(c, "  movzx eax, al");
@@ -541,12 +697,29 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         store_gp(c, in->result, R11);
         break;
     case OP_ZEXT: copy_value(c, in->result, in->a); break;
-    case OP_SEXT:
-        load_gp(c, R11, in->a);
-        sext_r11(c, f->vtypes[in->a].bits);
-        mask_r11(c, t);
-        store_gp(c, in->result, R11);
+    case OP_SEXT: {
+        Loc *dl = &c->bf->loc[in->result];
+        int dreg = (dl->is_reg && dl->cls == BCLS_GP) ? dl->idx : -1;
+        int dreg_use = (dreg >= 0) ? dreg : R11;
+        Type st = f->vtypes[in->a];
+        if (st.bits == 32 && t.bits == 64) {
+            char ab[64]; locstr(c, ab, sizeof ab, in->a, 4);
+            E(c, "  movsxd %s, %s", G64[dreg_use], ab);
+        } else {
+            load_gp(c, dreg_use, in->a);
+            if (st.bits < 64) {
+                E(c, "  shl %s, %d", G64[dreg_use], 64 - st.bits);
+                E(c, "  sar %s, %d", G64[dreg_use], 64 - st.bits);
+            }
+            if (t.bits < 64) {
+                int k = 64 - t.bits;
+                E(c, "  shl %s, %d", G64[dreg_use], k);
+                E(c, "  shr %s, %d", G64[dreg_use], k);
+            }
+        }
+        if (dreg < 0) store_gp(c, in->result, R11);
         break;
+    }
     case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FDIV: {
         const char *nm = in->op == OP_FADD ? "add" : in->op == OP_FSUB ? "sub" :
                          in->op == OP_FMUL ? "mul" : "div";
@@ -677,65 +850,74 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         break;
     }
     case OP_LOAD: {
-        int base_v, disp;
-        resolve_addr(c, in->a, &base_v, &disp);
-        Loc *bl = &c->bf->loc[base_v];
-        const char *basereg = "rax";
-        if (bl->is_reg && bl->cls == BCLS_GP) basereg = G64[bl->idx];
-        else load_gp(c, RAX, base_v);
-        char mstr[64];
-        if (disp == 0) snprintf(mstr, sizeof mstr, "[%s]", basereg);
-        else if (disp > 0) snprintf(mstr, sizeof mstr, "[%s + %d]", basereg, disp);
-        else snprintf(mstr, sizeof mstr, "[%s - %d]", basereg, -disp);
-        if (t.kind == TY_FLOAT) {
-            E(c, "  %s xmm15, %s", t.bits == 32 ? "movss" : "movsd", mstr);
-            store_fp(c, in->result, 15);
+        X86Addr addr;
+        if (c->folded_ins && in->a >= 0 && in->a < f->nvalues && c->folded_ins[in->a]) {
+            resolve_x86_addr(c, in->a, &addr);
         } else {
+            addr = (X86Addr){ .base_v = in->a, .idx_v = -1, .scale = 1, .disp = 0 };
+        }
+        char mstr[64];
+        format_x86_addr(c, mstr, sizeof mstr, &addr);
+        if (t.kind == TY_FLOAT) {
+            Loc *rl = &c->bf->loc[in->result];
+            int xmm = (rl->is_reg && rl->cls == BCLS_FP) ? rl->idx : 15;
+            E(c, "  %s xmm%d, %s", t.bits == 32 ? "movss" : "movsd", xmm, mstr);
+            if (!rl->is_reg) store_fp(c, in->result, 15);
+        } else {
+            Loc *rl = &c->bf->loc[in->result];
+            int dreg = (rl->is_reg && rl->cls == BCLS_GP) ? rl->idx : R11;
             const char *szp = t.bits == 8 ? "BYTE PTR" : t.bits == 16 ? "WORD PTR" : t.bits == 32 ? "DWORD PTR" : "QWORD PTR";
-            if (t.bits == 8 || t.bits == 16) E(c, "  movzx r11d, %s %s", szp, mstr);
-            else if (t.bits == 32) E(c, "  mov r11d, DWORD PTR %s", mstr);
-            else E(c, "  mov r11, QWORD PTR %s", mstr);
-            if (t.bits == 1) E(c, "  and r11, 1");
-            store_gp(c, in->result, R11);
+            if (t.bits == 8 || t.bits == 16) E(c, "  movzx %s, %s %s", G32[dreg], szp, mstr);
+            else if (t.bits == 32) E(c, "  mov %s, DWORD PTR %s", G32[dreg], mstr);
+            else E(c, "  mov %s, QWORD PTR %s", G64[dreg], mstr);
+            if (t.bits == 1) E(c, "  and %s, 1", G32[dreg]);
+            if (!rl->is_reg) store_gp(c, in->result, R11);
         }
         break;
     }
     case OP_STORE: {
-        int base_v, disp;
-        resolve_addr(c, in->a, &base_v, &disp);
-        Loc *bl = &c->bf->loc[base_v];
-        const char *basereg = "rax";
-        if (bl->is_reg && bl->cls == BCLS_GP) basereg = G64[bl->idx];
-        else load_gp(c, RAX, base_v);
+        X86Addr addr;
+        if (c->folded_ins && in->a >= 0 && in->a < f->nvalues && c->folded_ins[in->a]) {
+            resolve_x86_addr(c, in->a, &addr);
+        } else {
+            addr = (X86Addr){ .base_v = in->a, .idx_v = -1, .scale = 1, .disp = 0 };
+        }
         char mstr[64];
-        if (disp == 0) snprintf(mstr, sizeof mstr, "[%s]", basereg);
-        else if (disp > 0) snprintf(mstr, sizeof mstr, "[%s + %d]", basereg, disp);
-        else snprintf(mstr, sizeof mstr, "[%s - %d]", basereg, -disp);
+        format_x86_addr(c, mstr, sizeof mstr, &addr);
         Type vt = f->vtypes[in->b];
+        if (in->b >= 0 && in->b < f->nvalues && c->folded_ins && c->folded_ins[in->b]) {
+            const char *szp = vt.bits == 8 ? "BYTE PTR" : vt.bits == 16 ? "WORD PTR" : vt.bits == 32 ? "DWORD PTR" : "QWORD PTR";
+            E(c, "  inc %s %s", szp, mstr);
+            break;
+        }
         if (vt.kind == TY_FLOAT) {
             load_fp(c, 15, in->b);
             E(c, "  %s %s, xmm15", vt.bits == 32 ? "movss" : "movsd", mstr);
         } else {
-            load_gp(c, R11, in->b);
-            const char *r = vt.bits == 8 ? "r11b" : vt.bits == 16 ? "r11w" : vt.bits == 32 ? "r11d" : "r11";
-            E(c, "  mov %s, %s", mstr, r);
+            Loc *bl = &c->bf->loc[in->b];
+            const char *src_str = "r11";
+            if (bl->is_reg && bl->cls == BCLS_GP) {
+                src_str = vt.bits == 8 ? G8[bl->idx] : vt.bits == 16 ? G16[bl->idx] : vt.bits == 32 ? G32[bl->idx] : G64[bl->idx];
+            } else {
+                load_gp(c, R11, in->b);
+                src_str = vt.bits == 8 ? "r11b" : vt.bits == 16 ? "r11w" : vt.bits == 32 ? "r11d" : "r11";
+            }
+            E(c, "  mov %s, %s", mstr, src_str);
         }
         break;
     }
     case OP_VLOAD: case OP_VSTORE: {
-        int base_v, disp;
-        resolve_addr(c, in->a, &base_v, &disp);
-        Loc *bl = &c->bf->loc[base_v];
-        const char *basereg = "rax";
-        if (bl->is_reg && bl->cls == BCLS_GP) basereg = G64[bl->idx];
-        else load_gp(c, RAX, base_v);
+        X86Addr addr;
+        if (c->folded_ins && in->a >= 0 && in->a < f->nvalues && c->folded_ins[in->a]) {
+            resolve_x86_addr(c, in->a, &addr);
+        } else {
+            addr = (X86Addr){ .base_v = in->a, .idx_v = -1, .scale = 1, .disp = 0 };
+        }
+        char mstr[64];
+        format_x86_addr(c, mstr, sizeof mstr, &addr);
         int v = in->op == OP_VLOAD ? in->result : in->b;
         Loc *l = &c->bf->loc[v];
         if (l->is_reg) {
-            char mstr[64];
-            if (disp == 0) snprintf(mstr, sizeof mstr, "[%s]", basereg);
-            else if (disp > 0) snprintf(mstr, sizeof mstr, "[%s + %d]", basereg, disp);
-            else snprintf(mstr, sizeof mstr, "[%s - %d]", basereg, -disp);
             const char *vop = "movups";
             const char *env_al = getenv("KRELL_VECTOR_ALIGN");
             if (env_al && strcmp(env_al, "aligned") == 0) vop = "movaps";
@@ -748,17 +930,16 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         if (in->op == OP_VLOAD) bytes = 16 * t.n;
         else bytes = 16 * f->vtypes[in->b].n;
         for (int off = 0; off < bytes; off += 16) {
-            char mstr[64];
-            int total_off = disp + off;
-            if (total_off == 0) snprintf(mstr, sizeof mstr, "[%s]", basereg);
-            else if (total_off > 0) snprintf(mstr, sizeof mstr, "[%s + %d]", basereg, total_off);
-            else snprintf(mstr, sizeof mstr, "[%s - %d]", basereg, -total_off);
+            char chunk_mstr[64];
+            X86Addr chunk_addr = addr;
+            chunk_addr.disp += off;
+            format_x86_addr(c, chunk_mstr, sizeof chunk_mstr, &chunk_addr);
             if (in->op == OP_VLOAD) {
-                E(c, "  movups xmm15, %s", mstr);
+                E(c, "  movups xmm15, %s", chunk_mstr);
                 E(c, "  movups [rbp - %d], xmm15", l->off - off);
             } else {
-                E(c, "  movups xmm15, [rbp - %d]", l->off - off);
-                E(c, "  movups %s, xmm15", mstr);
+                E(c, "  movups xmm15, [rbp - %d], xmm15", l->off - off);
+                E(c, "  movups %s, xmm15", chunk_mstr);
             }
         }
         break;
@@ -1124,12 +1305,37 @@ static void emit_instr(Ctx *c, int bi, int ii) {
     }
     case OP_ASSUME: break;
     case OP_BR:
+        if (in->nargs == 0 && in->blk == bi + 1) break;
         emit_branch(c, in->blk, in->args, in->nargs);
         break;
     case OP_CONDBR: {
+        static const char *CC[10] = { "e","ne","b","be","a","ae","l","le","g","ge" };
+        static const char *INV_CC[10] = { "ne","e","ae","a","be","b","ge","g","le","l" };
+        if (in->nargs == 0 && in->nargs2 == 0) {
+            if (in->blk == bi + 1) {
+                if (c->cmp_fuse && in->a >= 0 && c->cmp_fuse[in->a]) {
+                    Instr *d = c->defins[in->a];
+                    E(c, "  j%s .Lb%d_%d", INV_CC[d->pred], c->fi, in->blk2);
+                } else {
+                    load_gp(c, R11, in->a);
+                    E(c, "  test r11, r11");
+                    E(c, "  je .Lb%d_%d", c->fi, in->blk2);
+                }
+                break;
+            } else if (in->blk2 == bi + 1) {
+                if (c->cmp_fuse && in->a >= 0 && c->cmp_fuse[in->a]) {
+                    Instr *d = c->defins[in->a];
+                    E(c, "  j%s .Lb%d_%d", CC[d->pred], c->fi, in->blk);
+                } else {
+                    load_gp(c, R11, in->a);
+                    E(c, "  test r11, r11");
+                    E(c, "  jne .Lb%d_%d", c->fi, in->blk);
+                }
+                break;
+            }
+        }
         int L = ++c->lbl;
         if (c->cmp_fuse && in->a >= 0 && c->cmp_fuse[in->a]) {
-            static const char *INV_CC[10] = { "ne", "e", "ae", "a", "be", "b", "ge", "g", "le", "l" };
             Instr *d = c->defins[in->a];
             E(c, "  j%s .Lx%d_%d", INV_CC[d->pred], c->fi, L);
         } else {
@@ -1157,6 +1363,143 @@ static void emit_instr(Ctx *c, int bi, int ii) {
     (void)sb2;
 }
 
+typedef struct {
+    bool eligible;
+    int early_blk;
+    int other_blk;
+    int early_arm;     /* 1 for term->blk, 2 for term->blk2 */
+    int pred;
+    int a_arg_idx;
+    bool b_is_const;
+    int64_t b_const;
+    int b_arg_idx;
+    int ret_arg_idx;   /* -1 if const */
+    int64_t ret_const;
+    bool ret_is_void;
+    const int32_t *other_args;
+    int other_nargs;
+} EarlyReturn;
+
+static EarlyReturn detect_early_return(Func *f) {
+    EarlyReturn er = { 0 };
+    if (f->nblocks < 2) return er;
+    Block *b0 = &f->blocks[0];
+    if (b0->nins < 1) return er;
+    Instr *term = &b0->ins[b0->nins - 1];
+    if (term->op != OP_CONDBR) return er;
+
+    /* Check all instructions before term in b0: only iconst or the cmp */
+    Instr *cmp = NULL;
+    for (int i = 0; i < b0->nins - 1; i++) {
+        Instr *in = &b0->ins[i];
+        if (in->op == OP_ICONST) continue;
+        if (in->op == OP_ICMP && in->result == term->a) {
+            cmp = in;
+            continue;
+        }
+        return er; /* unknown instruction in b0 */
+    }
+    if (!cmp) return er;
+
+    /* LHS of cmp must be an incoming GP argument (< 6) */
+    int a_idx = -1;
+    for (int i = 0; i < b0->nargs; i++) {
+        if (b0->arg_vals[i] == cmp->a) { a_idx = i; break; }
+    }
+    if (a_idx < 0 || a_idx >= 6) return er;
+
+    /* RHS of cmp must be an int constant or another argument (< 6) */
+    int64_t kval;
+    bool b_const = false;
+    int b_idx = -1;
+    if (be_iconst_val(f, cmp->b, &kval) && kval >= -2147483648LL && kval <= 2147483647LL) {
+        b_const = true;
+    } else {
+        for (int i = 0; i < b0->nargs; i++) {
+            if (b0->arg_vals[i] == cmp->b) { b_idx = i; break; }
+        }
+        if (b_idx < 0 || b_idx >= 6) return er;
+    }
+
+    /* Compute predecessor counts of each block */
+    int *preds = calloc((size_t)f->nblocks, sizeof(int));
+    for (int b = 0; b < f->nblocks; b++) {
+        Block *blk = &f->blocks[b];
+        for (int i = 0; i < blk->nins; i++) {
+            Instr *in = &blk->ins[i];
+            if (in->op == OP_BR && in->blk >= 0 && in->blk < f->nblocks) preds[in->blk]++;
+            if (in->op == OP_CONDBR) {
+                if (in->blk >= 0 && in->blk < f->nblocks) preds[in->blk]++;
+                if (in->blk2 >= 0 && in->blk2 < f->nblocks) preds[in->blk2]++;
+            }
+        }
+    }
+
+    /* Check if target block is a single-instruction OP_RET with single predecessor */
+    for (int arm = 1; arm <= 2; arm++) {
+        int tgt = (arm == 1) ? term->blk : term->blk2;
+        int other = (arm == 1) ? term->blk2 : term->blk;
+        if (tgt < 0 || tgt >= f->nblocks) continue;
+        if (preds[tgt] != 1) continue;
+        Block *tb = &f->blocks[tgt];
+        if (tb->nins != 1 || tb->ins[0].op != OP_RET) continue;
+
+        Instr *ret_in = &tb->ins[0];
+        if (ret_in->a < 0) {
+            er.eligible = true;
+            er.ret_is_void = true;
+        } else {
+            /* Check if ret_in->a is directly one of b0's incoming args */
+            int p_idx = -1;
+            for (int i = 0; i < b0->nargs; i++) {
+                if (b0->arg_vals[i] == ret_in->a) { p_idx = i; break; }
+            }
+            if (p_idx >= 0 && p_idx < 6) {
+                er.eligible = true;
+                er.ret_arg_idx = p_idx;
+            } else if (tb->nargs >= 1 && ret_in->a == tb->arg_vals[0]) {
+                int passed_v = (arm == 1) ? term->args[0] : term->args2[0];
+                int64_t rk;
+                if (be_iconst_val(f, passed_v, &rk)) {
+                    er.eligible = true;
+                    er.ret_arg_idx = -1;
+                    er.ret_const = rk;
+                } else {
+                    for (int i = 0; i < b0->nargs; i++) {
+                        if (b0->arg_vals[i] == passed_v) { p_idx = i; break; }
+                    }
+                    if (p_idx >= 0 && p_idx < 6) {
+                        er.eligible = true;
+                        er.ret_arg_idx = p_idx;
+                    }
+                }
+            } else {
+                int64_t rk;
+                if (be_iconst_val(f, ret_in->a, &rk)) {
+                    er.eligible = true;
+                    er.ret_arg_idx = -1;
+                    er.ret_const = rk;
+                }
+            }
+        }
+        if (er.eligible) {
+            er.early_blk = tgt;
+            er.other_blk = other;
+            er.early_arm = arm;
+            er.pred = cmp->pred;
+            er.a_arg_idx = a_idx;
+            er.b_is_const = b_const;
+            er.b_const = kval;
+            er.b_arg_idx = b_idx;
+            er.other_args = (arm == 1) ? term->args2 : term->args;
+            er.other_nargs = (arm == 1) ? term->nargs2 : term->nargs;
+            break;
+        }
+    }
+    free(preds);
+    return er;
+}
+
 static int emit_func(Ctx *c, int fi) {
     Module *m = c->m;
     Func *f = &m->funcs[fi];
@@ -1182,14 +1525,42 @@ static int emit_func(Ctx *c, int fi) {
             for (int k = 0; k < in->nargs2; k++) uses[in->args2[k]]++;
         }
     }
+    /* RMW pass: find load64 + add 1 + store64 patterns */
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = &f->blocks[bi];
         for (int ii = 0; ii < b->nins; ii++) {
             Instr *in = &b->ins[ii];
+            if (in->op == OP_STORE) {
+                int val_v = in->b;
+                if (val_v >= 0 && val_v < f->nvalues && c->defins[val_v]) {
+                    Instr *ain = c->defins[val_v];
+                    if (ain->op == OP_ADD && uses[val_v] == 1) {
+                        int64_t kval;
+                        int load_v = -1;
+                        if (be_iconst_val(f, ain->b, &kval) && kval == 1) load_v = ain->a;
+                        else if (be_iconst_val(f, ain->a, &kval) && kval == 1) load_v = ain->b;
+                        if (load_v >= 0 && load_v < f->nvalues && c->defins[load_v]) {
+                            Instr *lin = c->defins[load_v];
+                            if (lin->op == OP_LOAD && lin->a == in->a && uses[load_v] == 1) {
+                                c->folded_ins[val_v] = true;
+                                c->folded_ins[load_v] = true;
+                                uses[in->a]--;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = &f->blocks[bi];
+        for (int ii = 0; ii < b->nins; ii++) {
+            Instr *in = &b->ins[ii];
+            if (in->op == OP_LOAD && in->result >= 0 && c->folded_ins[in->result]) continue;
             if (in->op == OP_LOAD || in->op == OP_STORE || in->op == OP_VLOAD || in->op == OP_VSTORE) {
-                int base_v, disp;
-                resolve_addr(c, in->a, &base_v, &disp);
-                if (disp != 0 && in->a != base_v) {
+                X86Addr addr;
+                resolve_x86_addr(c, in->a, &addr);
+                if (can_fold_gep(c, &addr) && addr.base_v != in->a && uses[in->a] == 1) {
                     uses[in->a]--;
                 }
             }
@@ -1200,15 +1571,29 @@ static int emit_func(Ctx *c, int fi) {
         for (int ii = 0; ii < b->nins; ii++) {
             Instr *in = &b->ins[ii];
             if (in->op == OP_GEP && in->result >= 0 && uses[in->result] == 0) {
-                int64_t imm;
-                if (be_iconst_val(f, in->b, &imm)) {
-                    c->folded_ins[in->result] = true;
-                    uses[in->b]--;
-                    if (uses[in->b] == 0 && c->defins[in->b] && c->defins[in->b]->op == OP_ICONST) {
-                        c->folded_ins[in->b] = true;
-                    }
+                c->folded_ins[in->result] = true;
+                uses[in->b]--;
+                if (uses[in->b] == 0 && c->defins[in->b] && c->defins[in->b]->op == OP_ICONST) {
+                    c->folded_ins[in->b] = true;
                 }
             }
+        }
+    }
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = &f->blocks[bi];
+        for (int ii = 0; ii < b->nins; ii++) {
+            Instr *in = &b->ins[ii];
+            if (in->op == OP_ICMP || (in->op >= OP_ADD && in->op <= OP_XOR && in->op != OP_MUL)) {
+                int64_t imm;
+                if (in->b >= 0 && be_iconst_val(f, in->b, &imm) && imm >= -2147483648LL && imm <= 2147483647LL) {
+                    uses[in->b]--;
+                }
+            }
+        }
+    }
+    for (int v = 0; v < f->nvalues; v++) {
+        if (uses[v] == 0 && c->defins[v] && c->defins[v]->op == OP_ICONST) {
+            c->folded_ins[v] = true;
         }
     }
     c->cmp_fuse = calloc((size_t)f->nvalues, sizeof(bool));
@@ -1236,13 +1621,36 @@ static int emit_func(Ctx *c, int fi) {
         }
     }
     free(uses);
+
+    static const PoolReg POOL_GP[] = {
+        { RSI, 0 }, { RDI, 0 }, { R8, 0 }, { R9, 0 }, { R10, 0 },
+        { RBX, 1 }, { R12, 1 }, { R13, 1 }, { R14, 1 }, { R15, 1 },
+    };
     Pools pools = { POOL_GP, 10, POOL_FP, 15 };
-    BeFunc *bf = be_analyze(m, f, &pools);
+    BeFunc *bf = be_analyze_ext(m, f, &pools, c->folded_ins);
     if (!bf) { free(c->defins); c->defins = NULL; free(c->folded_ins); c->folded_ins = NULL; free(c->cmp_fuse); c->cmp_fuse = NULL; return -1; }
     c->bf = bf;
+    EarlyReturn er = detect_early_return(f);
+    int early_lbl = 0;
     E(c, ".globl %s", f->name);
     E(c, ".type %s, @function", f->name);
     E(c, "%s:", f->name);
+    if (er.eligible) {
+        early_lbl = ++c->lbl;
+        const char *areg = G64[ARG_GP[er.a_arg_idx]];
+        if (er.b_is_const) {
+            E(c, "  cmp %s, %lld", areg, (long long)er.b_const);
+        } else {
+            E(c, "  cmp %s, %s", areg, G64[ARG_GP[er.b_arg_idx]]);
+        }
+        static const char *CC[10] = { "e","ne","b","be","a","ae","l","le","g","ge" };
+        static const char *INV_CC[10] = { "ne","e","ae","a","be","b","ge","g","le","l" };
+        if (er.early_arm == 1) {
+            E(c, "  j%s .Lx%d_%d", CC[er.pred], fi, early_lbl);
+        } else {
+            E(c, "  j%s .Lx%d_%d", INV_CC[er.pred], fi, early_lbl);
+        }
+    }
     E(c, "  push rbp");
     E(c, "  mov rbp, rsp");
     if (bf->frame_bytes) E(c, "  sub rsp, %d", bf->frame_bytes);
@@ -1288,7 +1696,21 @@ static int emit_func(Ctx *c, int fi) {
             }
         }
     }
+    if (er.eligible) {
+        emit_branch(c, er.other_blk, er.other_args, er.other_nargs);
+        E(c, ".Lx%d_%d:", fi, early_lbl);
+        if (er.ret_is_void) {
+            E(c, "  ret");
+        } else if (er.ret_arg_idx >= 0) {
+            if (ARG_GP[er.ret_arg_idx] != RAX) E(c, "  mov rax, %s", G64[ARG_GP[er.ret_arg_idx]]);
+            E(c, "  ret");
+        } else {
+            E(c, "  mov rax, %lld", (long long)er.ret_const);
+            E(c, "  ret");
+        }
+    }
     for (int b = 0; b < f->nblocks; b++) {
+        if (er.eligible && (b == 0 || b == er.early_blk)) continue;
         E(c, ".Lb%d_%d:", fi, b);
         for (int i = 0; i < f->blocks[b].nins; i++)
             emit_instr(c, b, i);

@@ -1111,6 +1111,165 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
     }
 }
 
+static bool opt_eliminate_block_args(Func *f, OptStats *st) {
+    if (f->nblocks <= 1) return false;
+    int nb = f->nblocks;
+    int W = (nb + 63) / 64;
+    size_t nnb = (size_t)nb;
+
+    /* Compute dominators */
+    uint64_t *doms = calloc(nnb * (size_t)W, sizeof(uint64_t));
+    for (int i = 0; i < nb; i++)
+        for (int w = 0; w < W; w++) doms[(size_t)i * W + w] = ~0ull;
+    for (int w = 0; w < W; w++) doms[w] = 0;
+    doms[0] = 1ull;
+
+    int *npred = calloc(nnb, sizeof(int));
+    int **preds = calloc(nnb, sizeof(int *));
+    int *predcap = calloc(nnb, sizeof(int));
+    for (int bi = 0; bi < nb; bi++) {
+        Block *b = &f->blocks[bi];
+        if (b->nins == 0) continue;
+        Instr *t = &b->ins[b->nins - 1];
+        int tg[2] = { -1, -1 };
+        if (t->op == OP_BR) tg[0] = t->blk;
+        if (t->op == OP_CONDBR) { tg[0] = t->blk; tg[1] = t->blk2; }
+        for (int k = 0; k < 2; k++) if (tg[k] >= 0) {
+            int d = tg[k];
+            if (npred[d] == predcap[d]) { predcap[d] = predcap[d] ? predcap[d] * 2 : 4; preds[d] = realloc(preds[d], sizeof(int) * (size_t)predcap[d]); }
+            preds[d][npred[d]++] = bi;
+        }
+    }
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int i = 1; i < nb; i++) {
+            if (npred[i] == 0) continue;
+            uint64_t *nd = malloc(sizeof(uint64_t) * (size_t)W);
+            for (int w = 0; w < W; w++) nd[w] = ~0ull;
+            for (int p = 0; p < npred[i]; p++)
+                for (int w = 0; w < W; w++) nd[w] &= doms[(size_t)preds[i][p] * W + w];
+            nd[i / 64] |= (1ull << (i % 64));
+            if (memcmp(nd, &doms[(size_t)i * W], sizeof(uint64_t) * (size_t)W) != 0) {
+                memcpy(&doms[(size_t)i * W], nd, sizeof(uint64_t) * (size_t)W);
+                changed = true;
+            }
+            free(nd);
+        }
+    }
+    #define DOM(d, b) ((doms[(size_t)(b) * W + (d) / 64] >> ((d) % 64)) & 1ull)
+
+    /* Find defining block for each value */
+    int nv = f->nvalues;
+    int *defblk = malloc(sizeof(int) * (size_t)(nv > 0 ? nv : 1));
+    for (int v = 0; v < nv; v++) defblk[v] = -1;
+    for (int bi = 0; bi < nb; bi++) {
+        Block *b = &f->blocks[bi];
+        for (int a = 0; a < b->nargs; a++) defblk[b->arg_vals[a]] = bi;
+        for (int ii = 0; ii < b->nins; ii++)
+            if (b->ins[ii].result >= 0) defblk[b->ins[ii].result] = bi;
+    }
+
+    bool any_eliminated = false;
+    bool progress = true;
+    while (progress) {
+        progress = false;
+        for (int bi = 1; bi < nb; bi++) {
+            Block *b = &f->blocks[bi];
+            if (b->nargs == 0) continue;
+            if (npred[bi] == 0) continue;
+
+            for (int a = 0; a < b->nargs; a++) {
+                int val = b->arg_vals[a];
+                int cand = -1;
+                bool ok = true;
+
+                for (int pbi = 0; pbi < nb; pbi++) {
+                    Block *pb = &f->blocks[pbi];
+                    if (pb->nins == 0) continue;
+                    Instr *t = &pb->ins[pb->nins - 1];
+                    if (t->op == OP_BR && t->blk == bi) {
+                        int inc_val = t->args[a];
+                        if (inc_val != val) {
+                            if (cand < 0) cand = inc_val;
+                            else if (cand != inc_val) { ok = false; break; }
+                        }
+                    } else if (t->op == OP_CONDBR) {
+                        if (t->blk == bi) {
+                            int inc_val = t->args[a];
+                            if (inc_val != val) {
+                                if (cand < 0) cand = inc_val;
+                                else if (cand != inc_val) { ok = false; break; }
+                            }
+                        }
+                        if (t->blk2 == bi) {
+                            int inc_val = t->args2[a];
+                            if (inc_val != val) {
+                                if (cand < 0) cand = inc_val;
+                                else if (cand != inc_val) { ok = false; break; }
+                            }
+                        }
+                    }
+                }
+
+                if (!ok || cand < 0) continue;
+                int db = defblk[cand];
+                if (db < 0 || db == bi || !DOM(db, bi)) continue;
+
+                /* cand is invariant and dominates block bi! Eliminate argument a */
+                for (int b_idx = 0; b_idx < nb; b_idx++) {
+                    Block *cb = &f->blocks[b_idx];
+                    for (int ii = 0; ii < cb->nins; ii++) {
+                        Instr *in = &cb->ins[ii];
+                        if (in->a == val) in->a = cand;
+                        if (in->b == val) in->b = cand;
+                        if (in->c == val && in->op != OP_ALLOCA) in->c = cand;
+                        for (int k = 0; k < in->nargs; k++) if (in->args[k] == val) in->args[k] = cand;
+                        for (int k = 0; k < in->nargs2; k++) if (in->args2[k] == val) in->args2[k] = cand;
+                    }
+                }
+
+                /* Remove argument a from all predecessor branches to bi */
+                for (int pbi = 0; pbi < nb; pbi++) {
+                    Block *pb = &f->blocks[pbi];
+                    if (pb->nins == 0) continue;
+                    Instr *t = &pb->ins[pb->nins - 1];
+                    if (t->op == OP_BR && t->blk == bi) {
+                        for (int k = a; k < t->nargs - 1; k++) t->args[k] = t->args[k + 1];
+                        t->nargs--;
+                    } else if (t->op == OP_CONDBR) {
+                        if (t->blk == bi) {
+                            for (int k = a; k < t->nargs - 1; k++) t->args[k] = t->args[k + 1];
+                            t->nargs--;
+                        }
+                        if (t->blk2 == bi) {
+                            for (int k = a; k < t->nargs2 - 1; k++) t->args2[k] = t->args2[k + 1];
+                            t->nargs2--;
+                        }
+                    }
+                }
+
+                /* Remove argument a from block bi */
+                for (int k = a; k < b->nargs - 1; k++) {
+                    b->arg_vals[k] = b->arg_vals[k + 1];
+                    b->arg_types[k] = b->arg_types[k + 1];
+                }
+                b->nargs--;
+                a--;
+                progress = true;
+                any_eliminated = true;
+                if (st) st->rewritten++;
+            }
+        }
+    }
+
+    #undef DOM
+    for (int i = 0; i < nb; i++) free(preds[i]);
+    free(preds); free(npred); free(predcap);
+    free(doms); free(defblk);
+    return any_eliminated;
+}
+
 void opt_optimize(Module *m, const Cost *cost, OptStats *st) {
     OptStats local = { 0, 0, 0, 0 };
     if (!st) st = &local;
@@ -1127,6 +1286,7 @@ void opt_optimize(Module *m, const Cost *cost, OptStats *st) {
         /* seed float constant knowledge for the fold rules */
         optimize_func(&o);
         free(o.subst); free(o.usecount); free(o.konst); free(o.hask);
+        opt_eliminate_block_args(f, st);
     }
     const char *ve = mod_verify(m);
     if (ve && snap) {

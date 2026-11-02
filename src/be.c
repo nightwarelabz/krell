@@ -38,6 +38,10 @@ static int cmp_iv(const void *a, const void *b) {
 }
 
 BeFunc *be_analyze(Module *m, Func *f, const Pools *pools) {
+    return be_analyze_ext(m, f, pools, NULL);
+}
+
+BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folded) {
     (void)m;
     BeFunc *bf = calloc(1, sizeof(BeFunc));
     bf->f = f;
@@ -51,7 +55,8 @@ BeFunc *be_analyze(Module *m, Func *f, const Pools *pools) {
     bf->vec_off = malloc(sizeof(int32_t) * (size_t)nv);
     bf->blkstart = calloc((size_t)(f->nblocks > 0 ? f->nblocks : 1), sizeof(int));
     for (int i = 0; i < f->nvalues; i++) {
-        bf->vclass[i] = (int8_t)be_class_of(f->vtypes[i]);
+        if (folded && folded[i]) bf->vclass[i] = -1;
+        else bf->vclass[i] = (int8_t)be_class_of(f->vtypes[i]);
         bf->vec_off[i] = -1;
     }
     /* positions */
@@ -210,8 +215,8 @@ BeFunc *be_analyze(Module *m, Func *f, const Pools *pools) {
                 ivs[ni].v = v; ivs[ni].cross = bf->crosscall[v]; ni++;
             }
         qsort(ivs, (size_t)ni, sizeof(Iv), cmp_iv);
-        /* active list: (end, reg, callee) */
-        typedef struct { int end, reg; bool callee; } Act;
+        /* active list: (end, reg, v, callee) */
+        typedef struct { int end, reg, v; bool callee; } Act;
         Act *act = malloc(sizeof(Act) * (size_t)(ni > 0 ? ni : 1));
         int na = 0;
         bool *regused = calloc((size_t)npool, 1);
@@ -273,14 +278,39 @@ BeFunc *be_analyze(Module *m, Func *f, const Pools *pools) {
             }
             if (pick >= 0) {
                 regused[pick] = true;
-                act[na].end = iv->end; act[na].reg = pick; act[na].callee = pool[pick].callee_saved != 0; na++;
+                act[na].end = iv->end; act[na].reg = pick; act[na].v = iv->v; act[na].callee = pool[pick].callee_saved != 0; na++;
                 bf->loc[iv->v].is_reg = 1;
                 bf->loc[iv->v].cls = (int8_t)cls;
                 bf->loc[iv->v].idx = pool[pick].reg;
             } else {
-                bf->loc[iv->v].is_reg = 0;
-                bf->loc[iv->v].cls = (int8_t)cls;
-                bf->loc[iv->v].idx = spill_counter++;
+                /* SpillAtInterval: find active interval that ends furthest after iv->end */
+                int furthest = -1;
+                int max_end = iv->end;
+                for (int j = 0; j < na; j++) {
+                    if (iv->cross && !act[j].callee) continue;
+                    if (act[j].end > max_end) {
+                        max_end = act[j].end;
+                        furthest = j;
+                    }
+                }
+                if (furthest >= 0) {
+                    int evict_val = act[furthest].v;
+                    int r = act[furthest].reg;
+                    bf->loc[evict_val].is_reg = 0;
+                    bf->loc[evict_val].cls = (int8_t)cls;
+                    bf->loc[evict_val].idx = spill_counter++;
+
+                    act[furthest].end = iv->end;
+                    act[furthest].v = iv->v;
+                    act[furthest].callee = pool[r].callee_saved != 0;
+                    bf->loc[iv->v].is_reg = 1;
+                    bf->loc[iv->v].cls = (int8_t)cls;
+                    bf->loc[iv->v].idx = pool[r].reg;
+                } else {
+                    bf->loc[iv->v].is_reg = 0;
+                    bf->loc[iv->v].cls = (int8_t)cls;
+                    bf->loc[iv->v].idx = spill_counter++;
+                }
             }
         }
         if (spill_counter > maxslots) maxslots = spill_counter;
