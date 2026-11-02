@@ -1746,35 +1746,18 @@ static int emit_func(Ctx *c, int fi) {
     }
     free(uses);
 
-    bool has_div = false, has_var_shift = false;
-    for (int bi = 0; bi < f->nblocks; bi++) {
-        Block *b = &f->blocks[bi];
-        for (int ii = 0; ii < b->nins; ii++) {
-            Instr *in = &b->ins[ii];
-            if (in->op >= OP_UDIV && in->op <= OP_SREM) has_div = true;
-            if (in->op == OP_SHL || in->op == OP_LSHR || in->op == OP_ASHR) {
-                int64_t k;
-                if (!be_iconst_val(f, in->b, &k)) has_var_shift = true;
-            }
-        }
-    }
-
-    PoolReg pool_gp_storage[14];
-    int ngp = 0;
-    pool_gp_storage[ngp++] = (PoolReg){ RSI, 0 };
-    pool_gp_storage[ngp++] = (PoolReg){ RDI, 0 };
-    pool_gp_storage[ngp++] = (PoolReg){ R8, 0 };
-    pool_gp_storage[ngp++] = (PoolReg){ R9, 0 };
-    pool_gp_storage[ngp++] = (PoolReg){ R10, 0 };
-    if (!has_div) pool_gp_storage[ngp++] = (PoolReg){ RDX, 0 };
-    if (!has_var_shift) pool_gp_storage[ngp++] = (PoolReg){ RCX, 0 };
-    pool_gp_storage[ngp++] = (PoolReg){ RBX, 1 };
-    pool_gp_storage[ngp++] = (PoolReg){ R12, 1 };
-    pool_gp_storage[ngp++] = (PoolReg){ R13, 1 };
-    pool_gp_storage[ngp++] = (PoolReg){ R14, 1 };
-    pool_gp_storage[ngp++] = (PoolReg){ R15, 1 };
-
-    Pools pools = { pool_gp_storage, ngp, POOL_FP, 15 };
+    /* GP pool: RAX/RCX/RDX/R11 stay scratch. The emitter loads RCX for
+     * every non-constant shift and for div/rem, takes RDX for div/rem
+     * (cqo) and for memcpy/memset argument setup, whatever op classes
+     * the function happens to contain -- so neither register may ever
+     * be allocated. (A conditional pool that admitted them broke the
+     * krellproof chart's glyph rendering: live values in RCX/RDX were
+     * clobbered by unrelated shift and copy sequences.) */
+    static const PoolReg POOL_GP[] = {
+        { RSI, 0 }, { RDI, 0 }, { R8, 0 }, { R9, 0 }, { R10, 0 },
+        { RBX, 1 }, { R12, 1 }, { R13, 1 }, { R14, 1 }, { R15, 1 },
+    };
+    Pools pools = { POOL_GP, 10, POOL_FP, 15 };
     BeFunc *bf = be_analyze_ext(m, f, &pools, c->folded_ins);
     if (!bf) { free(c->defins); c->defins = NULL; free(c->folded_ins); c->folded_ins = NULL; free(c->cmp_fuse); c->cmp_fuse = NULL; return -1; }
     c->bf = bf;
