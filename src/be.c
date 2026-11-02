@@ -25,7 +25,16 @@ typedef struct { int start, end, v; bool cross; } Iv;
 
 static int cmp_iv(const void *a, const void *b) {
     const Iv *x = a, *y = b;
-    return x->start < y->start ? -1 : x->start > y->start ? 1 : 0;
+    /* Total order (start, end, value id): qsort leaves the order of
+     * equal elements to the libc, and block arguments tie on start
+     * by construction — without the tie-breaks the allocator walks
+     * tied intervals in libc order and the same module compiles to
+     * different (equivalent) code on different platforms. With a
+     * total order the allocation, and therefore the generated code,
+     * is identical everywhere. */
+    if (x->start != y->start) return x->start < y->start ? -1 : 1;
+    if (x->end != y->end) return x->end < y->end ? -1 : 1;
+    return x->v < y->v ? -1 : x->v > y->v ? 1 : 0;
 }
 
 BeFunc *be_analyze(Module *m, Func *f, const Pools *pools) {
