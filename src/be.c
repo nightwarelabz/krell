@@ -55,6 +55,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
     bf->vec_off = malloc(sizeof(int32_t) * (size_t)nv);
     bf->blkstart = calloc((size_t)(f->nblocks > 0 ? f->nblocks : 1), sizeof(int));
     for (int i = 0; i < f->nvalues; i++) {
+        bf->loc[i].idx = -1;
         if (folded && folded[i]) bf->vclass[i] = -1;
         else bf->vclass[i] = (int8_t)be_class_of(f->vtypes[i]);
         bf->vec_off[i] = -1;
@@ -211,12 +212,13 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
         int ni = 0;
         for (int v = 0; v < f->nvalues; v++)
             if (bf->vclass[v] == cls) {
+                if (bf->defpos[v] == bf->endpos[v]) continue;
                 ivs[ni].start = bf->defpos[v]; ivs[ni].end = bf->endpos[v];
                 ivs[ni].v = v; ivs[ni].cross = bf->crosscall[v]; ni++;
             }
         qsort(ivs, (size_t)ni, sizeof(Iv), cmp_iv);
-        /* active list: (end, reg, v, callee) */
-        typedef struct { int end, reg, v; bool callee; } Act;
+        /* active list: (start, end, reg, v, callee) */
+        typedef struct { int start, end, reg, v; bool callee; } Act;
         Act *act = malloc(sizeof(Act) * (size_t)(ni > 0 ? ni : 1));
         int na = 0;
         bool *regused = calloc((size_t)npool, 1);
@@ -242,7 +244,8 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
             Instr *d = defins[iv->v];
             if (d && (d->op == OP_VADD || d->op == OP_VSUB || d->op == OP_VMUL ||
                       d->op == OP_ADD || d->op == OP_SUB || d->op == OP_MUL ||
-                      d->op == OP_AND || d->op == OP_OR || d->op == OP_XOR)) {
+                      d->op == OP_AND || d->op == OP_OR || d->op == OP_XOR ||
+                      d->op == OP_ZEXT || d->op == OP_TRUNC)) {
                 int a = d->a;
                 if (a >= 0 && bf->vclass[a] == cls && bf->loc[a].is_reg &&
                     bf->endpos[a] == iv->start) {
@@ -278,7 +281,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
             }
             if (pick >= 0) {
                 regused[pick] = true;
-                act[na].end = iv->end; act[na].reg = pick; act[na].v = iv->v; act[na].callee = pool[pick].callee_saved != 0; na++;
+                act[na].start = iv->start; act[na].end = iv->end; act[na].reg = pick; act[na].v = iv->v; act[na].callee = pool[pick].callee_saved != 0; na++;
                 bf->loc[iv->v].is_reg = 1;
                 bf->loc[iv->v].cls = (int8_t)cls;
                 bf->loc[iv->v].idx = pool[pick].reg;
@@ -288,6 +291,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
                 int max_end = iv->end;
                 for (int j = 0; j < na; j++) {
                     if (iv->cross && !act[j].callee) continue;
+                    if (act[j].end - act[j].start > 15 && (iv->end - iv->start) < 8) continue;
                     if (act[j].end > max_end) {
                         max_end = act[j].end;
                         furthest = j;
@@ -300,6 +304,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
                     bf->loc[evict_val].cls = (int8_t)cls;
                     bf->loc[evict_val].idx = spill_counter++;
 
+                    act[furthest].start = iv->start;
                     act[furthest].end = iv->end;
                     act[furthest].v = iv->v;
                     act[furthest].callee = pool[r].callee_saved != 0;
@@ -342,11 +347,11 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
             /* map old per-class slot idx -> new global idx, per class */
             int mx = 0;
             for (int v = 0; v < f->nvalues; v++)
-                if (bf->vclass[v] == cls && !bf->loc[v].is_reg && f->vtypes[v].kind != TY_VEC && bf->loc[v].idx >= mx) mx = bf->loc[v].idx + 1;
+                if (bf->vclass[v] == cls && !bf->loc[v].is_reg && bf->loc[v].idx >= 0 && f->vtypes[v].kind != TY_VEC && bf->loc[v].idx >= mx) mx = bf->loc[v].idx + 1;
             int *map = malloc(sizeof(int) * (size_t)(mx > 0 ? mx : 1));
             for (int i = 0; i < mx; i++) map[i] = next++;
             for (int v = 0; v < f->nvalues; v++)
-                if (bf->vclass[v] == cls && !bf->loc[v].is_reg && f->vtypes[v].kind != TY_VEC) bf->loc[v].idx = map[bf->loc[v].idx];
+                if (bf->vclass[v] == cls && !bf->loc[v].is_reg && bf->loc[v].idx >= 0 && f->vtypes[v].kind != TY_VEC) bf->loc[v].idx = map[bf->loc[v].idx];
             free(map);
         }
         int total_scalar_slots = next;
@@ -404,7 +409,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
                 bf->vec_off[v] = vec_base + bf->loc[v].idx * 16;
                 bf->loc[v].off = bf->vec_off[v];
             } else if (bf->vclass[v] >= 0 && !bf->loc[v].is_reg) {
-                bf->loc[v].off = slot_base + bf->loc[v].idx * 8;
+                if (bf->loc[v].idx >= 0) bf->loc[v].off = slot_base + bf->loc[v].idx * 8;
             }
         }
         for (int i = 0; i < bf->maxpos; i++)

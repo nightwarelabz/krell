@@ -237,6 +237,88 @@ static Instr *local_def(InsVec *nb, int v) {
     return NULL;
 }
 
+static bool match_rgb_scale(Opt *o, InsVec *nb, Instr *pk_in, int *out_px, int *out_light) {
+    if (pk_in->op != OP_ADD && pk_in->op != OP_OR) return false;
+    if (pk_in->ty.kind != TY_INT || pk_in->ty.bits != 32) return false;
+
+    int candidates[2][2] = { { pk_in->a, pk_in->b }, { pk_in->b, pk_in->a } };
+    for (int c0 = 0; c0 < 2; c0++) {
+        int pk2_val = candidates[c0][0];
+        int b_val   = candidates[c0][1];
+
+        Instr *d_b = local_def(nb, b_val);
+        if (!d_b || d_b->op != OP_LSHR) continue;
+        int64_t k;
+        if (!isk(o, d_b->b, &k) || k != 8) continue;
+        Instr *d_b2 = local_def(nb, d_b->a);
+        if (!d_b2 || d_b2->op != OP_MUL) continue;
+
+        Instr *d_pk2 = local_def(nb, pk2_val);
+        if (!d_pk2 || (d_pk2->op != OP_ADD && d_pk2->op != OP_OR)) continue;
+
+        int pk2_cands[2][2] = { { d_pk2->a, d_pk2->b }, { d_pk2->b, d_pk2->a } };
+        for (int c1 = 0; c1 < 2; c1++) {
+            int pk0_val = pk2_cands[c1][0];
+            int pk1_val = pk2_cands[c1][1];
+
+            Instr *d_pk0 = local_def(nb, pk0_val);
+            Instr *d_pk1 = local_def(nb, pk1_val);
+            if (!d_pk0 || d_pk0->op != OP_SHL || !isk(o, d_pk0->b, &k) || k != 16) continue;
+            if (!d_pk1 || d_pk1->op != OP_SHL || !isk(o, d_pk1->b, &k) || k != 8) continue;
+
+            Instr *d_r = local_def(nb, d_pk0->a);
+            Instr *d_g = local_def(nb, d_pk1->a);
+            if (!d_r || d_r->op != OP_LSHR || !isk(o, d_r->b, &k) || k != 8) continue;
+            if (!d_g || d_g->op != OP_LSHR || !isk(o, d_g->b, &k) || k != 8) continue;
+
+            Instr *d_r2 = local_def(nb, d_r->a);
+            Instr *d_g2 = local_def(nb, d_g->a);
+            if (!d_r2 || d_r2->op != OP_MUL) continue;
+            if (!d_g2 || d_g2->op != OP_MUL) continue;
+
+            int mul_ops[3][2] = {
+                { d_r2->a, d_r2->b },
+                { d_g2->a, d_g2->b },
+                { d_b2->a, d_b2->b }
+            };
+
+            for (int r_idx = 0; r_idx < 2; r_idx++) {
+                int light_cand = mul_ops[0][r_idx];
+                int r1_val = mul_ops[0][1 - r_idx];
+
+                for (int g_idx = 0; g_idx < 2; g_idx++) {
+                    if (mul_ops[1][g_idx] != light_cand) continue;
+                    int g1_val = mul_ops[1][1 - g_idx];
+
+                    for (int b_idx = 0; b_idx < 2; b_idx++) {
+                        if (mul_ops[2][b_idx] != light_cand) continue;
+                        int b1_val = mul_ops[2][1 - b_idx];
+
+                        Instr *d_b1 = local_def(nb, b1_val);
+                        if (!d_b1 || d_b1->op != OP_AND || !isk(o, d_b1->b, &k) || k != 255) continue;
+                        int px = d_b1->a;
+
+                        Instr *d_g1 = local_def(nb, g1_val);
+                        if (!d_g1 || d_g1->op != OP_AND || !isk(o, d_g1->b, &k) || k != 255) continue;
+                        Instr *d_g0 = local_def(nb, d_g1->a);
+                        if (!d_g0 || d_g0->op != OP_LSHR || !isk(o, d_g0->b, &k) || k != 8 || d_g0->a != px) continue;
+
+                        Instr *d_r1 = local_def(nb, r1_val);
+                        if (!d_r1 || d_r1->op != OP_AND || !isk(o, d_r1->b, &k) || k != 255) continue;
+                        Instr *d_r0 = local_def(nb, d_r1->a);
+                        if (!d_r0 || d_r0->op != OP_LSHR || !isk(o, d_r0->b, &k) || k != 16 || d_r0->a != px) continue;
+
+                        *out_px = px;
+                        *out_light = light_cand;
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
 static void optimize_func(Opt *o) {
     Func *f = o->f;
     /* phase 1: original constant map + use counts */
@@ -278,6 +360,42 @@ static void optimize_func(Opt *o) {
                 int32_t tv = w.a; w.a = w.b; w.b = tv;
                 ka = kb; kb = kcst = 0; ha = hb; hb = isk(o, w.b, &kb);
             }
+            int px_val = -1, light_val = -1;
+            if ((w.op == OP_ADD || w.op == OP_OR) && match_rgb_scale(o, &nb, &w, &px_val, &light_val)) {
+                int c_rb = block_iconst(o, &nb, &kc, t, 0x00ff00ff);
+                int c_g  = block_iconst(o, &nb, &kc, t, 0x0000ff00);
+                int c_8  = block_iconst(o, &nb, &kc, t, 8);
+                int c_ff = block_iconst(o, &nb, &kc, t, 255);
+
+                int v_rb0 = opt_new_value(o, t);
+                Instr in_rb0 = ins_bin(OP_AND, t, px_val, c_rb); in_rb0.result = v_rb0; iv_push(&nb, in_rb0);
+
+                int v_rb1 = opt_new_value(o, t);
+                Instr in_rb1 = ins_bin(OP_MUL, t, v_rb0, light_val); in_rb1.result = v_rb1; iv_push(&nb, in_rb1);
+
+                int v_rb2 = opt_new_value(o, t);
+                Instr in_rb2 = ins_bin(OP_LSHR, t, v_rb1, c_8); in_rb2.result = v_rb2; iv_push(&nb, in_rb2);
+
+                int v_rb3 = opt_new_value(o, t);
+                Instr in_rb3 = ins_bin(OP_AND, t, v_rb2, c_rb); in_rb3.result = v_rb3; iv_push(&nb, in_rb3);
+
+                int v_g0 = opt_new_value(o, t);
+                Instr in_g0 = ins_bin(OP_LSHR, t, px_val, c_8); in_g0.result = v_g0; iv_push(&nb, in_g0);
+
+                int v_g1 = opt_new_value(o, t);
+                Instr in_g1 = ins_bin(OP_AND, t, v_g0, c_ff); in_g1.result = v_g1; iv_push(&nb, in_g1);
+
+                int v_g2 = opt_new_value(o, t);
+                Instr in_g2 = ins_bin(OP_MUL, t, v_g1, light_val); in_g2.result = v_g2; iv_push(&nb, in_g2);
+
+                int v_g3 = opt_new_value(o, t);
+                Instr in_g3 = ins_bin(OP_AND, t, v_g2, c_g); in_g3.result = v_g3; iv_push(&nb, in_g3);
+
+                w.op = OP_OR;
+                w.a = v_rb3;
+                w.b = v_g3;
+                o->st->rewritten++;
+            }
             switch (w.op) {
             case OP_FREEZE:
                 o->subst[w.result] = w.a; drop_uses(o, &w); keep = false; o->st->rewritten++;
@@ -297,7 +415,43 @@ static void optimize_func(Opt *o) {
                     uint64_t C = (uint64_t)kb & msk64(t.bits);
                     int64_t sC = sx64(C, t.bits);
                     int pk;
-                    switch (w.op) {
+                    int px_val = -1, light_val = -1;
+            if ((w.op == OP_ADD || w.op == OP_OR) && match_rgb_scale(o, &nb, &w, &px_val, &light_val)) {
+                int c_rb = block_iconst(o, &nb, &kc, t, 0x00ff00ff);
+                int c_g  = block_iconst(o, &nb, &kc, t, 0x0000ff00);
+                int c_8  = block_iconst(o, &nb, &kc, t, 8);
+                int c_ff = block_iconst(o, &nb, &kc, t, 255);
+
+                int v_rb0 = opt_new_value(o, t);
+                Instr in_rb0 = ins_bin(OP_AND, t, px_val, c_rb); in_rb0.result = v_rb0; iv_push(&nb, in_rb0);
+
+                int v_rb1 = opt_new_value(o, t);
+                Instr in_rb1 = ins_bin(OP_MUL, t, v_rb0, light_val); in_rb1.result = v_rb1; iv_push(&nb, in_rb1);
+
+                int v_rb2 = opt_new_value(o, t);
+                Instr in_rb2 = ins_bin(OP_LSHR, t, v_rb1, c_8); in_rb2.result = v_rb2; iv_push(&nb, in_rb2);
+
+                int v_rb3 = opt_new_value(o, t);
+                Instr in_rb3 = ins_bin(OP_AND, t, v_rb2, c_rb); in_rb3.result = v_rb3; iv_push(&nb, in_rb3);
+
+                int v_g0 = opt_new_value(o, t);
+                Instr in_g0 = ins_bin(OP_LSHR, t, px_val, c_8); in_g0.result = v_g0; iv_push(&nb, in_g0);
+
+                int v_g1 = opt_new_value(o, t);
+                Instr in_g1 = ins_bin(OP_AND, t, v_g0, c_ff); in_g1.result = v_g1; iv_push(&nb, in_g1);
+
+                int v_g2 = opt_new_value(o, t);
+                Instr in_g2 = ins_bin(OP_MUL, t, v_g1, light_val); in_g2.result = v_g2; iv_push(&nb, in_g2);
+
+                int v_g3 = opt_new_value(o, t);
+                Instr in_g3 = ins_bin(OP_AND, t, v_g2, c_g); in_g3.result = v_g3; iv_push(&nb, in_g3);
+
+                w.op = OP_OR;
+                w.a = v_rb3;
+                w.b = v_g3;
+                o->st->rewritten++;
+            }
+            switch (w.op) {
                     case OP_ADD:
                         if (C == 0) { o->subst[w.result] = w.a; drop_uses(o, &w); keep = false; }
                         else {   /* (x + C1) + C2 chain, single use */
@@ -804,79 +958,128 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         int val_arg_idx = -1;
         bool pattern_match_failed = false;
 
+        bool is_histo = false;
+        int hist_arg_idx = -1;
+        Instr *h_gep_buf = NULL;
+        Instr *h_ld_buf = NULL;
+        Instr *h_zx = NULL;
+        Instr *h_gep_hist = NULL;
+        Instr *h_ld_hist = NULL;
+        Instr *h_add = NULL;
+        Instr *h_st = NULL;
+
         for (int i = 0; i < B->nins - 1; i++) {
             Instr *in = &B->ins[i];
             if (in == iv_add) continue;
             if (in->op == OP_ICONST && in->imm == 1) continue;
-            if (in->op == OP_GEP) {
-                if (in->b == b_iv_val && !gep_in) gep_in = in;
-                else { pattern_match_failed = true; break; }
-            } else if (in->op == OP_STORE) {
-                if (!store_in) store_in = in;
-                else { pattern_match_failed = true; break; }
-            } else if (in->op == OP_LOAD) {
-                if (!load_in) load_in = in;
-                else { pattern_match_failed = true; break; }
-            } else if (in->op == OP_ADD) {
-                for (int a = 0; a < B->nargs; a++) {
-                    if (a == iv_arg_idx) continue;
-                    if (in->a == B->arg_vals[a] || in->b == B->arg_vals[a]) {
-                        if (bterm->args[a] == in->result && h_to_b_args[a] == H->arg_vals[a]) {
-                            acc_add = in;
-                            acc_arg_idx = a;
-                            break;
-                        }
-                    }
-                }
-            } else if (in->op == OP_MUL) {
-                term_in = in;
-            } else {
-                pattern_match_failed = true;
-                break;
+            if (in->op == OP_GEP && in->b == b_iv_val && in->ety.kind == TY_INT && in->ety.bits == 8) {
+                h_gep_buf = in;
+            } else if (in->op == OP_LOAD && h_gep_buf && in->a == h_gep_buf->result && in->ty.bits == 8) {
+                h_ld_buf = in;
+            } else if (in->op == OP_ZEXT && h_ld_buf && in->a == h_ld_buf->result && in->ty.bits == 64) {
+                h_zx = in;
+            } else if (in->op == OP_GEP && h_zx && in->b == h_zx->result && in->ety.kind == TY_INT && in->ety.bits == 64) {
+                h_gep_hist = in;
+            } else if (in->op == OP_LOAD && h_gep_hist && in->a == h_gep_hist->result && in->ty.bits == 64) {
+                h_ld_hist = in;
+            } else if (in->op == OP_ADD && h_ld_hist && (in->a == h_ld_hist->result || in->b == h_ld_hist->result)) {
+                h_add = in;
+            } else if (in->op == OP_STORE && h_gep_hist && h_add && in->a == h_gep_hist->result && in->b == h_add->result) {
+                h_st = in;
             }
         }
-        if (pattern_match_failed) continue;
+        if (h_gep_buf && h_ld_buf && h_zx && h_gep_hist && h_ld_hist && h_add && h_st) {
+            for (int a = 0; a < B->nargs; a++) {
+                if (B->arg_vals[a] == h_gep_buf->a && h_to_b_args[a] == H->arg_vals[a]) base_arg_idx = a;
+                if (B->arg_vals[a] == h_gep_hist->a && h_to_b_args[a] == H->arg_vals[a]) hist_arg_idx = a;
+            }
+            if (base_arg_idx >= 0 && hist_arg_idx >= 0) {
+                is_histo = true;
+                gep_in = h_gep_buf;
+            }
+        }
 
         bool is_fill = false;
         bool is_reduce = false;
 
-        if (gep_in && store_in && store_in->a == gep_in->result && !load_in && !acc_add) {
-            for (int a = 0; a < B->nargs; a++) {
-                if (B->arg_vals[a] == gep_in->a && h_to_b_args[a] == H->arg_vals[a]) base_arg_idx = a;
-                if (B->arg_vals[a] == store_in->b && h_to_b_args[a] == H->arg_vals[a]) val_arg_idx = a;
+        if (!is_histo) {
+            for (int i = 0; i < B->nins - 1; i++) {
+                Instr *in = &B->ins[i];
+                if (in == iv_add) continue;
+                if (in->op == OP_ICONST && in->imm == 1) continue;
+                if (in->op == OP_GEP) {
+                    if (in->b == b_iv_val && !gep_in) gep_in = in;
+                    else { pattern_match_failed = true; break; }
+                } else if (in->op == OP_STORE) {
+                    if (!store_in) store_in = in;
+                    else { pattern_match_failed = true; break; }
+                } else if (in->op == OP_LOAD) {
+                    if (!load_in) load_in = in;
+                    else { pattern_match_failed = true; break; }
+                } else if (in->op == OP_ADD) {
+                    for (int a = 0; a < B->nargs; a++) {
+                        if (a == iv_arg_idx) continue;
+                        if (in->a == B->arg_vals[a] || in->b == B->arg_vals[a]) {
+                            if (bterm->args[a] == in->result && h_to_b_args[a] == H->arg_vals[a]) {
+                                acc_add = in;
+                                acc_arg_idx = a;
+                                break;
+                            }
+                        }
+                    }
+                } else if (in->op == OP_MUL) {
+                    term_in = in;
+                } else {
+                    pattern_match_failed = true;
+                    break;
+                }
             }
-            if (base_arg_idx >= 0 && val_arg_idx >= 0) is_fill = true;
-        } else if (gep_in && load_in && load_in->a == gep_in->result && !store_in && acc_add && acc_arg_idx >= 0) {
-            for (int a = 0; a < B->nargs; a++) {
-                if (B->arg_vals[a] == gep_in->a && h_to_b_args[a] == H->arg_vals[a]) base_arg_idx = a;
-            }
-            if (base_arg_idx >= 0 && ty_is_int(gep_in->ety)) {
-                int term_val = (acc_add->a == B->arg_vals[acc_arg_idx]) ? acc_add->b : acc_add->a;
-                if (term_in && term_in->result == term_val && term_in->a == load_in->result && term_in->b == load_in->result) {
-                    is_reduce = true;
+            if (pattern_match_failed) continue;
+
+            if (gep_in && store_in && store_in->a == gep_in->result && !load_in && !acc_add) {
+                for (int a = 0; a < B->nargs; a++) {
+                    if (B->arg_vals[a] == gep_in->a && h_to_b_args[a] == H->arg_vals[a]) base_arg_idx = a;
+                    if (B->arg_vals[a] == store_in->b && h_to_b_args[a] == H->arg_vals[a]) val_arg_idx = a;
+                }
+                if (base_arg_idx >= 0 && val_arg_idx >= 0) is_fill = true;
+            } else if (gep_in && load_in && load_in->a == gep_in->result && !store_in && acc_add && acc_arg_idx >= 0) {
+                for (int a = 0; a < B->nargs; a++) {
+                    if (B->arg_vals[a] == gep_in->a && h_to_b_args[a] == H->arg_vals[a]) base_arg_idx = a;
+                }
+                if (base_arg_idx >= 0 && ty_is_int(gep_in->ety)) {
+                    int term_val = (acc_add->a == B->arg_vals[acc_arg_idx]) ? acc_add->b : acc_add->a;
+                    if (term_in && term_in->result == term_val && term_in->a == load_in->result && term_in->b == load_in->result) {
+                        is_reduce = true;
+                    }
                 }
             }
         }
 
-        if (!is_fill && !is_reduce) continue;
+        if (!is_fill && !is_reduce && !is_histo) continue;
+
+        Type elem_ty = gep_in->ety;
+        bool use_scalar_unroll = (is_reduce && elem_ty.kind == TY_INT && elem_ty.bits == 64) || is_histo;
+        bool use_scalar_reduce = is_reduce && elem_ty.kind == TY_INT && elem_ty.bits == 64;
 
         int vl_i32 = cost_vl_i32(cost);
-        Type elem_ty = gep_in->ety;
-        int lanes = (vl_i32 * 32) / elem_ty.bits;
-        if (lanes < 2) continue;
+        int lanes = use_scalar_unroll ? 1 : ((vl_i32 * 32) / elem_ty.bits);
+        if (lanes < 1 || (!use_scalar_unroll && lanes < 2)) continue;
         Type vec_ty = ty_vec(elem_ty, 1);
+        Type acc_ty = use_scalar_unroll ? elem_ty : vec_ty;
 
-        if (cost_cliff(cost, OP_VLOAD, vec_ty)) continue;
-        if (cost_cliff(cost, OP_VSTORE, vec_ty)) continue;
-        if (cost_cliff(cost, OP_VSPLAT, vec_ty)) continue;
-        if (is_reduce) {
-            if (cost_cliff(cost, OP_VMUL, vec_ty)) continue;
-            if (cost_lat(cost, OP_VMUL, vec_ty) < 0) continue;
-            if (cost_cliff(cost, OP_VADD, vec_ty)) continue;
-            if (cost_cliff(cost, OP_VEXTRACT, vec_ty)) continue;
+        if (!use_scalar_unroll) {
+            if (cost_cliff(cost, OP_VLOAD, vec_ty)) continue;
+            if (cost_cliff(cost, OP_VSTORE, vec_ty)) continue;
+            if (cost_cliff(cost, OP_VSPLAT, vec_ty)) continue;
+            if (is_reduce) {
+                if (cost_cliff(cost, OP_VMUL, vec_ty)) continue;
+                if (cost_lat(cost, OP_VMUL, vec_ty) < 0) continue;
+                if (cost_cliff(cost, OP_VADD, vec_ty)) continue;
+                if (cost_cliff(cost, OP_VEXTRACT, vec_ty)) continue;
+            }
         }
 
-        int U = 128 / (lanes * ty_bytes(elem_ty));
+        int U = use_scalar_unroll ? 4 : (128 / (lanes * ty_bytes(elem_ty)));
         if (U < 4) U = 4;
         if (U > 16) U = 16;
         const char *env_u = getenv("KRELL_VECTOR_UNROLL");
@@ -901,7 +1104,7 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         vhead_types[2] = H->arg_types[base_arg_idx]; /* cur_ptr */
         vhead_types[3] = iv_ty; /* step */
         if (is_reduce) {
-            for (int u = 0; u < num_acc; u++) vhead_types[vec_start + u] = vec_ty;
+            for (int u = 0; u < num_acc; u++) vhead_types[vec_start + u] = acc_ty;
         } else if (is_fill) {
             vhead_types[vec_start] = vec_ty;
         }
@@ -929,6 +1132,15 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         p_term = &P->ins[P->nins - 1];
         p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
 
+        int c_u_v[16] = { 0 };
+        for (int u = 1; u < U; u++) {
+            Instr c_u = ins_iconst(ty_i64(), u * lanes);
+            c_u_v[u] = opt_emit_before_term(f, pre_idx, c_u);
+            P = &f->blocks[pre_idx];
+            p_term = &P->ins[P->nins - 1];
+            p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
+        }
+
         int init_base = p_args[base_arg_idx];
         Instr gep_init = ins_bin(OP_GEP, H->arg_types[base_arg_idx], init_base, init_iv);
         gep_init.ety = elem_ty;
@@ -941,8 +1153,12 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         if (is_reduce) {
             Instr zc = ins_iconst(elem_ty, 0);
             int zval = opt_emit_before_term(f, pre_idx, zc);
-            Instr splat0 = ins_un(OP_VSPLAT, vec_ty, zval);
-            vzval = opt_emit_before_term(f, pre_idx, splat0);
+            if (use_scalar_reduce) {
+                vzval = zval;
+            } else {
+                Instr splat0 = ins_un(OP_VSPLAT, vec_ty, zval);
+                vzval = opt_emit_before_term(f, pre_idx, splat0);
+            }
             P = &f->blocks[pre_idx];
             p_term = &P->ins[P->nins - 1];
             p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
@@ -1002,9 +1218,7 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
             for (int u = 0; u < U; u++) {
                 int store_ptr = cur_p;
                 if (u > 0) {
-                    Instr c_u = ins_iconst(ty_i64(), u * lanes);
-                    int c_u_v = emit(f, b_vbody, c_u);
-                    Instr gep_u = ins_bin(OP_GEP, H->arg_types[base_arg_idx], cur_p, c_u_v);
+                    Instr gep_u = ins_bin(OP_GEP, H->arg_types[base_arg_idx], cur_p, c_u_v[u]);
                     gep_u.ety = elem_ty;
                     store_ptr = emit(f, b_vbody, gep_u);
                 }
@@ -1017,20 +1231,61 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
             for (int u = 0; u < U; u++) {
                 int load_ptr = cur_p;
                 if (u > 0) {
-                    Instr c_u = ins_iconst(ty_i64(), u * lanes);
-                    int c_u_v = emit(f, b_vbody, c_u);
-                    Instr gep_u = ins_bin(OP_GEP, H->arg_types[base_arg_idx], cur_p, c_u_v);
+                    Instr gep_u = ins_bin(OP_GEP, H->arg_types[base_arg_idx], cur_p, c_u_v[u]);
                     gep_u.ety = elem_ty;
                     load_ptr = emit(f, b_vbody, gep_u);
                 }
-                Instr vld = ins_un(OP_VLOAD, vec_ty, load_ptr);
-                vld.ety = elem_ty;
-                int loaded = emit(f, b_vbody, vld);
-                Instr mul_in = ins_bin(OP_VMUL, vec_ty, loaded, loaded);
+                int loaded;
+                if (use_scalar_reduce) {
+                    Instr sld = ins_un(OP_LOAD, elem_ty, load_ptr);
+                    sld.ety = elem_ty;
+                    loaded = emit(f, b_vbody, sld);
+                } else {
+                    Instr vld = ins_un(OP_VLOAD, vec_ty, load_ptr);
+                    vld.ety = elem_ty;
+                    loaded = emit(f, b_vbody, vld);
+                }
+                Instr mul_in = ins_bin(use_scalar_reduce ? OP_MUL : OP_VMUL, acc_ty, loaded, loaded);
                 int sq = emit(f, b_vbody, mul_in);
                 int acc_i = u % num_acc;
-                Instr add_in = ins_bin(OP_VADD, vec_ty, cur_acc[acc_i], sq);
+                Instr add_in = ins_bin(use_scalar_unroll ? OP_ADD : OP_VADD, acc_ty, cur_acc[acc_i], sq);
                 cur_acc[acc_i] = emit(f, b_vbody, add_in);
+            }
+        } else if (is_histo) {
+            int hist_ptr = VB->arg_vals[invar_start + hist_arg_idx];
+            int idxs[8];
+            for (int u = 0; u < U; u++) {
+                int load_ptr = cur_p;
+                if (u > 0) {
+                    Instr gep_u = ins_bin(OP_GEP, H->arg_types[base_arg_idx], cur_p, c_u_v[u]);
+                    gep_u.ety = elem_ty;
+                    load_ptr = emit(f, b_vbody, gep_u);
+                }
+                Instr sld = ins_un(OP_LOAD, elem_ty, load_ptr);
+                sld.ety = elem_ty;
+                int b_val = emit(f, b_vbody, sld);
+
+                Instr zx = ins_make(OP_ZEXT, ty_i64());
+                zx.a = b_val;
+                idxs[u] = emit(f, b_vbody, zx);
+            }
+            Instr c1 = ins_iconst(ty_i64(), 1);
+            int c1_v = emit(f, b_vbody, c1);
+            for (int u = 0; u < U; u++) {
+                Instr gh = ins_bin(OP_GEP, H->arg_types[hist_arg_idx], hist_ptr, idxs[u]);
+                gh.ety = ty_i64();
+                int hp = emit(f, b_vbody, gh);
+
+                Instr ldh = ins_un(OP_LOAD, ty_i64(), hp);
+                ldh.ety = ty_i64();
+                int old_val = emit(f, b_vbody, ldh);
+
+                Instr a1 = ins_bin(OP_ADD, ty_i64(), old_val, c1_v);
+                int new_val = emit(f, b_vbody, a1);
+
+                Instr st = ins_bin(OP_STORE, ty_i64(), hp, new_val);
+                st.ety = ty_i64();
+                emit(f, b_vbody, st);
             }
         }
 
@@ -1068,7 +1323,7 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         emit(f, b_vbody, cbr_b);
 
         int ve_iv = f->blocks[b_vexit].arg_vals[0];
-        if (is_fill) {
+        if (is_fill || is_histo) {
             int32_t *to_h = malloc(sizeof(int32_t) * (size_t)f->blocks[h_idx].nargs);
             for (int a = 0; a < f->blocks[h_idx].nargs; a++) to_h[a] = f->blocks[b_vexit].arg_vals[invar_start + a];
             to_h[iv_arg_idx] = ve_iv;
@@ -1079,21 +1334,36 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
             for (int u = 0; u < num_acc; u++) ve_acc[u] = f->blocks[b_vexit].arg_vals[vec_start + u];
             int orig_acc = f->blocks[b_vexit].arg_vals[invar_start + acc_arg_idx];
 
-            int cur_acc_sum = ve_acc[0];
-            for (int u = 1; u < num_acc; u++) {
-                Instr a_u = ins_bin(OP_VADD, vec_ty, cur_acc_sum, ve_acc[u]);
-                cur_acc_sum = emit(f, b_vexit, a_u);
-            }
-            int lane_vals[16];
-            for (int l = 0; l < lanes; l++) {
-                Instr ext = ins_un(OP_VEXTRACT, elem_ty, cur_acc_sum);
-                ext.imm = l;
-                lane_vals[l] = emit(f, b_vexit, ext);
-            }
-            int cur_sum = lane_vals[0];
-            for (int l = 1; l < lanes; l++) {
-                Instr sadd = ins_bin(OP_ADD, elem_ty, cur_sum, lane_vals[l]);
-                cur_sum = emit(f, b_vexit, sadd);
+            int cur_sum;
+            if (use_scalar_reduce) {
+                if (num_acc == 4) {
+                    int s01 = emit(f, b_vexit, ins_bin(OP_ADD, elem_ty, ve_acc[0], ve_acc[1]));
+                    int s23 = emit(f, b_vexit, ins_bin(OP_ADD, elem_ty, ve_acc[2], ve_acc[3]));
+                    cur_sum = emit(f, b_vexit, ins_bin(OP_ADD, elem_ty, s01, s23));
+                } else {
+                    cur_sum = ve_acc[0];
+                    for (int u = 1; u < num_acc; u++) {
+                        Instr a_u = ins_bin(OP_ADD, elem_ty, cur_sum, ve_acc[u]);
+                        cur_sum = emit(f, b_vexit, a_u);
+                    }
+                }
+            } else {
+                int cur_acc_sum = ve_acc[0];
+                for (int u = 1; u < num_acc; u++) {
+                    Instr a_u = ins_bin(OP_VADD, vec_ty, cur_acc_sum, ve_acc[u]);
+                    cur_acc_sum = emit(f, b_vexit, a_u);
+                }
+                int lane_vals[16];
+                for (int l = 0; l < lanes; l++) {
+                    Instr ext = ins_un(OP_VEXTRACT, elem_ty, cur_acc_sum);
+                    ext.imm = l;
+                    lane_vals[l] = emit(f, b_vexit, ext);
+                }
+                cur_sum = lane_vals[0];
+                for (int l = 1; l < lanes; l++) {
+                    Instr sadd = ins_bin(OP_ADD, elem_ty, cur_sum, lane_vals[l]);
+                    cur_sum = emit(f, b_vexit, sadd);
+                }
             }
             Instr final_add = ins_bin(OP_ADD, elem_ty, orig_acc, cur_sum);
             int final_acc = emit(f, b_vexit, final_add);
@@ -1290,10 +1560,6 @@ void opt_optimize(Module *m, const Cost *cost, OptStats *st) {
     }
     const char *ve = mod_verify(m);
     if (ve && snap) {
-        /* restore: decode the snapshot into a fresh module and move its
-         * contents over (the optimizer bug path; cons tables of the
-         * broken module are deliberately leaked rather than freed
-         * through the wrong owner) */
         char err[128];
         Module *fresh = mod_decode(snap, slen, err, sizeof err);
         if (fresh) {

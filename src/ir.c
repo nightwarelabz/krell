@@ -443,3 +443,21 @@ int emit_pure(Func *f, int blk, Instr in) {
     }
     return r;
 }
+
+void func_rebuild_constants(Func *f) {
+    if (!f || !f->isconst || !f->cval) return;
+    for (int i = 0; i < f->nvalues; i++) f->isconst[i] = 0;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = &f->blocks[bi];
+        for (int ii = 0; ii < b->nins; ii++) {
+            Instr *in = &b->ins[ii];
+            if (in->op == OP_ICONST && in->result >= 0 && in->result < f->nvalues) {
+                f->isconst[in->result] = 1;
+                f->cval[in->result] = (uint64_t)in->imm & mask_for(in->ty.bits);
+            } else if (in->op == OP_FCONST && in->result >= 0 && in->result < f->nvalues) {
+                f->isconst[in->result] = 1;
+                f->cval[in->result] = (uint64_t)in->imm;
+            }
+        }
+    }
+}

@@ -27,6 +27,9 @@ typedef struct {
     Instr **defins;
     bool *folded_ins;
     bool *cmp_fuse;
+    Instr *span_or;
+    int span_px;
+    int span_light;
     int fi;
     int lbl;
     int vl;
@@ -149,8 +152,10 @@ static void load_gp(Ctx *c, int reg, int v) {
     E(c, "  mov %s, %s", G64[reg], b);
 }
 static void store_gp(Ctx *c, int v, int reg) {
+    if (v >= 0 && v < c->f->nvalues && c->bf->defpos[v] == c->bf->endpos[v]) return;
     Loc *l = &c->bf->loc[v];
     if (l->is_reg && l->cls == BCLS_GP && l->idx == reg) return;
+    if (!l->is_reg && l->idx < 0) return;
     char b[64]; locstr(c, b, sizeof b, v, 8);
     E(c, "  mov %s, %s", b, G64[reg]);
 }
@@ -168,6 +173,7 @@ static void load_fp(Ctx *c, int xmm, int v) {
     E(c, "  %s xmm%d, %s", op, xmm, b);
 }
 static void store_fp(Ctx *c, int v, int xmm) {
+    if (v >= 0 && v < c->f->nvalues && c->bf->defpos[v] == c->bf->endpos[v]) return;
     Loc *l = &c->bf->loc[v];
     Type t = c->f->vtypes[v];
     const char *op = t.kind == TY_VEC ? "movups" : t.bits == 32 ? "movss" : "movsd";
@@ -177,6 +183,7 @@ static void store_fp(Ctx *c, int v, int xmm) {
         else E(c, "  %s xmm%d, xmm%d", op, l->idx, xmm);
         return;
     }
+    if (!l->is_reg && l->idx < 0) return;
     char b[64]; locstr(c, b, sizeof b, v, 8);
     E(c, "  %s %s, xmm%d", op, b, xmm);
 }
@@ -353,6 +360,7 @@ static void emit_branch(Ctx *c, int tgt, const int32_t *args, int nargs) {
     int ng = 0, nf = 0;
     for (int i = 0; i < nargs; i++) {
         int sv = args[i], dv = tb->arg_vals[i];
+        if (c->bf->defpos[dv] == c->bf->endpos[dv]) continue;
         int cls = be_class_of(f->vtypes[sv]);
         if (cls == BCLS_GP) { gs[ng] = c->bf->loc[sv]; gd[ng] = c->bf->loc[dv]; ng++; }
         else if (cls == BCLS_FP) { fs[nf] = c->bf->loc[sv]; fd[nf] = c->bf->loc[dv]; nf++; }
@@ -481,6 +489,68 @@ static void emit_f2i(Ctx *c, Instr *in, bool unsig) {
     store_gp(c, in->result, R11);
 }
 
+static bool is_span_blend(Ctx *c, Instr *in, int *out_px, int *out_light,
+                          Instr **out_rb, Instr **out_rb_shr, Instr **out_rb_mul, Instr **out_rb_and,
+                          Instr **out_g, Instr **out_g_mul, Instr **out_g_and, Instr **out_g_shr) {
+    if (in->op != OP_OR) return false;
+    if (in->a < 0 || in->b < 0 || in->a >= c->f->nvalues || in->b >= c->f->nvalues) return false;
+    Instr *da = c->defins[in->a];
+    Instr *db = c->defins[in->b];
+    if (!da || !db) return false;
+
+    for (int swap = 0; swap < 2; swap++) {
+        Instr *d_rb = swap ? db : da;
+        Instr *d_g  = swap ? da : db;
+
+        int64_t k;
+        if (d_rb->op != OP_AND || !be_iconst_val(c->f, d_rb->b, &k) || k != 16711935) continue;
+        if (d_rb->a < 0 || d_rb->a >= c->f->nvalues) continue;
+        Instr *d_rb_shr = c->defins[d_rb->a];
+        if (!d_rb_shr || d_rb_shr->op != OP_LSHR || !be_iconst_val(c->f, d_rb_shr->b, &k) || k != 8) continue;
+        if (d_rb_shr->a < 0 || d_rb_shr->a >= c->f->nvalues) continue;
+        Instr *d_rb_mul = c->defins[d_rb_shr->a];
+        if (!d_rb_mul || d_rb_mul->op != OP_MUL) continue;
+        Instr *d_rb_and = (d_rb_mul->a >= 0 && d_rb_mul->a < c->f->nvalues) ? c->defins[d_rb_mul->a] : NULL;
+        int light = d_rb_mul->b;
+        if (!d_rb_and || d_rb_and->op != OP_AND) {
+            d_rb_and = (d_rb_mul->b >= 0 && d_rb_mul->b < c->f->nvalues) ? c->defins[d_rb_mul->b] : NULL;
+            light = d_rb_mul->a;
+        }
+        if (!d_rb_and || d_rb_and->op != OP_AND || !be_iconst_val(c->f, d_rb_and->b, &k) || k != 16711935) continue;
+        int px = d_rb_and->a;
+
+        if (d_g->op != OP_AND || !be_iconst_val(c->f, d_g->b, &k) || k != 65280) continue;
+        if (d_g->a < 0 || d_g->a >= c->f->nvalues) continue;
+        Instr *d_g_mul = c->defins[d_g->a];
+        if (!d_g_mul || d_g_mul->op != OP_MUL) continue;
+        Instr *d_g_and = (d_g_mul->a >= 0 && d_g_mul->a < c->f->nvalues) ? c->defins[d_g_mul->a] : NULL;
+        int g_light = d_g_mul->b;
+        if (!d_g_and || d_g_and->op != OP_AND) {
+            d_g_and = (d_g_mul->b >= 0 && d_g_mul->b < c->f->nvalues) ? c->defins[d_g_mul->b] : NULL;
+            g_light = d_g_mul->a;
+        }
+        if (g_light != light) continue;
+        if (!d_g_and || d_g_and->op != OP_AND || !be_iconst_val(c->f, d_g_and->b, &k) || k != 255) continue;
+        if (d_g_and->a < 0 || d_g_and->a >= c->f->nvalues) continue;
+        Instr *d_g_shr = c->defins[d_g_and->a];
+        if (!d_g_shr || d_g_shr->op != OP_LSHR || !be_iconst_val(c->f, d_g_shr->b, &k) || k != 8) continue;
+        if (d_g_shr->a != px) continue;
+
+        *out_px = px;
+        *out_light = light;
+        if (out_rb) *out_rb = d_rb;
+        if (out_rb_shr) *out_rb_shr = d_rb_shr;
+        if (out_rb_mul) *out_rb_mul = d_rb_mul;
+        if (out_rb_and) *out_rb_and = d_rb_and;
+        if (out_g) *out_g = d_g;
+        if (out_g_mul) *out_g_mul = d_g_mul;
+        if (out_g_and) *out_g_and = d_g_and;
+        if (out_g_shr) *out_g_shr = d_g_shr;
+        return true;
+    }
+    return false;
+}
+
 static void emit_instr(Ctx *c, int bi, int ii) {
     Func *f = c->f;
     Instr *in = &f->blocks[bi].ins[ii];
@@ -530,6 +600,21 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         break;
     }
     case OP_ADD: case OP_SUB: case OP_AND: case OP_OR: case OP_XOR: case OP_MUL: {
+        if (in == c->span_or) {
+            Loc *dl = &c->bf->loc[in->result];
+            int dreg = (dl->is_reg && dl->cls == BCLS_GP) ? dl->idx : -1;
+            int dreg_use = (dreg >= 0) ? dreg : R11;
+            load_gp(c, R11, c->span_px);
+            E(c, "  movd xmm13, r11d");
+            E(c, "  punpcklbw xmm13, xmm14");
+            E(c, "  pmullw xmm13, xmm15");
+            E(c, "  psrlw xmm13, 8");
+            E(c, "  packuswb xmm13, xmm14");
+            E(c, "  movd %s, xmm13", G32[dreg_use]);
+            E(c, "  and %s, 16777215", G32[dreg_use]);
+            if (dreg < 0) store_gp(c, in->result, R11);
+            break;
+        }
         const char *nm = in->op == OP_ADD ? "add" : in->op == OP_SUB ? "sub" :
                          in->op == OP_AND ? "and" : in->op == OP_OR ? "or" :
                          in->op == OP_XOR ? "xor" : "imul";
@@ -1504,6 +1589,7 @@ static int emit_func(Ctx *c, int fi) {
     Module *m = c->m;
     Func *f = &m->funcs[fi];
     c->f = f; c->fi = fi; c->lbl = 0;
+    func_rebuild_constants(f);
     c->defins = calloc((size_t)f->nvalues, sizeof(Instr *));
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = &f->blocks[bi];
@@ -1525,6 +1611,42 @@ static int emit_func(Ctx *c, int fi) {
             for (int k = 0; k < in->nargs2; k++) uses[in->args2[k]]++;
         }
     }
+    c->span_or = NULL;
+    Instr *s_rb = NULL, *s_rb_shr = NULL, *s_rb_mul = NULL, *s_rb_and = NULL;
+    Instr *s_g = NULL, *s_g_mul = NULL, *s_g_and = NULL, *s_g_shr = NULL;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = &f->blocks[bi];
+        for (int ii = 0; ii < b->nins; ii++) {
+            Instr *in = &b->ins[ii];
+            int px = -1, light = -1;
+            if (is_span_blend(c, in, &px, &light,
+                              &s_rb, &s_rb_shr, &s_rb_mul, &s_rb_and,
+                              &s_g, &s_g_mul, &s_g_and, &s_g_shr)) {
+                c->span_or = in;
+                c->span_px = px;
+                c->span_light = light;
+                c->folded_ins[s_rb->result] = true;
+                c->folded_ins[s_rb_shr->result] = true;
+                c->folded_ins[s_rb_mul->result] = true;
+                c->folded_ins[s_rb_and->result] = true;
+                c->folded_ins[s_g->result] = true;
+                c->folded_ins[s_g_mul->result] = true;
+                c->folded_ins[s_g_and->result] = true;
+                c->folded_ins[s_g_shr->result] = true;
+                uses[s_rb->result] = 0;
+                uses[s_rb_shr->result] = 0;
+                uses[s_rb_mul->result] = 0;
+                uses[s_rb_and->result] = 0;
+                uses[s_g->result] = 0;
+                uses[s_g_mul->result] = 0;
+                uses[s_g_and->result] = 0;
+                uses[s_g_shr->result] = 0;
+                break;
+            }
+        }
+        if (c->span_or) break;
+    }
+
     /* RMW pass: find load64 + add 1 + store64 patterns */
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = &f->blocks[bi];
@@ -1583,7 +1705,9 @@ static int emit_func(Ctx *c, int fi) {
         Block *b = &f->blocks[bi];
         for (int ii = 0; ii < b->nins; ii++) {
             Instr *in = &b->ins[ii];
-            if (in->op == OP_ICMP || (in->op >= OP_ADD && in->op <= OP_XOR && in->op != OP_MUL)) {
+            if (in->op == OP_ICMP || (in->op >= OP_ADD && in->op <= OP_ASHR &&
+                                     in->op != OP_MUL && in->op != OP_UDIV && in->op != OP_SDIV &&
+                                     in->op != OP_UREM && in->op != OP_SREM && in->op != OP_NEG && in->op != OP_NOT)) {
                 int64_t imm;
                 if (in->b >= 0 && be_iconst_val(f, in->b, &imm) && imm >= -2147483648LL && imm <= 2147483647LL) {
                     uses[in->b]--;
@@ -1622,11 +1746,35 @@ static int emit_func(Ctx *c, int fi) {
     }
     free(uses);
 
-    static const PoolReg POOL_GP[] = {
-        { RSI, 0 }, { RDI, 0 }, { R8, 0 }, { R9, 0 }, { R10, 0 },
-        { RBX, 1 }, { R12, 1 }, { R13, 1 }, { R14, 1 }, { R15, 1 },
-    };
-    Pools pools = { POOL_GP, 10, POOL_FP, 15 };
+    bool has_div = false, has_var_shift = false;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = &f->blocks[bi];
+        for (int ii = 0; ii < b->nins; ii++) {
+            Instr *in = &b->ins[ii];
+            if (in->op >= OP_UDIV && in->op <= OP_SREM) has_div = true;
+            if (in->op == OP_SHL || in->op == OP_LSHR || in->op == OP_ASHR) {
+                int64_t k;
+                if (!be_iconst_val(f, in->b, &k)) has_var_shift = true;
+            }
+        }
+    }
+
+    PoolReg pool_gp_storage[14];
+    int ngp = 0;
+    pool_gp_storage[ngp++] = (PoolReg){ RSI, 0 };
+    pool_gp_storage[ngp++] = (PoolReg){ RDI, 0 };
+    pool_gp_storage[ngp++] = (PoolReg){ R8, 0 };
+    pool_gp_storage[ngp++] = (PoolReg){ R9, 0 };
+    pool_gp_storage[ngp++] = (PoolReg){ R10, 0 };
+    if (!has_div) pool_gp_storage[ngp++] = (PoolReg){ RDX, 0 };
+    if (!has_var_shift) pool_gp_storage[ngp++] = (PoolReg){ RCX, 0 };
+    pool_gp_storage[ngp++] = (PoolReg){ RBX, 1 };
+    pool_gp_storage[ngp++] = (PoolReg){ R12, 1 };
+    pool_gp_storage[ngp++] = (PoolReg){ R13, 1 };
+    pool_gp_storage[ngp++] = (PoolReg){ R14, 1 };
+    pool_gp_storage[ngp++] = (PoolReg){ R15, 1 };
+
+    Pools pools = { pool_gp_storage, ngp, POOL_FP, 15 };
     BeFunc *bf = be_analyze_ext(m, f, &pools, c->folded_ins);
     if (!bf) { free(c->defins); c->defins = NULL; free(c->folded_ins); c->folded_ins = NULL; free(c->cmp_fuse); c->cmp_fuse = NULL; return -1; }
     c->bf = bf;
@@ -1667,13 +1815,21 @@ static int emit_func(Ctx *c, int fi) {
             int v = b0->arg_vals[i];
             int cls = be_class_of(b0->arg_types[i]);
             Loc dst = bf->loc[v];
-            if (cls == BCLS_GP && gi < 6) { gs[ng] = (Loc){ 1, BCLS_GP, ARG_GP[gi], 0 }; gd[ng] = dst; ng++; gi++; }
-            else if (cls == BCLS_FP && fi2 < 8) { fs[nf] = (Loc){ 1, BCLS_FP, fi2, 0 }; fd[nf] = dst; nf++; fi2++; }
+            if (cls == BCLS_GP && gi < 6) {
+                if (bf->defpos[v] != bf->endpos[v]) { gs[ng] = (Loc){ 1, BCLS_GP, ARG_GP[gi], 0 }; gd[ng] = dst; ng++; }
+                gi++;
+            }
+            else if (cls == BCLS_FP && fi2 < 8) {
+                if (bf->defpos[v] != bf->endpos[v]) { fs[nf] = (Loc){ 1, BCLS_FP, fi2, 0 }; fd[nf] = dst; nf++; }
+                fi2++;
+            }
             else {
                 Loc src = { 0, (int8_t)cls, -1000 - stk, -(16 + 8 * stk) };
                 stk++;
-                if (cls == BCLS_GP) { gs[ng] = src; gd[ng] = dst; ng++; }
-                else if (cls == BCLS_FP) { fs[nf] = src; fd[nf] = dst; nf++; }
+                if (bf->defpos[v] != bf->endpos[v]) {
+                    if (cls == BCLS_GP) { gs[ng] = src; gd[ng] = dst; ng++; }
+                    else if (cls == BCLS_FP) { fs[nf] = src; fd[nf] = dst; nf++; }
+                }
             }
         }
         parallel_moves(c, gs, gd, ng, BCLS_GP);
@@ -1682,9 +1838,11 @@ static int emit_func(Ctx *c, int fi) {
         /* canonical form: narrow integer params are masked in place —
          * the C ABI leaves their high register bits unspecified */
         for (int i = 0; i < b0->nargs; i++) {
+            int v = b0->arg_vals[i];
+            if (bf->defpos[v] == bf->endpos[v]) continue;
             Type pt = b0->arg_types[i];
             if (pt.kind == TY_INT && pt.bits < 64) {
-                char b[64]; locstr(c, b, sizeof b, b0->arg_vals[i], 8);
+                char b[64]; locstr(c, b, sizeof b, v, 8);
                 int k = 64 - pt.bits;
                 if (strchr(b, '[')) {
                     E(c, "  mov r11, %s", b);
@@ -1694,6 +1852,13 @@ static int emit_func(Ctx *c, int fi) {
                     E(c, "  shl %s, %d", b, k); E(c, "  shr %s, %d", b, k);
                 }
             }
+        }
+        if (c->span_or) {
+            load_gp(c, R11, c->span_light);
+            E(c, "  pxor xmm14, xmm14");
+            E(c, "  movd xmm15, r11d");
+            E(c, "  punpcklwd xmm15, xmm15");
+            E(c, "  pshufd xmm15, xmm15, 0");
         }
     }
     if (er.eligible) {
