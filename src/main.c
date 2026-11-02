@@ -12,6 +12,7 @@
  * (sniffed by content). Targets: x86_64, aarch64, riscv64, llvm. */
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE 1
+#define _DARWIN_C_SOURCE 1
 #include "krell.h"
 #include <stdio.h>
 #include <string.h>
