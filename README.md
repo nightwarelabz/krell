@@ -19,6 +19,10 @@ one program, written once  ──►  Krell-IR (binary, hashed, verified)
                                    └── LLVM IR  lowering lane (release)
 ```
 
+https://github.com/user-attachments/assets/fdf0ceef-8e54-44ec-a440-a470060f964a
+
+*Every frame of this film was computed by a single Krell program.*
+
 ## Design
 
 - **Typed SSA with block arguments** — infinite virtual registers,
