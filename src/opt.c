@@ -674,6 +674,443 @@ static void optimize_func(Opt *o) {
     }
 }
 
+/* ---- loop vectorization pass ---- */
+static int opt_emit_before_term(Func *f, int blk, Instr in) {
+    Block *b = &f->blocks[blk];
+    Instr term = b->ins[b->nins - 1];
+    b->nins--;
+    int res = emit(f, blk, in);
+    b = &f->blocks[blk];
+    if (b->nins == b->cap) {
+        b->cap = b->cap ? b->cap * 2 : 16;
+        b->ins = realloc(b->ins, (size_t)b->cap * sizeof(Instr));
+    }
+    b->ins[b->nins++] = term;
+    return res;
+}
+
+static bool opt_find_iconst(Func *f, int v, int64_t *out) {
+    if (v < 0 || v >= f->nvalues) return false;
+    if (f->isconst[v] && f->vtypes[v].kind == TY_INT) {
+        *out = (int64_t)f->cval[v];
+        return true;
+    }
+    for (int b = 0; b < f->nblocks; b++) {
+        Block *bl = &f->blocks[b];
+        for (int i = 0; i < bl->nins; i++) {
+            if (bl->ins[i].result == v && bl->ins[i].op == OP_ICONST) {
+                *out = bl->ins[i].imm;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *st) {
+    (void)m;
+    int orig_nblocks = f->nblocks;
+    for (int h_idx = 0; h_idx < orig_nblocks; h_idx++) {
+        Block *H = &f->blocks[h_idx];
+        if (H->nins < 2) continue;
+        Instr *term = &H->ins[H->nins - 1];
+        if (term->op != OP_CONDBR) continue;
+
+        int body_idx = -1, exit_idx = -1;
+        bool body_on_true = false;
+        if (term->blk >= 0 && term->blk < f->nblocks) {
+            Block *b = &f->blocks[term->blk];
+            if (b->nins > 0 && b->ins[b->nins - 1].op == OP_BR && b->ins[b->nins - 1].blk == h_idx) {
+                body_idx = term->blk; exit_idx = term->blk2; body_on_true = true;
+            }
+        }
+        if (body_idx < 0 && term->blk2 >= 0 && term->blk2 < f->nblocks) {
+            Block *b = &f->blocks[term->blk2];
+            if (b->nins > 0 && b->ins[b->nins - 1].op == OP_BR && b->ins[b->nins - 1].blk == h_idx) {
+                body_idx = term->blk2; exit_idx = term->blk; body_on_true = false;
+            }
+        }
+        if (body_idx < 0 || exit_idx < 0) continue;
+
+        int pre_idx = -1, npred = 0;
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            if (bi == body_idx) continue;
+            Block *b = &f->blocks[bi];
+            if (b->nins == 0) continue;
+            Instr *t = &b->ins[b->nins - 1];
+            if (t->op == OP_BR && t->blk == h_idx) { pre_idx = bi; npred++; }
+            else if (t->op == OP_CONDBR && (t->blk == h_idx || t->blk2 == h_idx)) { pre_idx = bi; npred++; }
+        }
+        if (npred != 1 || pre_idx < 0) continue;
+
+        int cond_val = term->a;
+        Instr *cmp = NULL;
+        for (int i = 0; i < H->nins - 1; i++) {
+            if (H->ins[i].result == cond_val) { cmp = &H->ins[i]; break; }
+        }
+        if (!cmp || cmp->op != OP_ICMP) continue;
+        if (body_on_true && cmp->pred != IC_SLT && cmp->pred != IC_ULT) continue;
+        if (!body_on_true && cmp->pred != IC_SGE && cmp->pred != IC_UGE) continue;
+
+        int iv_arg_idx = -1;
+        for (int a = 0; a < H->nargs; a++) {
+            if (H->arg_vals[a] == cmp->a) { iv_arg_idx = a; break; }
+        }
+        if (iv_arg_idx < 0) continue;
+        int iv_val = H->arg_vals[iv_arg_idx];
+        Type iv_ty = H->arg_types[iv_arg_idx];
+        int limit_val = cmp->b;
+
+        int limit_arg_idx = -1;
+        int64_t limit_cval = 0;
+        for (int a = 0; a < H->nargs; a++) {
+            if (H->arg_vals[a] == limit_val) { limit_arg_idx = a; break; }
+        }
+        if (limit_arg_idx < 0) {
+            if (!opt_find_iconst(f, limit_val, &limit_cval)) continue;
+        }
+
+        int32_t *h_to_b_args = body_on_true ? term->args : term->args2;
+        int h_to_b_nargs = body_on_true ? term->nargs : term->nargs2;
+        Block *B = &f->blocks[body_idx];
+        if (h_to_b_nargs != B->nargs || B->nargs != H->nargs) continue;
+        if (h_to_b_args[iv_arg_idx] != iv_val) continue;
+
+        int b_iv_val = B->arg_vals[iv_arg_idx];
+
+        Instr *bterm = &B->ins[B->nins - 1];
+        if (bterm->nargs != H->nargs) continue;
+        int next_iv = bterm->args[iv_arg_idx];
+        Instr *iv_add = NULL;
+        for (int i = 0; i < B->nins - 1; i++) {
+            if (B->ins[i].result == next_iv) { iv_add = &B->ins[i]; break; }
+        }
+        if (!iv_add || iv_add->op != OP_ADD) continue;
+        int64_t step_val = 0;
+        if (iv_add->a == b_iv_val) {
+            if (!opt_find_iconst(f, iv_add->b, &step_val)) continue;
+        } else if (iv_add->b == b_iv_val) {
+            if (!opt_find_iconst(f, iv_add->a, &step_val)) continue;
+        } else continue;
+        if (step_val != 1) continue;
+
+        Instr *gep_in = NULL;
+        Instr *store_in = NULL;
+        Instr *load_in = NULL;
+        Instr *acc_add = NULL;
+        Instr *term_in = NULL;
+        int acc_arg_idx = -1;
+        int base_arg_idx = -1;
+        int val_arg_idx = -1;
+        bool pattern_match_failed = false;
+
+        for (int i = 0; i < B->nins - 1; i++) {
+            Instr *in = &B->ins[i];
+            if (in == iv_add) continue;
+            if (in->op == OP_ICONST && in->imm == 1) continue;
+            if (in->op == OP_GEP) {
+                if (in->b == b_iv_val && !gep_in) gep_in = in;
+                else { pattern_match_failed = true; break; }
+            } else if (in->op == OP_STORE) {
+                if (!store_in) store_in = in;
+                else { pattern_match_failed = true; break; }
+            } else if (in->op == OP_LOAD) {
+                if (!load_in) load_in = in;
+                else { pattern_match_failed = true; break; }
+            } else if (in->op == OP_ADD) {
+                for (int a = 0; a < B->nargs; a++) {
+                    if (a == iv_arg_idx) continue;
+                    if (in->a == B->arg_vals[a] || in->b == B->arg_vals[a]) {
+                        if (bterm->args[a] == in->result && h_to_b_args[a] == H->arg_vals[a]) {
+                            acc_add = in;
+                            acc_arg_idx = a;
+                            break;
+                        }
+                    }
+                }
+            } else if (in->op == OP_MUL) {
+                term_in = in;
+            } else {
+                pattern_match_failed = true;
+                break;
+            }
+        }
+        if (pattern_match_failed) continue;
+
+        bool is_fill = false;
+        bool is_reduce = false;
+
+        if (gep_in && store_in && store_in->a == gep_in->result && !load_in && !acc_add) {
+            for (int a = 0; a < B->nargs; a++) {
+                if (B->arg_vals[a] == gep_in->a && h_to_b_args[a] == H->arg_vals[a]) base_arg_idx = a;
+                if (B->arg_vals[a] == store_in->b && h_to_b_args[a] == H->arg_vals[a]) val_arg_idx = a;
+            }
+            if (base_arg_idx >= 0 && val_arg_idx >= 0) is_fill = true;
+        } else if (gep_in && load_in && load_in->a == gep_in->result && !store_in && acc_add && acc_arg_idx >= 0) {
+            for (int a = 0; a < B->nargs; a++) {
+                if (B->arg_vals[a] == gep_in->a && h_to_b_args[a] == H->arg_vals[a]) base_arg_idx = a;
+            }
+            if (base_arg_idx >= 0 && ty_is_int(gep_in->ety)) {
+                int term_val = (acc_add->a == B->arg_vals[acc_arg_idx]) ? acc_add->b : acc_add->a;
+                if (term_in && term_in->result == term_val && term_in->a == load_in->result && term_in->b == load_in->result) {
+                    is_reduce = true;
+                }
+            }
+        }
+
+        if (!is_fill && !is_reduce) continue;
+
+        int vl_i32 = cost_vl_i32(cost);
+        Type elem_ty = gep_in->ety;
+        int lanes = (vl_i32 * 32) / elem_ty.bits;
+        if (lanes < 2) continue;
+        Type vec_ty = ty_vec(elem_ty, 1);
+
+        if (cost_cliff(cost, OP_VLOAD, vec_ty)) continue;
+        if (cost_cliff(cost, OP_VSTORE, vec_ty)) continue;
+        if (cost_cliff(cost, OP_VSPLAT, vec_ty)) continue;
+        if (is_reduce) {
+            if (cost_cliff(cost, OP_VMUL, vec_ty)) continue;
+            if (cost_lat(cost, OP_VMUL, vec_ty) < 0) continue;
+            if (cost_cliff(cost, OP_VADD, vec_ty)) continue;
+            if (cost_cliff(cost, OP_VEXTRACT, vec_ty)) continue;
+        }
+
+        int U = 128 / (lanes * ty_bytes(elem_ty));
+        if (U < 4) U = 4;
+        if (U > 16) U = 16;
+        const char *env_u = getenv("KRELL_VECTOR_UNROLL");
+        if (env_u && atoi(env_u) > 0) U = atoi(env_u);
+
+        int num_acc = 4;
+        const char *env_acc = getenv("KRELL_VECTOR_ACC");
+        if (env_acc && atoi(env_acc) > 0) num_acc = atoi(env_acc);
+        if (num_acc > U) num_acc = U;
+        if (num_acc != 1 && num_acc != 2 && num_acc != 4 && num_acc != 8) num_acc = 4;
+
+        int total_step = lanes * U;
+
+        int num_vec_args = is_reduce ? num_acc : (is_fill ? 1 : 0);
+        int vhead_nargs = 4 + num_vec_args + H->nargs;
+        int vec_start = 4;
+        int invar_start = 4 + num_vec_args;
+
+        Type *vhead_types = malloc(sizeof(Type) * (size_t)vhead_nargs);
+        vhead_types[0] = iv_ty;
+        vhead_types[1] = iv_ty; /* vec_limit */
+        vhead_types[2] = H->arg_types[base_arg_idx]; /* cur_ptr */
+        vhead_types[3] = iv_ty; /* step */
+        if (is_reduce) {
+            for (int u = 0; u < num_acc; u++) vhead_types[vec_start + u] = vec_ty;
+        } else if (is_fill) {
+            vhead_types[vec_start] = vec_ty;
+        }
+        for (int a = 0; a < H->nargs; a++) vhead_types[invar_start + a] = H->arg_types[a];
+
+        int b_vhead = func_add_block(f, vhead_types, vhead_nargs);
+        int b_vbody = func_add_block(f, vhead_types, vhead_nargs);
+        int b_vexit = func_add_block(f, vhead_types, vhead_nargs);
+
+        Block *P = &f->blocks[pre_idx];
+        Instr *p_term = &P->ins[P->nins - 1];
+        int32_t *p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
+        int init_iv = p_args[iv_arg_idx];
+
+        int v_limit_val = limit_arg_idx >= 0 ? p_args[limit_arg_idx] : -1;
+        if (limit_arg_idx < 0) {
+            Instr lc = ins_iconst(iv_ty, limit_cval);
+            v_limit_val = opt_emit_before_term(f, pre_idx, lc);
+        }
+        Instr c_tot_pre = ins_iconst(iv_ty, total_step);
+        int c_tot_pre_v = opt_emit_before_term(f, pre_idx, c_tot_pre);
+        Instr sub_lim = ins_bin(OP_SUB, iv_ty, v_limit_val, c_tot_pre_v);
+        int vec_limit = opt_emit_before_term(f, pre_idx, sub_lim);
+        P = &f->blocks[pre_idx];
+        p_term = &P->ins[P->nins - 1];
+        p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
+
+        int init_base = p_args[base_arg_idx];
+        Instr gep_init = ins_bin(OP_GEP, H->arg_types[base_arg_idx], init_base, init_iv);
+        gep_init.ety = elem_ty;
+        int init_p = opt_emit_before_term(f, pre_idx, gep_init);
+        P = &f->blocks[pre_idx];
+        p_term = &P->ins[P->nins - 1];
+        p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
+
+        int vzval = -1;
+        if (is_reduce) {
+            Instr zc = ins_iconst(elem_ty, 0);
+            int zval = opt_emit_before_term(f, pre_idx, zc);
+            Instr splat0 = ins_un(OP_VSPLAT, vec_ty, zval);
+            vzval = opt_emit_before_term(f, pre_idx, splat0);
+            P = &f->blocks[pre_idx];
+            p_term = &P->ins[P->nins - 1];
+            p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
+        } else if (is_fill) {
+            int init_val = p_args[val_arg_idx];
+            Instr spl = ins_un(OP_VSPLAT, vec_ty, init_val);
+            vzval = opt_emit_before_term(f, pre_idx, spl);
+            P = &f->blocks[pre_idx];
+            p_term = &P->ins[P->nins - 1];
+            p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
+        }
+
+        int32_t *to_vhead = malloc(sizeof(int32_t) * (size_t)vhead_nargs);
+        to_vhead[0] = init_iv;
+        to_vhead[1] = vec_limit;
+        to_vhead[2] = init_p;
+        to_vhead[3] = c_tot_pre_v;
+        if (is_reduce) {
+            for (int u = 0; u < num_acc; u++) to_vhead[vec_start + u] = vzval;
+        } else if (is_fill) {
+            to_vhead[vec_start] = vzval;
+        }
+        for (int a = 0; a < f->blocks[h_idx].nargs; a++) to_vhead[invar_start + a] = p_args[a];
+
+        if (p_term->blk == h_idx) {
+            p_term->blk = b_vhead;
+            free(p_term->args);
+            p_term->args = to_vhead;
+            p_term->nargs = (uint16_t)vhead_nargs;
+        } else {
+            p_term->blk2 = b_vhead;
+            free(p_term->args2);
+            p_term->args2 = to_vhead;
+            p_term->nargs2 = (uint16_t)vhead_nargs;
+        }
+
+        int vh_iv = f->blocks[b_vhead].arg_vals[0];
+        int vh_vec_limit = f->blocks[b_vhead].arg_vals[1];
+        Instr cmp_in = ins_bin(OP_ICMP, ty_int(1), vh_iv, vh_vec_limit);
+        cmp_in.pred = IC_SLE;
+        int c_res = emit(f, b_vhead, cmp_in);
+
+        int32_t *a_body = ids_dup(f->blocks[b_vhead].arg_vals, vhead_nargs);
+        int32_t *a_exit = ids_dup(f->blocks[b_vhead].arg_vals, vhead_nargs);
+        Instr cbr = ins_condbr(c_res, b_vbody, a_body, vhead_nargs, b_vexit, a_exit, vhead_nargs);
+        emit(f, b_vhead, cbr);
+
+        Block *VB = &f->blocks[b_vbody];
+        int vb_iv = VB->arg_vals[0];
+        int vb_vec_limit = VB->arg_vals[1];
+        int cur_p = VB->arg_vals[2];
+        int vb_step = VB->arg_vals[3];
+
+        int cur_acc[8];
+        if (is_fill) {
+            int vval = VB->arg_vals[vec_start];
+            for (int u = 0; u < U; u++) {
+                int store_ptr = cur_p;
+                if (u > 0) {
+                    Instr c_u = ins_iconst(ty_i64(), u * lanes);
+                    int c_u_v = emit(f, b_vbody, c_u);
+                    Instr gep_u = ins_bin(OP_GEP, H->arg_types[base_arg_idx], cur_p, c_u_v);
+                    gep_u.ety = elem_ty;
+                    store_ptr = emit(f, b_vbody, gep_u);
+                }
+                Instr vst = ins_bin(OP_VSTORE, ty_void(), store_ptr, vval);
+                vst.ety = elem_ty;
+                emit(f, b_vbody, vst);
+            }
+        } else if (is_reduce) {
+            for (int u = 0; u < num_acc; u++) cur_acc[u] = VB->arg_vals[vec_start + u];
+            for (int u = 0; u < U; u++) {
+                int load_ptr = cur_p;
+                if (u > 0) {
+                    Instr c_u = ins_iconst(ty_i64(), u * lanes);
+                    int c_u_v = emit(f, b_vbody, c_u);
+                    Instr gep_u = ins_bin(OP_GEP, H->arg_types[base_arg_idx], cur_p, c_u_v);
+                    gep_u.ety = elem_ty;
+                    load_ptr = emit(f, b_vbody, gep_u);
+                }
+                Instr vld = ins_un(OP_VLOAD, vec_ty, load_ptr);
+                vld.ety = elem_ty;
+                int loaded = emit(f, b_vbody, vld);
+                Instr mul_in = ins_bin(OP_VMUL, vec_ty, loaded, loaded);
+                int sq = emit(f, b_vbody, mul_in);
+                int acc_i = u % num_acc;
+                Instr add_in = ins_bin(OP_VADD, vec_ty, cur_acc[acc_i], sq);
+                cur_acc[acc_i] = emit(f, b_vbody, add_in);
+            }
+        }
+
+        /* Pointer bump and IV step */
+        Instr next_p_in = ins_bin(OP_GEP, H->arg_types[base_arg_idx], cur_p, vb_step);
+        next_p_in.ety = elem_ty;
+        int next_p_v = emit(f, b_vbody, next_p_in);
+
+        Instr next_iv_in = ins_bin(OP_ADD, iv_ty, vb_iv, vb_step);
+        int next_iv_v = emit(f, b_vbody, next_iv_in);
+
+        Instr cmp_in_b = ins_bin(OP_ICMP, ty_int(1), next_iv_v, vb_vec_limit);
+        cmp_in_b.pred = IC_SLE;
+        int c_res_b = emit(f, b_vbody, cmp_in_b);
+
+        int32_t *to_loop = ids_dup(f->blocks[b_vbody].arg_vals, vhead_nargs);
+        to_loop[0] = next_iv_v;
+        to_loop[1] = vb_vec_limit;
+        to_loop[2] = next_p_v;
+        to_loop[3] = vb_step;
+        if (is_reduce) {
+            for (int u = 0; u < num_acc; u++) to_loop[vec_start + u] = cur_acc[u];
+        }
+
+        int32_t *to_exit = ids_dup(f->blocks[b_vbody].arg_vals, vhead_nargs);
+        to_exit[0] = next_iv_v;
+        to_exit[1] = vb_vec_limit;
+        to_exit[2] = next_p_v;
+        to_exit[3] = vb_step;
+        if (is_reduce) {
+            for (int u = 0; u < num_acc; u++) to_exit[vec_start + u] = cur_acc[u];
+        }
+
+        Instr cbr_b = ins_condbr(c_res_b, b_vbody, to_loop, vhead_nargs, b_vexit, to_exit, vhead_nargs);
+        emit(f, b_vbody, cbr_b);
+
+        int ve_iv = f->blocks[b_vexit].arg_vals[0];
+        if (is_fill) {
+            int32_t *to_h = malloc(sizeof(int32_t) * (size_t)f->blocks[h_idx].nargs);
+            for (int a = 0; a < f->blocks[h_idx].nargs; a++) to_h[a] = f->blocks[b_vexit].arg_vals[invar_start + a];
+            to_h[iv_arg_idx] = ve_iv;
+            Instr br_h = ins_br(h_idx, to_h, f->blocks[h_idx].nargs);
+            emit(f, b_vexit, br_h);
+        } else if (is_reduce) {
+            int ve_acc[8];
+            for (int u = 0; u < num_acc; u++) ve_acc[u] = f->blocks[b_vexit].arg_vals[vec_start + u];
+            int orig_acc = f->blocks[b_vexit].arg_vals[invar_start + acc_arg_idx];
+
+            int cur_acc_sum = ve_acc[0];
+            for (int u = 1; u < num_acc; u++) {
+                Instr a_u = ins_bin(OP_VADD, vec_ty, cur_acc_sum, ve_acc[u]);
+                cur_acc_sum = emit(f, b_vexit, a_u);
+            }
+            int lane_vals[16];
+            for (int l = 0; l < lanes; l++) {
+                Instr ext = ins_un(OP_VEXTRACT, elem_ty, cur_acc_sum);
+                ext.imm = l;
+                lane_vals[l] = emit(f, b_vexit, ext);
+            }
+            int cur_sum = lane_vals[0];
+            for (int l = 1; l < lanes; l++) {
+                Instr sadd = ins_bin(OP_ADD, elem_ty, cur_sum, lane_vals[l]);
+                cur_sum = emit(f, b_vexit, sadd);
+            }
+            Instr final_add = ins_bin(OP_ADD, elem_ty, orig_acc, cur_sum);
+            int final_acc = emit(f, b_vexit, final_add);
+            int32_t *to_h = malloc(sizeof(int32_t) * (size_t)f->blocks[h_idx].nargs);
+            for (int a = 0; a < f->blocks[h_idx].nargs; a++) to_h[a] = f->blocks[b_vexit].arg_vals[invar_start + a];
+            to_h[iv_arg_idx] = ve_iv;
+            to_h[acc_arg_idx] = final_acc;
+            Instr br_h = ins_br(h_idx, to_h, f->blocks[h_idx].nargs);
+            emit(f, b_vexit, br_h);
+        }
+
+        free(vhead_types);
+        st->rewritten++;
+        break; /* vectorized one loop in this function */
+    }
+}
+
 void opt_optimize(Module *m, const Cost *cost, OptStats *st) {
     OptStats local = { 0, 0, 0, 0 };
     if (!st) st = &local;
@@ -682,6 +1119,7 @@ void opt_optimize(Module *m, const Cost *cost, OptStats *st) {
     uint8_t *snap = mod_encode(m, &slen);
     for (int fi = 0; fi < m->nfuncs; fi++) {
         Func *f = &m->funcs[fi];
+        opt_vectorize_loops(m, f, cost, st);
         Opt o = { 0 };
         o.f = f; o.cost = cost; o.st = st;
         opt_grow(&o, f->nvalues);

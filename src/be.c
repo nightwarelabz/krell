@@ -7,7 +7,7 @@ int be_class_of(Type t) {
     switch (t.kind) {
     case TY_INT: case TY_PTR: return BCLS_GP;
     case TY_FLOAT: return BCLS_FP;
-    case TY_VEC: return BCLS_VEC;
+    case TY_VEC: return t.n == 1 ? BCLS_FP : BCLS_VEC;
     default: return -1;
     }
 }
@@ -90,7 +90,8 @@ BeFunc *be_analyze(Module *m, Func *f, const Pools *pools) {
         for (int i = 0; i < bl->nins; i++) {
             Instr *in = &bl->ins[i];
             int p = be_pos(bf, b, i);
-            USE(in->a, p); USE(in->b, p); USE(in->c, p);
+            USE(in->a, p); USE(in->b, p);
+            if (in->op != OP_ALLOCA) USE(in->c, p);
             for (int k = 0; k < in->nargs; k++) USE(in->args[k], p);
             for (int k = 0; k < in->nargs2; k++) USE(in->args2[k], p);
         }
@@ -110,7 +111,7 @@ BeFunc *be_analyze(Module *m, Func *f, const Pools *pools) {
         for (int i = 0; i < bl->nargs; i++) SET(bdef, b, bl->arg_vals[i]);
         for (int i = 0; i < bl->nins; i++) {
             Instr *in = &bl->ins[i];
-            int32_t ops[3] = { in->a, in->b, in->c };
+            int32_t ops[3] = { in->a, in->b, in->op == OP_ALLOCA ? -1 : in->c };
             for (int k = 0; k < 3; k++)
                 if (ops[k] >= 0 && !GET(bdef, b, ops[k])) SET(buse, b, ops[k]);
             for (int k = 0; k < in->nargs; k++)
@@ -187,6 +188,15 @@ BeFunc *be_analyze(Module *m, Func *f, const Pools *pools) {
     (void)scalar_slots; (void)vec_units; (void)out_slots;
 
     /* ---------- linear scan per class ---------- */
+    Instr **defins = calloc((size_t)nv, sizeof(Instr *));
+    for (int b = 0; b < f->nblocks; b++) {
+        Block *bl = &f->blocks[b];
+        for (int i = 0; i < bl->nins; i++) {
+            Instr *in = &bl->ins[i];
+            if (in->result >= 0) defins[in->result] = in;
+        }
+    }
+
     int maxslots = 0;
     for (int cls = 0; cls < 2; cls++) {
         const PoolReg *pool = cls == BCLS_GP ? pools->gp : pools->fp;
@@ -220,6 +230,37 @@ BeFunc *be_analyze(Module *m, Func *f, const Pools *pools) {
             /* choose a register: if crossing, callee-saved only;
              * prefer caller-saved for non-crossing (preserve callee regs) */
             int pick = -1;
+
+            /* 2-address / accumulator reuse preference:
+             * If iv->v is defined by an operation whose first operand a dies at iv->start,
+             * and a is allocated to a register in this pool, reuse that register! */
+            Instr *d = defins[iv->v];
+            if (d && (d->op == OP_VADD || d->op == OP_VSUB || d->op == OP_VMUL ||
+                      d->op == OP_ADD || d->op == OP_SUB || d->op == OP_MUL ||
+                      d->op == OP_AND || d->op == OP_OR || d->op == OP_XOR)) {
+                int a = d->a;
+                if (a >= 0 && bf->vclass[a] == cls && bf->loc[a].is_reg &&
+                    bf->endpos[a] == iv->start) {
+                    int r_id = bf->loc[a].idx;
+                    for (int r = 0; r < npool; r++) {
+                        if (pool[r].reg == r_id) {
+                            bool cs = pool[r].callee_saved != 0;
+                            if (!iv->cross || cs) {
+                                for (int j = 0; j < na; j++) {
+                                    if (act[j].reg == r) {
+                                        act[j] = act[--na];
+                                        break;
+                                    }
+                                }
+                                regused[r] = false;
+                                pick = r;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
             for (int pass = 0; pass < 2 && pick < 0; pass++) {
                 for (int r = 0; r < npool; r++) {
                     if (regused[r]) continue;
@@ -245,18 +286,21 @@ BeFunc *be_analyze(Module *m, Func *f, const Pools *pools) {
         if (spill_counter > maxslots) maxslots = spill_counter;
         free(ivs); free(act); free(regused); free(regowner_end);
     }
+    free(defins);
     bf->nspill_gp = 0; bf->nspill_fp = 0;
     for (int v = 0; v < f->nvalues; v++)
         if (!bf->loc[v].is_reg && bf->vclass[v] == BCLS_GP) bf->nspill_gp++;
-        else if (!bf->loc[v].is_reg && bf->vclass[v] == BCLS_FP) bf->nspill_fp++;
-    /* vector values: always stack-resident */
+        else if (!bf->loc[v].is_reg && bf->vclass[v] == BCLS_FP && f->vtypes[v].kind != TY_VEC) bf->nspill_fp++;
+    /* vector values: stack-resident if not in register */
     {
         int unit = 0;
         /* units counted after scalar slots are known: defer offset fixup */
         for (int v = 0; v < f->nvalues; v++)
-            if (bf->vclass[v] == BCLS_VEC) {
-                bf->loc[v].is_reg = 0; bf->loc[v].cls = BCLS_VEC; bf->loc[v].idx = unit;
-                unit += f->vtypes[v].n;
+            if (f->vtypes[v].kind == TY_VEC) {
+                if (!bf->loc[v].is_reg) {
+                    bf->loc[v].is_reg = 0; bf->loc[v].cls = BCLS_VEC; bf->loc[v].idx = unit;
+                    unit += f->vtypes[v].n;
+                }
             }
         bf->nalloca = unit; /* temporarily stash unit count; fixed below */
     }
@@ -268,11 +312,11 @@ BeFunc *be_analyze(Module *m, Func *f, const Pools *pools) {
             /* map old per-class slot idx -> new global idx, per class */
             int mx = 0;
             for (int v = 0; v < f->nvalues; v++)
-                if (bf->vclass[v] == cls && !bf->loc[v].is_reg && bf->loc[v].idx >= mx) mx = bf->loc[v].idx + 1;
+                if (bf->vclass[v] == cls && !bf->loc[v].is_reg && f->vtypes[v].kind != TY_VEC && bf->loc[v].idx >= mx) mx = bf->loc[v].idx + 1;
             int *map = malloc(sizeof(int) * (size_t)(mx > 0 ? mx : 1));
             for (int i = 0; i < mx; i++) map[i] = next++;
             for (int v = 0; v < f->nvalues; v++)
-                if (bf->vclass[v] == cls && !bf->loc[v].is_reg) bf->loc[v].idx = map[bf->loc[v].idx];
+                if (bf->vclass[v] == cls && !bf->loc[v].is_reg && f->vtypes[v].kind != TY_VEC) bf->loc[v].idx = map[bf->loc[v].idx];
             free(map);
         }
         int total_scalar_slots = next;
@@ -326,7 +370,7 @@ BeFunc *be_analyze(Module *m, Func *f, const Pools *pools) {
         int vec_base = slot_base + total_scalar_slots * 8;
         int allo_base = vec_base + vec_unit_total * 16;
         for (int v = 0; v < f->nvalues; v++) {
-            if (bf->vclass[v] == BCLS_VEC) {
+            if (bf->loc[v].cls == BCLS_VEC && !bf->loc[v].is_reg) {
                 bf->vec_off[v] = vec_base + bf->loc[v].idx * 16;
                 bf->loc[v].off = bf->vec_off[v];
             } else if (bf->vclass[v] >= 0 && !bf->loc[v].is_reg) {

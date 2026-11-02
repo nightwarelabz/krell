@@ -28,6 +28,9 @@ typedef struct {
     Module *m;
     Func *f;
     BeFunc *bf;
+    Instr **defins;
+    bool *folded_ins;
+    bool *cmp_fuse;
     int fi;
     int lbl;
     int vl;
@@ -41,21 +44,32 @@ static void E(Ctx *c, const char *fmt, ...) {
 }
 
 /* operand text for a value's home; sz in bytes for register naming */
-static void locstr(Ctx *c, char *buf, size_t cap, int v, int sz) {
-    Loc *l = &c->bf->loc[v];
-    if (l->is_reg) {
-        if (l->cls == BCLS_FP) snprintf(buf, cap, "xmm%d", l->idx);
-        else snprintf(buf, cap, "%s", gname(sz)[l->idx]);
-    } else {
-        snprintf(buf, cap, "[rbp - %d]", l->off);
-    }
-}
 static void locstr_off(char *buf, size_t cap, Loc *l, int sz) {
     if (l->is_reg) {
         if (l->cls == BCLS_FP) snprintf(buf, cap, "xmm%d", l->idx);
         else snprintf(buf, cap, "%s", gname(sz)[l->idx]);
     } else if (l->off >= 0) snprintf(buf, cap, "[rbp - %d]", l->off);
     else snprintf(buf, cap, "[rbp + %d]", -l->off);
+}
+static void locstr(Ctx *c, char *buf, size_t cap, int v, int sz) {
+    locstr_off(buf, cap, &c->bf->loc[v], sz);
+}
+
+static int mem_size_of(Type t, int vl);
+
+static void resolve_addr(Ctx *c, int ptr_v, int *base_v, int *disp_out) {
+    *base_v = ptr_v;
+    *disp_out = 0;
+    if (ptr_v < 0 || ptr_v >= c->f->nvalues || !c->defins) return;
+    Instr *d = c->defins[ptr_v];
+    if (d && d->op == OP_GEP) {
+        int64_t imm;
+        if (be_iconst_val(c->f, d->b, &imm)) {
+            int esz = (int)mem_size_of(d->ety, c->vl);
+            *base_v = d->a;
+            *disp_out = (int)(imm * esz);
+        }
+    }
 }
 
 static void load_gp(Ctx *c, int reg, int v) {
@@ -73,16 +87,26 @@ static void store_gp(Ctx *c, int v, int reg) {
 static void load_fp(Ctx *c, int xmm, int v) {
     Loc *l = &c->bf->loc[v];
     Type t = c->f->vtypes[v];
-    const char *op = t.bits == 32 ? "movss" : "movsd";
+    const char *op = t.kind == TY_VEC ? "movups" : t.bits == 32 ? "movss" : "movsd";
     if (l->is_reg && l->cls == BCLS_FP && l->idx == xmm) return;
+    if (l->is_reg && l->cls == BCLS_FP) {
+        if (t.kind == TY_VEC) E(c, "  movaps xmm%d, xmm%d", xmm, l->idx);
+        else E(c, "  %s xmm%d, xmm%d", op, xmm, l->idx);
+        return;
+    }
     char b[64]; locstr(c, b, sizeof b, v, 8);
     E(c, "  %s xmm%d, %s", op, xmm, b);
 }
 static void store_fp(Ctx *c, int v, int xmm) {
     Loc *l = &c->bf->loc[v];
     Type t = c->f->vtypes[v];
-    const char *op = t.bits == 32 ? "movss" : "movsd";
+    const char *op = t.kind == TY_VEC ? "movups" : t.bits == 32 ? "movss" : "movsd";
     if (l->is_reg && l->cls == BCLS_FP && l->idx == xmm) return;
+    if (l->is_reg && l->cls == BCLS_FP) {
+        if (t.kind == TY_VEC) E(c, "  movaps xmm%d, xmm%d", l->idx, xmm);
+        else E(c, "  %s xmm%d, xmm%d", op, l->idx, xmm);
+        return;
+    }
     char b[64]; locstr(c, b, sizeof b, v, 8);
     E(c, "  %s %s, xmm%d", op, b, xmm);
 }
@@ -92,7 +116,14 @@ static void copy_value(Ctx *c, int dst, int src) {
     Type t = c->f->vtypes[src];
     int cls = be_class_of(t);
     if (cls == BCLS_GP) { load_gp(c, R11, src); store_gp(c, dst, R11); }
-    else if (cls == BCLS_FP) { load_fp(c, 15, src); store_fp(c, dst, 15); }
+    else if (cls == BCLS_FP) {
+        Loc *dl = &c->bf->loc[dst], *sl = &c->bf->loc[src];
+        if (dl->is_reg && sl->is_reg) {
+            E(c, "  movaps xmm%d, xmm%d", dl->idx, sl->idx);
+        } else {
+            load_fp(c, 15, src); store_fp(c, dst, 15);
+        }
+    }
     else { /* vector: chunk copy through xmm15 */
         Loc *dl = &c->bf->loc[dst], *sl = &c->bf->loc[src];
         int bytes = 16 * t.n;
@@ -121,6 +152,8 @@ static void x86_mv(void *p, Loc dst, Loc src) {
         if (!dst.is_reg && !src.is_reg) {
             E(c, "  movsd xmm15, %s", sb);
             E(c, "  movsd %s, xmm15", db);
+        } else if (dst.is_reg && src.is_reg) {
+            E(c, "  movaps %s, %s", db, sb);
         } else E(c, "  movsd %s, %s", db, sb);
     }
 }
@@ -373,6 +406,7 @@ static void emit_f2i(Ctx *c, Instr *in, bool unsig) {
 static void emit_instr(Ctx *c, int bi, int ii) {
     Func *f = c->f;
     Instr *in = &f->blocks[bi].ins[ii];
+    if (in->result >= 0 && c->folded_ins && c->folded_ins[in->result]) return;
     Type t = in->ty;
     char sb[64], sb2[64];
     switch (in->op) {
@@ -466,6 +500,7 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         load_gp(c, RAX, in->b);
         if (sgn) sext_rax(c, f->vtypes[in->b].bits);
         E(c, "  cmp r11, rax");
+        if (c->cmp_fuse && in->result >= 0 && c->cmp_fuse[in->result]) break;
         E(c, "  set%s al", CC[in->pred]);
         E(c, "  movzx eax, al");
         store_gp(c, in->result, RAX);
@@ -622,57 +657,108 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         break;
     case OP_GEP: {
         load_gp(c, R11, in->a);
-        load_gp(c, RAX, in->b);
-        Type it2 = f->vtypes[in->b];
-        if (it2.bits < 64) { E(c, "  shl rax, %d", 64 - it2.bits); E(c, "  sar rax, %d", 64 - it2.bits); }
         int esz = (int)mem_size_of(in->ety, c->vl);
-        if (esz != 1) E(c, "  imul rax, rax, %d", esz);
-        E(c, "  add r11, rax");
+        int64_t imm;
+        if (be_iconst_val(f, in->b, &imm)) {
+            if (imm * esz != 0) E(c, "  add r11, %lld", (long long)(imm * esz));
+        } else {
+            load_gp(c, RAX, in->b);
+            Type it2 = f->vtypes[in->b];
+            if (it2.bits < 64) { E(c, "  shl rax, %d", 64 - it2.bits); E(c, "  sar rax, %d", 64 - it2.bits); }
+            if (esz == 1 || esz == 2 || esz == 4 || esz == 8) {
+                if (esz == 1) E(c, "  add r11, rax");
+                else E(c, "  lea r11, [r11 + rax*%d]", esz);
+            } else {
+                E(c, "  imul rax, rax, %d", esz);
+                E(c, "  add r11, rax");
+            }
+        }
         store_gp(c, in->result, R11);
         break;
     }
     case OP_LOAD: {
-        load_gp(c, RAX, in->a);
+        int base_v, disp;
+        resolve_addr(c, in->a, &base_v, &disp);
+        Loc *bl = &c->bf->loc[base_v];
+        const char *basereg = "rax";
+        if (bl->is_reg && bl->cls == BCLS_GP) basereg = G64[bl->idx];
+        else load_gp(c, RAX, base_v);
+        char mstr[64];
+        if (disp == 0) snprintf(mstr, sizeof mstr, "[%s]", basereg);
+        else if (disp > 0) snprintf(mstr, sizeof mstr, "[%s + %d]", basereg, disp);
+        else snprintf(mstr, sizeof mstr, "[%s - %d]", basereg, -disp);
         if (t.kind == TY_FLOAT) {
-            E(c, "  %s xmm15, [rax]", t.bits == 32 ? "movss" : "movsd");
+            E(c, "  %s xmm15, %s", t.bits == 32 ? "movss" : "movsd", mstr);
             store_fp(c, in->result, 15);
         } else {
             const char *szp = t.bits == 8 ? "BYTE PTR" : t.bits == 16 ? "WORD PTR" : t.bits == 32 ? "DWORD PTR" : "QWORD PTR";
-            if (t.bits == 8 || t.bits == 16) E(c, "  movzx r11d, %s [rax]", szp);
-            else if (t.bits == 32) E(c, "  mov r11d, DWORD PTR [rax]");
-            else E(c, "  mov r11, QWORD PTR [rax]");
+            if (t.bits == 8 || t.bits == 16) E(c, "  movzx r11d, %s %s", szp, mstr);
+            else if (t.bits == 32) E(c, "  mov r11d, DWORD PTR %s", mstr);
+            else E(c, "  mov r11, QWORD PTR %s", mstr);
             if (t.bits == 1) E(c, "  and r11, 1");
             store_gp(c, in->result, R11);
         }
         break;
     }
     case OP_STORE: {
-        load_gp(c, RAX, in->a);
+        int base_v, disp;
+        resolve_addr(c, in->a, &base_v, &disp);
+        Loc *bl = &c->bf->loc[base_v];
+        const char *basereg = "rax";
+        if (bl->is_reg && bl->cls == BCLS_GP) basereg = G64[bl->idx];
+        else load_gp(c, RAX, base_v);
+        char mstr[64];
+        if (disp == 0) snprintf(mstr, sizeof mstr, "[%s]", basereg);
+        else if (disp > 0) snprintf(mstr, sizeof mstr, "[%s + %d]", basereg, disp);
+        else snprintf(mstr, sizeof mstr, "[%s - %d]", basereg, -disp);
         Type vt = f->vtypes[in->b];
         if (vt.kind == TY_FLOAT) {
             load_fp(c, 15, in->b);
-            E(c, "  %s [rax], xmm15", vt.bits == 32 ? "movss" : "movsd");
+            E(c, "  %s %s, xmm15", vt.bits == 32 ? "movss" : "movsd", mstr);
         } else {
             load_gp(c, R11, in->b);
             const char *r = vt.bits == 8 ? "r11b" : vt.bits == 16 ? "r11w" : vt.bits == 32 ? "r11d" : "r11";
-            E(c, "  mov [rax], %s", r);
+            E(c, "  mov %s, %s", mstr, r);
         }
         break;
     }
     case OP_VLOAD: case OP_VSTORE: {
-        load_gp(c, RAX, in->a);
+        int base_v, disp;
+        resolve_addr(c, in->a, &base_v, &disp);
+        Loc *bl = &c->bf->loc[base_v];
+        const char *basereg = "rax";
+        if (bl->is_reg && bl->cls == BCLS_GP) basereg = G64[bl->idx];
+        else load_gp(c, RAX, base_v);
         int v = in->op == OP_VLOAD ? in->result : in->b;
         Loc *l = &c->bf->loc[v];
+        if (l->is_reg) {
+            char mstr[64];
+            if (disp == 0) snprintf(mstr, sizeof mstr, "[%s]", basereg);
+            else if (disp > 0) snprintf(mstr, sizeof mstr, "[%s + %d]", basereg, disp);
+            else snprintf(mstr, sizeof mstr, "[%s - %d]", basereg, -disp);
+            const char *vop = "movups";
+            const char *env_al = getenv("KRELL_VECTOR_ALIGN");
+            if (env_al && strcmp(env_al, "aligned") == 0) vop = "movaps";
+            else if (env_al && strcmp(env_al, "streaming") == 0) vop = in->op == OP_VSTORE ? "movntdq" : "movaps";
+            if (in->op == OP_VLOAD) E(c, "  %s xmm%d, %s", vop, l->idx, mstr);
+            else E(c, "  %s %s, xmm%d", vop, mstr, l->idx);
+            break;
+        }
         int bytes = 16 * t.n;
         if (in->op == OP_VLOAD) bytes = 16 * t.n;
         else bytes = 16 * f->vtypes[in->b].n;
         for (int off = 0; off < bytes; off += 16) {
+            char mstr[64];
+            int total_off = disp + off;
+            if (total_off == 0) snprintf(mstr, sizeof mstr, "[%s]", basereg);
+            else if (total_off > 0) snprintf(mstr, sizeof mstr, "[%s + %d]", basereg, total_off);
+            else snprintf(mstr, sizeof mstr, "[%s - %d]", basereg, -total_off);
             if (in->op == OP_VLOAD) {
-                E(c, "  movups xmm15, [rax + %d]", off);
+                E(c, "  movups xmm15, %s", mstr);
                 E(c, "  movups [rbp - %d], xmm15", l->off - off);
             } else {
                 E(c, "  movups xmm15, [rbp - %d]", l->off - off);
-                E(c, "  movups [rax + %d], xmm15", off);
+                E(c, "  movups %s, xmm15", mstr);
             }
         }
         break;
@@ -680,8 +766,35 @@ static void emit_instr(Ctx *c, int bi, int ii) {
     case OP_VSPLAT: {
         Type et = ty_elem(t);
         Loc *l = &c->bf->loc[in->result];
-        int lanes = ty_lanes(t, c->vl);
         int eb = et.bits / 8;
+        if (l->is_reg) {
+            if (et.kind == TY_FLOAT) {
+                load_fp(c, l->idx, in->a);
+                if (et.bits == 32) E(c, "  shufps xmm%d, xmm%d, 0", l->idx, l->idx);
+                else E(c, "  movddup xmm%d, xmm%d", l->idx, l->idx);
+            } else {
+                load_gp(c, R11, in->a);
+                if (eb == 4) {
+                    E(c, "  movd xmm%d, r11d", l->idx);
+                    E(c, "  pshufd xmm%d, xmm%d, 0", l->idx, l->idx);
+                } else if (eb == 8) {
+                    E(c, "  movq xmm%d, r11", l->idx);
+                    E(c, "  movddup xmm%d, xmm%d", l->idx, l->idx);
+                } else {
+                    E(c, "  movd xmm%d, r11d", l->idx);
+                    if (eb == 1) {
+                        E(c, "  punpcklbw xmm%d, xmm%d", l->idx, l->idx);
+                        E(c, "  pshuflw xmm%d, xmm%d, 0", l->idx, l->idx);
+                        E(c, "  punpcklqdq xmm%d, xmm%d", l->idx, l->idx);
+                    } else if (eb == 2) {
+                        E(c, "  pshuflw xmm%d, xmm%d, 0", l->idx, l->idx);
+                        E(c, "  punpcklqdq xmm%d, xmm%d", l->idx, l->idx);
+                    }
+                }
+            }
+            break;
+        }
+        int lanes = ty_lanes(t, c->vl);
         if (et.kind == TY_FLOAT) load_fp(c, 15, in->a);
         else load_gp(c, R11, in->a);
         for (int i = 0; i < lanes; i++) {
@@ -699,6 +812,76 @@ static void emit_instr(Ctx *c, int bi, int ii) {
     case OP_VFADD: case OP_VFSUB: case OP_VFMUL: case OP_VFDIV: {
         Type et = ty_elem(t);
         Loc *dl = &c->bf->loc[in->result], *al = &c->bf->loc[in->a], *bl = &c->bf->loc[in->b];
+        if (dl->is_reg) {
+            int dreg = dl->idx;
+            if (al->is_reg && al->idx == dreg) {
+                /* already in dreg */
+            } else if (al->is_reg) {
+                E(c, "  movaps xmm%d, xmm%d", dreg, al->idx);
+            } else {
+                E(c, "  movups xmm%d, [rbp - %d]", dreg, al->off);
+            }
+            if (in->op == OP_VADD && et.kind == TY_INT && et.bits == 64 && in->b >= 0 && c->defins[in->b]) {
+                Instr *db = c->defins[in->b];
+                if (db->op == OP_VMUL && db->a == db->b && c->folded_ins && c->folded_ins[in->b]) {
+                    int sreg = 14;
+                    Loc *sl = &c->bf->loc[db->a];
+                    if (sl->is_reg) sreg = sl->idx;
+                    else load_fp(c, 14, db->a);
+                    E(c, "  movdqa xmm15, xmm%d", sreg);
+                    E(c, "  psrlq xmm15, 32");
+                    E(c, "  pmuludq xmm15, xmm%d", sreg);
+                    E(c, "  psllq xmm15, 33");
+                    E(c, "  pmuludq xmm%d, xmm%d", sreg, sreg);
+                    E(c, "  paddq xmm%d, xmm%d", dreg, sreg);
+                    E(c, "  paddq xmm%d, xmm15", dreg);
+                    break;
+                }
+            }
+            if (in->op == OP_VMUL && et.kind == TY_INT && et.bits == 64) {
+                if (in->a == in->b) {
+                    E(c, "  movdqa xmm15, xmm%d", dreg);
+                    E(c, "  psrlq xmm15, 32");
+                    E(c, "  pmuludq xmm15, xmm%d", dreg);
+                    E(c, "  psllq xmm15, 33");
+                    E(c, "  pmuludq xmm%d, xmm%d", dreg, dreg);
+                    E(c, "  paddq xmm%d, xmm15", dreg);
+                } else {
+                    int breg = bl->is_reg ? bl->idx : 14;
+                    if (!bl->is_reg) E(c, "  movups xmm14, [rbp - %d]", bl->off);
+                    E(c, "  movdqa xmm15, xmm%d", dreg);
+                    E(c, "  psrlq xmm15, 32");
+                    E(c, "  pmuludq xmm15, xmm%d", breg);
+                    E(c, "  movdqa xmm13, xmm%d", breg);
+                    E(c, "  psrlq xmm13, 32");
+                    E(c, "  pmuludq xmm13, xmm%d", dreg);
+                    E(c, "  paddq xmm15, xmm13");
+                    E(c, "  psllq xmm15, 32");
+                    E(c, "  pmuludq xmm%d, xmm%d", dreg, breg);
+                    E(c, "  paddq xmm%d, xmm15", dreg);
+                }
+                break;
+            }
+            const char *nm = NULL;
+            if (et.kind == TY_FLOAT) {
+                nm = in->op == OP_VFADD ? (et.bits == 32 ? "addps" : "addpd") :
+                     in->op == OP_VFSUB ? (et.bits == 32 ? "subps" : "subpd") :
+                     in->op == OP_VFMUL ? (et.bits == 32 ? "mulps" : "mulpd") :
+                                          (et.bits == 32 ? "divps" : "divpd");
+            } else if (in->op == OP_VAND) nm = "pand";
+            else if (in->op == OP_VOR) nm = "por";
+            else if (in->op == OP_VXOR) nm = "pxor";
+            else {
+                nm = in->op == OP_VADD ? (et.bits == 64 ? "paddq" : et.bits == 32 ? "paddd" : et.bits == 16 ? "paddw" : "paddb") :
+                     in->op == OP_VSUB ? (et.bits == 64 ? "psubq" : et.bits == 32 ? "psubd" : et.bits == 16 ? "psubw" : "psubb") :
+                     (et.bits == 32 ? "pmulld" : et.bits == 16 ? "pmullw" : NULL);
+            }
+            if (nm) {
+                if (bl->is_reg) E(c, "  %s xmm%d, xmm%d", nm, dreg, bl->idx);
+                else E(c, "  %s xmm%d, [rbp - %d]", nm, dreg, bl->off);
+                break;
+            }
+        }
         bool scalarize = in->op == OP_VUDIV || (in->op == OP_VMUL && et.kind == TY_INT && et.bits != 32 && et.bits != 16);
         if (!scalarize) {
             const char *nm = NULL;
@@ -784,6 +967,39 @@ static void emit_instr(Ctx *c, int bi, int ii) {
     case OP_VEXTRACT: {
         Type et = ty_elem(f->vtypes[in->a]);
         Loc *al = &c->bf->loc[in->a];
+        int imm = (int)in->imm;
+        if (al->is_reg) {
+            if (et.kind == TY_FLOAT) {
+                if (imm == 0) store_fp(c, in->result, al->idx);
+                else {
+                    if (et.bits == 32) {
+                        E(c, "  shufps xmm15, xmm%d, %d", al->idx, imm);
+                        store_fp(c, in->result, 15);
+                    } else {
+                        E(c, "  movhlps xmm15, xmm%d", al->idx);
+                        store_fp(c, in->result, 15);
+                    }
+                }
+            } else {
+                if (et.bits == 64) {
+                    if (imm == 0) E(c, "  movq r11, xmm%d", al->idx);
+                    else {
+                        E(c, "  movhlps xmm15, xmm%d", al->idx);
+                        E(c, "  movq r11, xmm15");
+                    }
+                } else if (et.bits == 32) {
+                    if (imm == 0) E(c, "  movd r11d, xmm%d", al->idx);
+                    else {
+                        E(c, "  pshufd xmm15, xmm%d, %d", al->idx, imm);
+                        E(c, "  movd r11d, xmm15");
+                    }
+                } else {
+                    E(c, "  pextr%c r11d, xmm%d, %d", et.bits == 16 ? 'w' : 'b', al->idx, imm);
+                }
+                store_gp(c, in->result, R11);
+            }
+            break;
+        }
         int eb = et.bits / 8;
         int off = al->off - (int)in->imm * eb;
         if (et.kind == TY_FLOAT) {
@@ -801,8 +1017,27 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         copy_value(c, in->result, in->a);
         Type et = ty_elem(t);
         Loc *dl = &c->bf->loc[in->result];
+        int imm = (int)in->imm;
+        if (dl->is_reg) {
+            if (et.kind == TY_FLOAT) {
+                load_fp(c, 15, in->b);
+                if (et.bits == 32) E(c, "  insertps xmm%d, xmm15, %d", dl->idx, (imm << 4));
+                else {
+                    if (imm == 0) E(c, "  movsd xmm%d, xmm15", dl->idx);
+                    else E(c, "  movlhps xmm%d, xmm15", dl->idx);
+                }
+            } else {
+                load_gp(c, R11, in->b);
+                int eb = et.bits / 8;
+                if (eb == 1) E(c, "  pinsrb xmm%d, r11d, %d", dl->idx, imm);
+                else if (eb == 2) E(c, "  pinsrw xmm%d, r11d, %d", dl->idx, imm);
+                else if (eb == 4) E(c, "  pinsrd xmm%d, r11d, %d", dl->idx, imm);
+                else E(c, "  pinsrq xmm%d, r11, %d", dl->idx, imm);
+            }
+            break;
+        }
         int eb = et.bits / 8;
-        int off = dl->off - (int)in->imm * eb;
+        int off = dl->off - imm * eb;
         if (et.kind == TY_FLOAT) {
             load_fp(c, 15, in->b);
             E(c, "  %s [rbp - %d], xmm15", et.bits == 32 ? "movss" : "movsd", off);
@@ -893,9 +1128,15 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         break;
     case OP_CONDBR: {
         int L = ++c->lbl;
-        load_gp(c, R11, in->a);
-        E(c, "  test r11, r11");
-        E(c, "  je .Lx%d_%d", c->fi, L);
+        if (c->cmp_fuse && in->a >= 0 && c->cmp_fuse[in->a]) {
+            static const char *INV_CC[10] = { "ne", "e", "ae", "a", "be", "b", "ge", "g", "le", "l" };
+            Instr *d = c->defins[in->a];
+            E(c, "  j%s .Lx%d_%d", INV_CC[d->pred], c->fi, L);
+        } else {
+            load_gp(c, R11, in->a);
+            E(c, "  test r11, r11");
+            E(c, "  je .Lx%d_%d", c->fi, L);
+        }
         emit_branch(c, in->blk, in->args, in->nargs);
         E(c, ".Lx%d_%d:", c->fi, L);
         emit_branch(c, in->blk2, in->args2, in->nargs2);
@@ -920,9 +1161,84 @@ static int emit_func(Ctx *c, int fi) {
     Module *m = c->m;
     Func *f = &m->funcs[fi];
     c->f = f; c->fi = fi; c->lbl = 0;
+    c->defins = calloc((size_t)f->nvalues, sizeof(Instr *));
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = &f->blocks[bi];
+        for (int ii = 0; ii < b->nins; ii++) {
+            if (b->ins[ii].result >= 0)
+                c->defins[b->ins[ii].result] = &b->ins[ii];
+        }
+    }
+    c->folded_ins = calloc((size_t)f->nvalues, sizeof(bool));
+    int *uses = calloc((size_t)f->nvalues, sizeof(int));
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = &f->blocks[bi];
+        for (int ii = 0; ii < b->nins; ii++) {
+            Instr *in = &b->ins[ii];
+            if (in->a >= 0) uses[in->a]++;
+            if (in->b >= 0) uses[in->b]++;
+            if (in->c >= 0 && in->op != OP_ALLOCA) uses[in->c]++;
+            for (int k = 0; k < in->nargs; k++) uses[in->args[k]]++;
+            for (int k = 0; k < in->nargs2; k++) uses[in->args2[k]]++;
+        }
+    }
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = &f->blocks[bi];
+        for (int ii = 0; ii < b->nins; ii++) {
+            Instr *in = &b->ins[ii];
+            if (in->op == OP_LOAD || in->op == OP_STORE || in->op == OP_VLOAD || in->op == OP_VSTORE) {
+                int base_v, disp;
+                resolve_addr(c, in->a, &base_v, &disp);
+                if (disp != 0 && in->a != base_v) {
+                    uses[in->a]--;
+                }
+            }
+        }
+    }
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = &f->blocks[bi];
+        for (int ii = 0; ii < b->nins; ii++) {
+            Instr *in = &b->ins[ii];
+            if (in->op == OP_GEP && in->result >= 0 && uses[in->result] == 0) {
+                int64_t imm;
+                if (be_iconst_val(f, in->b, &imm)) {
+                    c->folded_ins[in->result] = true;
+                    uses[in->b]--;
+                    if (uses[in->b] == 0 && c->defins[in->b] && c->defins[in->b]->op == OP_ICONST) {
+                        c->folded_ins[in->b] = true;
+                    }
+                }
+            }
+        }
+    }
+    c->cmp_fuse = calloc((size_t)f->nvalues, sizeof(bool));
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = &f->blocks[bi];
+        if (b->nins >= 2) {
+            Instr *term = &b->ins[b->nins - 1];
+            Instr *prev = &b->ins[b->nins - 2];
+            if (term->op == OP_CONDBR && prev->op == OP_ICMP && term->a == prev->result && uses[prev->result] == 1) {
+                c->cmp_fuse[prev->result] = true;
+            }
+        }
+    }
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = &f->blocks[bi];
+        for (int ii = 0; ii < b->nins; ii++) {
+            Instr *in = &b->ins[ii];
+            if (in->op == OP_VADD && in->b >= 0 && c->defins[in->b]) {
+                Instr *db = c->defins[in->b];
+                Type et = ty_elem(in->ty);
+                if (db->op == OP_VMUL && db->a == db->b && et.kind == TY_INT && et.bits == 64 && uses[in->b] == 1) {
+                    c->folded_ins[in->b] = true;
+                }
+            }
+        }
+    }
+    free(uses);
     Pools pools = { POOL_GP, 10, POOL_FP, 15 };
     BeFunc *bf = be_analyze(m, f, &pools);
-    if (!bf) return -1;
+    if (!bf) { free(c->defins); c->defins = NULL; free(c->folded_ins); c->folded_ins = NULL; free(c->cmp_fuse); c->cmp_fuse = NULL; return -1; }
     c->bf = bf;
     E(c, ".globl %s", f->name);
     E(c, ".type %s, @function", f->name);
@@ -980,6 +1296,12 @@ static int emit_func(Ctx *c, int fi) {
     E(c, ".size %s, .-%s", f->name, f->name);
     be_free(bf);
     c->bf = NULL;
+    free(c->defins);
+    c->defins = NULL;
+    free(c->folded_ins);
+    c->folded_ins = NULL;
+    free(c->cmp_fuse);
+    c->cmp_fuse = NULL;
     return 0;
 }
 
