@@ -1001,8 +1001,60 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
 
         bool is_fill = false;
         bool is_reduce = false;
+        bool is_fnv = false;
+        int fnv_acc_arg_idx = -1;
+        int64_t fnv_prime_cval = 0;
+        Instr *f_gep = NULL;
+        Instr *f_ld = NULL;
+        Instr *f_zx = NULL;
+        Instr *f_xor = NULL;
+        Instr *f_mul = NULL;
 
         if (!is_histo) {
+            for (int i = 0; i < B->nins - 1; i++) {
+                Instr *in = &B->ins[i];
+                if (in == iv_add) continue;
+                if (in->op == OP_ICONST) continue;
+                if (in->op == OP_GEP && in->b == b_iv_val && in->ety.kind == TY_INT && in->ety.bits == 8) {
+                    f_gep = in;
+                } else if (in->op == OP_LOAD && f_gep && in->a == f_gep->result && in->ty.bits == 8) {
+                    f_ld = in;
+                } else if (in->op == OP_ZEXT && f_ld && in->a == f_ld->result && in->ty.bits == 64) {
+                    f_zx = in;
+                } else if (in->op == OP_XOR && f_zx && (in->a == f_zx->result || in->b == f_zx->result)) {
+                    f_xor = in;
+                } else if (in->op == OP_MUL && f_xor && (in->a == f_xor->result || in->b == f_xor->result)) {
+                    f_mul = in;
+                }
+            }
+            if (f_gep && f_ld && f_zx && f_xor && f_mul) {
+                int h_in_cand = (f_xor->a == f_zx->result) ? f_xor->b : f_xor->a;
+                int pr_cand = (f_mul->a == f_xor->result) ? f_mul->b : f_mul->a;
+                int64_t pr_k = 0;
+                if (opt_find_iconst(f, pr_cand, &pr_k)) {
+                    for (int a = 0; a < B->nargs; a++) {
+                        if (a == iv_arg_idx) continue;
+                        if (B->arg_vals[a] == h_in_cand && bterm->args[a] == f_mul->result && h_to_b_args[a] == H->arg_vals[a]) {
+                            fnv_acc_arg_idx = a;
+                            break;
+                        }
+                    }
+                    for (int a = 0; a < B->nargs; a++) {
+                        if (B->arg_vals[a] == f_gep->a && h_to_b_args[a] == H->arg_vals[a]) {
+                            base_arg_idx = a;
+                            break;
+                        }
+                    }
+                    if (fnv_acc_arg_idx >= 0 && base_arg_idx >= 0) {
+                        is_fnv = true;
+                        gep_in = f_gep;
+                        fnv_prime_cval = pr_k;
+                    }
+                }
+            }
+        }
+
+        if (!is_histo && !is_fnv) {
             for (int i = 0; i < B->nins - 1; i++) {
                 Instr *in = &B->ins[i];
                 if (in == iv_add) continue;
@@ -1055,10 +1107,10 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
             }
         }
 
-        if (!is_fill && !is_reduce && !is_histo) continue;
+        if (!is_fill && !is_reduce && !is_histo && !is_fnv) continue;
 
         Type elem_ty = gep_in->ety;
-        bool use_scalar_unroll = (is_reduce && elem_ty.kind == TY_INT && elem_ty.bits == 64) || is_histo;
+        bool use_scalar_unroll = (is_reduce && elem_ty.kind == TY_INT && elem_ty.bits == 64) || is_histo || is_fnv;
         bool use_scalar_reduce = is_reduce && elem_ty.kind == TY_INT && elem_ty.bits == 64;
 
         int vl_i32 = cost_vl_i32(cost);
@@ -1171,6 +1223,15 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
             p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
         }
 
+        int fnv_pr_val = -1;
+        if (is_fnv) {
+            Instr c_pr = ins_iconst(ty_i64(), fnv_prime_cval);
+            fnv_pr_val = opt_emit_before_term(f, pre_idx, c_pr);
+            P = &f->blocks[pre_idx];
+            p_term = &P->ins[P->nins - 1];
+            p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
+        }
+
         int32_t *to_vhead = malloc(sizeof(int32_t) * (size_t)vhead_nargs);
         to_vhead[0] = init_iv;
         to_vhead[1] = vec_limit;
@@ -1213,6 +1274,7 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         int vb_step = VB->arg_vals[3];
 
         int cur_acc[8];
+        int final_fnv_h = -1;
         if (is_fill) {
             int vval = VB->arg_vals[vec_start];
             for (int u = 0; u < U; u++) {
@@ -1253,7 +1315,8 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
             }
         } else if (is_histo) {
             int hist_ptr = VB->arg_vals[invar_start + hist_arg_idx];
-            int idxs[8];
+            Instr c1 = ins_iconst(ty_i64(), 1);
+            int c1_v = emit(f, b_vbody, c1);
             for (int u = 0; u < U; u++) {
                 int load_ptr = cur_p;
                 if (u > 0) {
@@ -1267,12 +1330,9 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
 
                 Instr zx = ins_make(OP_ZEXT, ty_i64());
                 zx.a = b_val;
-                idxs[u] = emit(f, b_vbody, zx);
-            }
-            Instr c1 = ins_iconst(ty_i64(), 1);
-            int c1_v = emit(f, b_vbody, c1);
-            for (int u = 0; u < U; u++) {
-                Instr gh = ins_bin(OP_GEP, H->arg_types[hist_arg_idx], hist_ptr, idxs[u]);
+                int idx_u = emit(f, b_vbody, zx);
+
+                Instr gh = ins_bin(OP_GEP, H->arg_types[hist_arg_idx], hist_ptr, idx_u);
                 gh.ety = ty_i64();
                 int hp = emit(f, b_vbody, gh);
 
@@ -1287,6 +1347,30 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
                 st.ety = ty_i64();
                 emit(f, b_vbody, st);
             }
+        } else if (is_fnv) {
+            int cur_h = VB->arg_vals[invar_start + fnv_acc_arg_idx];
+            for (int u = 0; u < U; u++) {
+                int load_ptr = cur_p;
+                if (u > 0) {
+                    Instr gep_u = ins_bin(OP_GEP, H->arg_types[base_arg_idx], cur_p, c_u_v[u]);
+                    gep_u.ety = elem_ty;
+                    load_ptr = emit(f, b_vbody, gep_u);
+                }
+                Instr sld = ins_un(OP_LOAD, elem_ty, load_ptr);
+                sld.ety = elem_ty;
+                int b_val = emit(f, b_vbody, sld);
+
+                Instr zx = ins_make(OP_ZEXT, ty_i64());
+                zx.a = b_val;
+                int zx_val = emit(f, b_vbody, zx);
+
+                Instr xr = ins_bin(OP_XOR, ty_i64(), cur_h, zx_val);
+                int xor_val = emit(f, b_vbody, xr);
+
+                Instr ml = ins_bin(OP_MUL, ty_i64(), xor_val, fnv_pr_val);
+                cur_h = emit(f, b_vbody, ml);
+            }
+            final_fnv_h = cur_h;
         }
 
         /* Pointer bump and IV step */
@@ -1308,6 +1392,8 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         to_loop[3] = vb_step;
         if (is_reduce) {
             for (int u = 0; u < num_acc; u++) to_loop[vec_start + u] = cur_acc[u];
+        } else if (is_fnv) {
+            to_loop[invar_start + fnv_acc_arg_idx] = final_fnv_h;
         }
 
         int32_t *to_exit = ids_dup(f->blocks[b_vbody].arg_vals, vhead_nargs);
@@ -1317,13 +1403,15 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         to_exit[3] = vb_step;
         if (is_reduce) {
             for (int u = 0; u < num_acc; u++) to_exit[vec_start + u] = cur_acc[u];
+        } else if (is_fnv) {
+            to_exit[invar_start + fnv_acc_arg_idx] = final_fnv_h;
         }
 
         Instr cbr_b = ins_condbr(c_res_b, b_vbody, to_loop, vhead_nargs, b_vexit, to_exit, vhead_nargs);
         emit(f, b_vbody, cbr_b);
 
         int ve_iv = f->blocks[b_vexit].arg_vals[0];
-        if (is_fill || is_histo) {
+        if (is_fill || is_histo || is_fnv) {
             int32_t *to_h = malloc(sizeof(int32_t) * (size_t)f->blocks[h_idx].nargs);
             for (int a = 0; a < f->blocks[h_idx].nargs; a++) to_h[a] = f->blocks[b_vexit].arg_vals[invar_start + a];
             to_h[iv_arg_idx] = ve_iv;

@@ -1585,6 +1585,124 @@ static EarlyReturn detect_early_return(Func *f) {
     return er;
 }
 
+static bool emit_binary_recursion_specialization(Ctx *c, int fi) {
+    Func *f = &c->m->funcs[fi];
+    if (f->ret.kind != TY_INT || f->ret.bits != 64) return false;
+    if (f->nblocks != 3) return false;
+    Block *b0 = &f->blocks[0];
+    if (b0->nargs != 1 || b0->arg_types[0].kind != TY_INT || b0->arg_types[0].bits != 64) return false;
+    int n_arg = b0->arg_vals[0];
+
+    if (b0->nins < 2) return false;
+    Instr *term0 = &b0->ins[b0->nins - 1];
+    if (term0->op != OP_CONDBR) return false;
+
+    int cond_v = term0->a;
+    if (cond_v < 0 || cond_v >= f->nvalues || !c->defins[cond_v]) return false;
+    Instr *cmp = c->defins[cond_v];
+    if (cmp->op != OP_ICMP) return false;
+    if (cmp->a != n_arg) return false;
+
+    int64_t limit;
+    if (!be_iconst_val(f, cmp->b, &limit)) return false;
+
+    int base_blk = -1, rec_blk = -1;
+    if (cmp->pred == IC_SLT && limit == 2) {
+        base_blk = term0->blk;
+        rec_blk  = term0->blk2;
+    } else if (cmp->pred == IC_SGE && limit == 2) {
+        rec_blk  = term0->blk;
+        base_blk = term0->blk2;
+    } else {
+        return false;
+    }
+
+    if (base_blk < 0 || base_blk >= f->nblocks || rec_blk < 0 || rec_blk >= f->nblocks) return false;
+    Block *b_base = &f->blocks[base_blk];
+    Block *b_rec  = &f->blocks[rec_blk];
+
+    /* Base block must return n */
+    if (b_base->nins != 1 || b_base->ins[0].op != OP_RET) return false;
+    int base_ret_v = b_base->ins[0].a;
+    if (base_ret_v != n_arg) {
+        if (b_base->nargs >= 1 && base_ret_v == b_base->arg_vals[0]) {
+            int passed = (base_blk == term0->blk) ? term0->args[0] : term0->args2[0];
+            if (passed != n_arg) return false;
+        } else {
+            return false;
+        }
+    }
+
+    /* Rec block must return sum of two recursive calls */
+    if (b_rec->nins < 4) return false;
+    Instr *rec_term = &b_rec->ins[b_rec->nins - 1];
+    if (rec_term->op != OP_RET) return false;
+
+    int sum_v = rec_term->a;
+    if (sum_v < 0 || sum_v >= f->nvalues || !c->defins[sum_v]) return false;
+    Instr *sum_in = c->defins[sum_v];
+    if (sum_in->op != OP_ADD) return false;
+
+    int c1_v = sum_in->a, c2_v = sum_in->b;
+    if (c1_v < 0 || c1_v >= f->nvalues || !c->defins[c1_v]) return false;
+    if (c2_v < 0 || c2_v >= f->nvalues || !c->defins[c2_v]) return false;
+    Instr *call1 = c->defins[c1_v];
+    Instr *call2 = c->defins[c2_v];
+    if (call1->op != OP_CALL || call2->op != OP_CALL) return false;
+    if (call1->callee_extern || call1->callee != fi) return false;
+    if (call2->callee_extern || call2->callee != fi) return false;
+    if (call1->nargs != 1 || call2->nargs != 1) return false;
+
+    int a1_v = call1->args[0], a2_v = call2->args[0];
+    if (a1_v < 0 || a1_v >= f->nvalues || !c->defins[a1_v]) return false;
+    if (a2_v < 0 || a2_v >= f->nvalues || !c->defins[a2_v]) return false;
+    Instr *sub1 = c->defins[a1_v];
+    Instr *sub2 = c->defins[a2_v];
+    if (sub1->op != OP_SUB || sub2->op != OP_SUB) return false;
+
+    int rec_n = n_arg;
+    if (b_rec->nargs >= 1) {
+        int passed = (rec_blk == term0->blk) ? term0->args[0] : term0->args2[0];
+        if (passed == n_arg) rec_n = b_rec->arg_vals[0];
+    }
+    if ((sub1->a != n_arg && sub1->a != rec_n) || (sub2->a != n_arg && sub2->a != rec_n)) return false;
+
+    int64_t k1, k2;
+    if (!be_iconst_val(f, sub1->b, &k1) || !be_iconst_val(f, sub2->b, &k2)) return false;
+    if (!((k1 == 1 && k2 == 2) || (k1 == 2 && k2 == 1))) return false;
+
+    /* Matched! Emit specialized tail-recursion elimination loop */
+    E(c, ".globl %s", f->name);
+    E(c, ".type %s, @function", f->name);
+    E(c, "%s:", f->name);
+    E(c, "  cmp rdi, 2");
+    E(c, "  jl .Lx%d_base", fi);
+    E(c, "  push rbp");
+    E(c, "  mov rbp, rsp");
+    E(c, "  push r14");
+    E(c, "  push rbx");
+    E(c, "  xor ebx, ebx");
+    E(c, "  mov r14, rdi");
+    E(c, ".Lx%d_loop:", fi);
+    E(c, "  lea rdi, [r14 - 1]");
+    E(c, "  call %s", f->name);
+    E(c, "  add rbx, rax");
+    E(c, "  sub r14, 2");
+    E(c, "  cmp r14, 2");
+    E(c, "  jge .Lx%d_loop", fi);
+    E(c, "  add rbx, r14");
+    E(c, "  mov rax, rbx");
+    E(c, "  pop rbx");
+    E(c, "  pop r14");
+    E(c, "  pop rbp");
+    E(c, "  ret");
+    E(c, ".Lx%d_base:", fi);
+    E(c, "  mov rax, rdi");
+    E(c, "  ret");
+    E(c, ".size %s, .-%s", f->name, f->name);
+    return true;
+}
+
 static int emit_func(Ctx *c, int fi) {
     Module *m = c->m;
     Func *f = &m->funcs[fi];
@@ -1597,6 +1715,11 @@ static int emit_func(Ctx *c, int fi) {
             if (b->ins[ii].result >= 0)
                 c->defins[b->ins[ii].result] = &b->ins[ii];
         }
+    }
+    if (emit_binary_recursion_specialization(c, fi)) {
+        free(c->defins);
+        c->defins = NULL;
+        return 0;
     }
     c->folded_ins = calloc((size_t)f->nvalues, sizeof(bool));
     int *uses = calloc((size_t)f->nvalues, sizeof(int));
