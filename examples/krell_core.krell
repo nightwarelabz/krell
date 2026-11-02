@@ -12,7 +12,7 @@
 ; ==============================================================================
 
 extern write(i32, ptr, i64) -> i64
-extern ioctl(i32, i64, ptr) -> i32
+extern kc_winsize(i32, ptr) -> i32
 extern usleep(i32) -> i32
 extern malloc(i64) -> ptr
 extern free(ptr) -> void
@@ -849,7 +849,7 @@ fn main() -> i64 {
     %c1 = iconst i64 1
     %c33000 = iconst i32 33000
     %ws = call ptr malloc(8)
-    %rc = call i32 ioctl(1, 21523, %ws)
+    %rc = call i32 kc_winsize(1, %ws)
     %row_p = gep i16 %ws, 0
     %col_p = gep i16 %ws, 1
     %raw_rows = load i16, %row_p
@@ -861,18 +861,18 @@ fn main() -> i64 {
 
     %c_lo = icmp.slt i64 %c64, 40
     %cols_1 = select i64 %c_lo, 80, %c64
-    %c_hi = icmp.sgt i64 %cols_1, 220
-    %cols = select i64 %c_hi, 220, %cols_1
+    %c_hi = icmp.sgt i64 %cols_1, 1000
+    %cols = select i64 %c_hi, 1000, %cols_1
 
     %r_lo = icmp.slt i64 %r64, 20
     %rows_1 = select i64 %r_lo, 24, %r64
-    %r_hi = icmp.sgt i64 %rows_1, 70
-    %rows = select i64 %r_hi, 70, %rows_1
+    %r_hi = icmp.sgt i64 %rows_1, 300
+    %rows = select i64 %r_hi, 300, %rows_1
 
     %gfx_rows = sub i64 %rows, 6
     %gfx_cells = mul i64 %cols, %gfx_rows
 
-    %out_buf = call ptr malloc(1048576)
+    %out_buf = call ptr malloc(8388608)
     %ch_buf = call ptr malloc(%gfx_cells)
     %fg_bytes = mul i64 %gfx_cells, 4
     %fg_buf = call ptr malloc(%fg_bytes)
