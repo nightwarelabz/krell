@@ -1,0 +1,24 @@
+name: Fix Krell Core modes
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fix-modes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/krell-core-folder
+      - name: Fix executable permissions
+        run: chmod +x examples/krell_core/krellc examples/krell_core/krell_core examples/krell_core/run_demo.sh
+      - name: Commit and push mode changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add examples/krell_core/krellc examples/krell_core/krell_core examples/krell_core/run_demo.sh
+          git diff --cached --quiet || git commit -m "Fix executable permissions for Krell Core example binaries"
+          git push
