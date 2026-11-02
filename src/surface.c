@@ -591,10 +591,11 @@ static bool parse_block_header(P *p, Func *f, const char *lbl) {
     char w[64];
     if (!word(p, w, sizeof w) || strcmp(w, lbl) != 0) { perr(p, "block label"); return false; }
     if (!eat_ch(p, '(')) { perr(p, "block ("); return false; }
-    Type atys[32]; char anames[32][64]; int na = 0;
+    Type atys[64]; char anames[64][64]; int na = 0;
     skip_ws(p);
     if (*p->p != ')') {
         for (;;) {
+            if (na >= 64) { perr(p, "too many block args"); return false; }
             if (!word(p, anames[na], sizeof anames[na])) { perr(p, "arg name"); return false; }
             if (!eat_ch(p, ':')) { perr(p, "arg :"); return false; }
             if (!parse_type(p, &atys[na])) return false;
