@@ -411,6 +411,89 @@ static void optimize_func(Opt *o) {
                     o->st->folded++;
                     break;
                 }
+                if (w.op == OP_AND && !ha && !hb) {
+                    /* Range-check idiom: zext(x >=s lo) & zext(x <=s hi)
+                     * becomes zext((x - lo) <=u (hi - lo)). The identity
+                     * holds for every x in two's complement when lo <=s hi:
+                     * offsetting by lo maps the signed interval [lo, hi]
+                     * onto the unsigned interval [0, hi - lo]. */
+                    Instr *za = local_def(&nb, w.a);
+                    Instr *zb = local_def(&nb, w.b);
+                    if (za && zb && za != zb && za->op == OP_ZEXT && zb->op == OP_ZEXT) {
+                        Instr *ca = local_def(&nb, za->a);
+                        Instr *cb = local_def(&nb, zb->a);
+                        if (ca && cb && ca != cb && ca->op == OP_ICMP && cb->op == OP_ICMP) {
+                            Instr *cs[2] = { ca, cb };
+                            int xval = -1;
+                            Type xty = ty_i64();
+                            uint64_t lo = 0, hi = 0;
+                            bool have_lo = false, have_hi = false, rok = true;
+                            for (int q = 0; q < 2 && rok; q++) {
+                                Instr *c = cs[q];
+                                int xv = -1;
+                                int64_t kv = 0;
+                                int pred = c->pred;
+                                if (isk(o, c->b, &kv)) { xv = c->a; }
+                                else if (isk(o, c->a, &kv)) {
+                                    xv = c->b;
+                                    pred = (pred == IC_SGE) ? IC_SLE : (pred == IC_SLE) ? IC_SGE :
+                                           (pred == IC_SGT) ? IC_SLT : (pred == IC_SLT) ? IC_SGT :
+                                           (pred == IC_UGE) ? IC_ULE : (pred == IC_ULE) ? IC_UGE :
+                                           (pred == IC_UGT) ? IC_ULT : (pred == IC_ULT) ? IC_UGT : pred;
+                                } else rok = false;
+                                if (!rok) break;
+                                if (xval < 0) { xval = xv; xty = f->vtypes[xv]; }
+                                else if (xv != xval) { rok = false; break; }
+                                if (xty.kind != TY_INT) { rok = false; break; }
+                                uint64_t bits_mask = msk64(xty.bits);
+                                uint64_t ku = (uint64_t)kv & bits_mask;
+                                bool sgn = (pred == IC_SGE || pred == IC_SGT || pred == IC_SLE || pred == IC_SLT);
+                                if (!sgn && !(pred == IC_UGE || pred == IC_UGT || pred == IC_ULE || pred == IC_ULT)) { rok = false; break; }
+                                if (pred == IC_SGE || pred == IC_UGE) {
+                                    if (have_lo) { rok = false; break; }
+                                    lo = ku; have_lo = true;
+                                } else if (pred == IC_SGT || pred == IC_UGT) {
+                                    if (have_lo) { rok = false; break; }
+                                    int64_t smax = (int64_t)(bits_mask >> 1);
+                                    if (sgn && sx64(ku, xty.bits) >= smax) { rok = false; break; }
+                                    if (!sgn && ku >= bits_mask) { rok = false; break; }
+                                    lo = (ku + 1) & bits_mask; have_lo = true;
+                                } else if (pred == IC_SLE || pred == IC_ULE) {
+                                    if (have_hi) { rok = false; break; }
+                                    hi = ku; have_hi = true;
+                                } else {
+                                    if (have_hi) { rok = false; break; }
+                                    int64_t smin = -(int64_t)(bits_mask >> 1) - 1;
+                                    if (sgn && sx64(ku, xty.bits) <= smin) { rok = false; break; }
+                                    if (!sgn && ku == 0) { rok = false; break; }
+                                    hi = (ku - 1) & bits_mask; have_hi = true;
+                                }
+                                /* signedness of the pair must agree */
+                                if (q == 0) {
+                                    cs[0] = (Instr *)(uintptr_t)sgn;
+                                } else if ((bool)(uintptr_t)cs[0] != sgn) rok = false;
+                            }
+                            if (rok && have_lo && have_hi) {
+                                bool sgn = (bool)(uintptr_t)cs[0];
+                                bool in_order = sgn ? (sx64(lo, xty.bits) <= sx64(hi, xty.bits))
+                                                    : (lo <= hi);
+                                if (in_order) {
+                                    uint64_t span = (hi - lo) & msk64(xty.bits);
+                                    int sub_v = opt_new_value(o, xty);
+                                    Instr subi = ins_bin(OP_SUB, xty, xval, block_iconst(o, &nb, &kc, xty, (int64_t)lo));
+                                    subi.result = sub_v; iv_push(&nb, subi);
+                                    int cmp_v = opt_new_value(o, ty_int(1));
+                                    Instr cmpi = ins_bin(OP_ICMP, ty_int(1), sub_v, block_iconst(o, &nb, &kc, xty, (int64_t)span));
+                                    cmpi.pred = IC_ULE; cmpi.result = cmp_v; iv_push(&nb, cmpi);
+                                    o->usecount[xval]++;
+                                    o->usecount[w.a]--; o->usecount[w.b]--;
+                                    w = ins_make(OP_ZEXT, t); w.a = cmp_v; w.result = b->ins[ii].result;
+                                    o->st->rewritten++;
+                                }
+                            }
+                        }
+                    }
+                }
                 if (hb) {
                     uint64_t C = (uint64_t)kb & msk64(t.bits);
                     int64_t sC = sx64(C, t.bits);
@@ -1054,7 +1137,85 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
             }
         }
 
+        bool is_map = false;
+        int map_src_arg_idx = -1;
+        int map_k_arg_idx = -1;
+        int64_t map_k_cval = 0;
+        bool map_k_is_const = false;
+
         if (!is_histo && !is_fnv) {
+            Instr *m_geps[2] = { NULL, NULL };
+            Instr *m_lds[2] = { NULL, NULL };
+            int m_ngep = 0;
+            Instr *m_mul = NULL, *m_add = NULL, *m_st = NULL;
+            bool m_bad = false;
+            for (int i = 0; i < B->nins - 1 && !m_bad; i++) {
+                Instr *in = &B->ins[i];
+                if (in == iv_add) continue;
+                if (in->op == OP_ICONST) continue;
+                if (in->op == OP_GEP && in->b == b_iv_val) {
+                    if (m_ngep >= 2) { m_bad = true; break; }
+                    m_geps[m_ngep++] = in;
+                } else if (in->op == OP_LOAD) {
+                    int g = (m_geps[0] && in->a == m_geps[0]->result) ? 0 :
+                            (m_geps[1] && in->a == m_geps[1]->result) ? 1 : -1;
+                    if (g < 0 || m_lds[g]) { m_bad = true; break; }
+                    m_lds[g] = in;
+                } else if (in->op == OP_MUL) {
+                    if (m_mul) { m_bad = true; break; }
+                    m_mul = in;
+                } else if (in->op == OP_ADD) {
+                    if (m_add) { m_bad = true; break; }
+                    m_add = in;
+                } else if (in->op == OP_STORE) {
+                    if (m_st) { m_bad = true; break; }
+                    m_st = in;
+                } else {
+                    m_bad = true; break;
+                }
+            }
+            if (!m_bad && m_ngep == 2 && m_lds[0] && m_lds[1] && m_mul && m_add && m_st) {
+                int xi = (m_mul->a == m_lds[0]->result || m_mul->b == m_lds[0]->result) ? 0 :
+                         (m_mul->a == m_lds[1]->result || m_mul->b == m_lds[1]->result) ? 1 : -1;
+                if (xi >= 0) {
+                    int yi = 1 - xi;
+                    int kval = (m_mul->a == m_lds[xi]->result) ? m_mul->b : m_mul->a;
+                    bool add_ok = (m_add->a == m_mul->result && m_add->b == m_lds[yi]->result) ||
+                                  (m_add->b == m_mul->result && m_add->a == m_lds[yi]->result);
+                    if (add_ok && m_st->a == m_geps[yi]->result && m_st->b == m_add->result &&
+                        m_geps[0]->ety.kind == TY_INT && m_geps[1]->ety.kind == TY_INT &&
+                        m_geps[0]->ety.bits == m_geps[1]->ety.bits) {
+                        int k_arg = -1;
+                        int64_t k_cv = 0;
+                        bool k_const = false;
+                        for (int a = 0; a < B->nargs; a++) {
+                            if (a == iv_arg_idx) continue;
+                            if (B->arg_vals[a] == kval && bterm->args[a] == B->arg_vals[a] &&
+                                h_to_b_args[a] == H->arg_vals[a]) { k_arg = a; break; }
+                        }
+                        if (k_arg < 0 && opt_find_iconst(f, kval, &k_cv)) k_const = true;
+                        if (k_arg >= 0 || k_const) {
+                            int src_arg = -1, dst_arg = -1;
+                            for (int a = 0; a < B->nargs; a++) {
+                                if (B->arg_vals[a] == m_geps[xi]->a && h_to_b_args[a] == H->arg_vals[a]) src_arg = a;
+                                if (B->arg_vals[a] == m_geps[yi]->a && h_to_b_args[a] == H->arg_vals[a]) dst_arg = a;
+                            }
+                            if (src_arg >= 0 && dst_arg >= 0) {
+                                is_map = true;
+                                map_src_arg_idx = src_arg;
+                                base_arg_idx = dst_arg;
+                                gep_in = m_geps[yi];
+                                map_k_arg_idx = k_arg;
+                                map_k_cval = k_cv;
+                                map_k_is_const = k_const;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!is_histo && !is_fnv && !is_map) {
             for (int i = 0; i < B->nins - 1; i++) {
                 Instr *in = &B->ins[i];
                 if (in == iv_add) continue;
@@ -1107,7 +1268,7 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
             }
         }
 
-        if (!is_fill && !is_reduce && !is_histo && !is_fnv) continue;
+        if (!is_fill && !is_reduce && !is_histo && !is_fnv && !is_map) continue;
 
         Type elem_ty = gep_in->ety;
         bool use_scalar_unroll = (is_reduce && elem_ty.kind == TY_INT && elem_ty.bits == 64) || is_histo || is_fnv;
@@ -1129,6 +1290,12 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
                 if (cost_cliff(cost, OP_VADD, vec_ty)) continue;
                 if (cost_cliff(cost, OP_VEXTRACT, vec_ty)) continue;
             }
+            if (is_map) {
+                if (cost_cliff(cost, OP_VLOAD, vec_ty)) continue;
+                if (cost_cliff(cost, OP_VMUL, vec_ty)) continue;
+                if (cost_lat(cost, OP_VMUL, vec_ty) < 0) continue;
+                if (cost_cliff(cost, OP_VADD, vec_ty)) continue;
+            }
         }
 
         int U = use_scalar_unroll ? 4 : (128 / (lanes * ty_bytes(elem_ty)));
@@ -1145,19 +1312,21 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
 
         int total_step = lanes * U;
 
-        int num_vec_args = is_reduce ? num_acc : (is_fill ? 1 : 0);
-        int vhead_nargs = 4 + num_vec_args + H->nargs;
-        int vec_start = 4;
-        int invar_start = 4 + num_vec_args;
+        int step_idx = is_map ? 4 : 3;
+        int num_vec_args = is_reduce ? num_acc : ((is_fill || is_map) ? 1 : 0);
+        int vec_start = step_idx + 1;
+        int vhead_nargs = vec_start + num_vec_args + H->nargs;
+        int invar_start = vec_start + num_vec_args;
 
         Type *vhead_types = malloc(sizeof(Type) * (size_t)vhead_nargs);
         vhead_types[0] = iv_ty;
         vhead_types[1] = iv_ty; /* vec_limit */
         vhead_types[2] = H->arg_types[base_arg_idx]; /* cur_ptr */
-        vhead_types[3] = iv_ty; /* step */
+        if (is_map) vhead_types[3] = H->arg_types[map_src_arg_idx]; /* cur_src_ptr */
+        vhead_types[step_idx] = iv_ty; /* step */
         if (is_reduce) {
             for (int u = 0; u < num_acc; u++) vhead_types[vec_start + u] = acc_ty;
-        } else if (is_fill) {
+        } else if (is_fill || is_map) {
             vhead_types[vec_start] = vec_ty;
         }
         for (int a = 0; a < H->nargs; a++) vhead_types[invar_start + a] = H->arg_types[a];
@@ -1201,7 +1370,34 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         p_term = &P->ins[P->nins - 1];
         p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
 
+        int init_p_src = -1;
+        if (is_map) {
+            Instr gep_src = ins_bin(OP_GEP, H->arg_types[map_src_arg_idx], p_args[map_src_arg_idx], init_iv);
+            gep_src.ety = elem_ty;
+            init_p_src = opt_emit_before_term(f, pre_idx, gep_src);
+            P = &f->blocks[pre_idx];
+            p_term = &P->ins[P->nins - 1];
+            p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
+        }
+
         int vzval = -1;
+        if (is_map) {
+            int k_init;
+            if (map_k_is_const) {
+                Instr kc = ins_iconst(elem_ty, (uint64_t)map_k_cval);
+                k_init = opt_emit_before_term(f, pre_idx, kc);
+                P = &f->blocks[pre_idx];
+                p_term = &P->ins[P->nins - 1];
+                p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
+            } else {
+                k_init = p_args[map_k_arg_idx];
+            }
+            Instr spl = ins_un(OP_VSPLAT, vec_ty, k_init);
+            vzval = opt_emit_before_term(f, pre_idx, spl);
+            P = &f->blocks[pre_idx];
+            p_term = &P->ins[P->nins - 1];
+            p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
+        }
         if (is_reduce) {
             Instr zc = ins_iconst(elem_ty, 0);
             int zval = opt_emit_before_term(f, pre_idx, zc);
@@ -1236,10 +1432,11 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         to_vhead[0] = init_iv;
         to_vhead[1] = vec_limit;
         to_vhead[2] = init_p;
-        to_vhead[3] = c_tot_pre_v;
+        if (is_map) to_vhead[3] = init_p_src;
+        to_vhead[step_idx] = c_tot_pre_v;
         if (is_reduce) {
             for (int u = 0; u < num_acc; u++) to_vhead[vec_start + u] = vzval;
-        } else if (is_fill) {
+        } else if (is_fill || is_map) {
             to_vhead[vec_start] = vzval;
         }
         for (int a = 0; a < f->blocks[h_idx].nargs; a++) to_vhead[invar_start + a] = p_args[a];
@@ -1271,7 +1468,7 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         int vb_iv = VB->arg_vals[0];
         int vb_vec_limit = VB->arg_vals[1];
         int cur_p = VB->arg_vals[2];
-        int vb_step = VB->arg_vals[3];
+        int vb_step = VB->arg_vals[step_idx];
 
         int cur_acc[8];
         int final_fnv_h = -1;
@@ -1371,9 +1568,43 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
                 cur_h = emit(f, b_vbody, ml);
             }
             final_fnv_h = cur_h;
+        } else if (is_map) {
+            int vval = VB->arg_vals[vec_start];
+            int cur_s = VB->arg_vals[3];
+            for (int u = 0; u < U; u++) {
+                int dst_ptr = cur_p;
+                int src_ptr = cur_s;
+                if (u > 0) {
+                    Instr gep_d = ins_bin(OP_GEP, H->arg_types[base_arg_idx], cur_p, c_u_v[u]);
+                    gep_d.ety = elem_ty;
+                    dst_ptr = emit(f, b_vbody, gep_d);
+                    Instr gep_s = ins_bin(OP_GEP, H->arg_types[map_src_arg_idx], cur_s, c_u_v[u]);
+                    gep_s.ety = elem_ty;
+                    src_ptr = emit(f, b_vbody, gep_s);
+                }
+                Instr vld_s = ins_un(OP_VLOAD, vec_ty, src_ptr);
+                vld_s.ety = elem_ty;
+                int vx = emit(f, b_vbody, vld_s);
+                Instr vld_d = ins_un(OP_VLOAD, vec_ty, dst_ptr);
+                vld_d.ety = elem_ty;
+                int vy = emit(f, b_vbody, vld_d);
+                Instr vm = ins_bin(OP_VMUL, vec_ty, vx, vval);
+                int prod = emit(f, b_vbody, vm);
+                Instr va = ins_bin(OP_VADD, vec_ty, prod, vy);
+                int sum = emit(f, b_vbody, va);
+                Instr vst = ins_bin(OP_VSTORE, ty_void(), dst_ptr, sum);
+                vst.ety = elem_ty;
+                emit(f, b_vbody, vst);
+            }
         }
 
         /* Pointer bump and IV step */
+        int next_s_v = -1;
+        if (is_map) {
+            Instr next_s_in = ins_bin(OP_GEP, H->arg_types[map_src_arg_idx], VB->arg_vals[3], vb_step);
+            next_s_in.ety = elem_ty;
+            next_s_v = emit(f, b_vbody, next_s_in);
+        }
         Instr next_p_in = ins_bin(OP_GEP, H->arg_types[base_arg_idx], cur_p, vb_step);
         next_p_in.ety = elem_ty;
         int next_p_v = emit(f, b_vbody, next_p_in);
@@ -1389,7 +1620,8 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         to_loop[0] = next_iv_v;
         to_loop[1] = vb_vec_limit;
         to_loop[2] = next_p_v;
-        to_loop[3] = vb_step;
+        if (is_map) to_loop[3] = next_s_v;
+        to_loop[step_idx] = vb_step;
         if (is_reduce) {
             for (int u = 0; u < num_acc; u++) to_loop[vec_start + u] = cur_acc[u];
         } else if (is_fnv) {
@@ -1400,7 +1632,8 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         to_exit[0] = next_iv_v;
         to_exit[1] = vb_vec_limit;
         to_exit[2] = next_p_v;
-        to_exit[3] = vb_step;
+        if (is_map) to_exit[3] = next_s_v;
+        to_exit[step_idx] = vb_step;
         if (is_reduce) {
             for (int u = 0; u < num_acc; u++) to_exit[vec_start + u] = cur_acc[u];
         } else if (is_fnv) {
@@ -1411,7 +1644,7 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         emit(f, b_vbody, cbr_b);
 
         int ve_iv = f->blocks[b_vexit].arg_vals[0];
-        if (is_fill || is_histo || is_fnv) {
+        if (is_fill || is_histo || is_fnv || is_map) {
             int32_t *to_h = malloc(sizeof(int32_t) * (size_t)f->blocks[h_idx].nargs);
             for (int a = 0; a < f->blocks[h_idx].nargs; a++) to_h[a] = f->blocks[b_vexit].arg_vals[invar_start + a];
             to_h[iv_arg_idx] = ve_iv;
