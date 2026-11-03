@@ -110,19 +110,26 @@ static int64_t f2i(double d, int bits, bool unsig) {
 }
 
 /* ---------- frame execution ---------- */
-typedef struct { uint64_t **lanes; int n; } Frame;
+typedef struct { uint64_t **lanes; uint64_t *arena; int n; } Frame;
 
+/* One zeroed arena per frame, values at fixed offsets: frame setup
+ * is two allocations regardless of value count, and operand lanes
+ * sit in one cache-friendly block instead of one calloc per value. */
 static void frame_alloc(Interp *it, Func *f, Frame *fr) {
     (void)it;
     fr->n = f->nvalues;
     fr->lanes = malloc(sizeof(uint64_t *) * (size_t)(fr->n ? fr->n : 1));
+    size_t total = 0;
+    for (int i = 0; i < fr->n; i++) total += (size_t)ty_lanes(f->vtypes[i], 4);
+    fr->arena = calloc(total ? total : 1, sizeof(uint64_t));
+    size_t off = 0;
     for (int i = 0; i < fr->n; i++) {
-        int ln = ty_lanes(f->vtypes[i], 4);
-        fr->lanes[i] = calloc((size_t)ln, sizeof(uint64_t));
+        fr->lanes[i] = fr->arena + off;
+        off += (size_t)ty_lanes(f->vtypes[i], 4);
     }
 }
 static void frame_free(Frame *fr) {
-    for (int i = 0; i < fr->n; i++) free(fr->lanes[i]);
+    free(fr->arena);
     free(fr->lanes);
 }
 static void val_copy(Func *f, Frame *fr, int dst, int src) {
