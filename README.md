@@ -123,6 +123,8 @@ the optimizer lowers its two-term recurrence to an O(n) loop —
 25.3 ns native and 10.0 ns through the LLVM lane, against
 4,901,152 ns for C -O2.
 
+![Krell v2.1 speed compared with other fast languages](brand/krell-v21-speed-vs-fast-languages.png)
+
 Per-kernel speedups (native / LLVM): fill32 3.20× / 3.11×,
 copy 3.03× / 3.08×, saxpy 2.71× / 2.50×, bytesum 2.64× / 3.73×,
 sumsq 1.55× / 1.36×, span 1.38× / 1.30×, dot 1.05× / 1.09×,
