@@ -195,11 +195,39 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
 
     /* ---------- linear scan per class ---------- */
     Instr **defins = calloc((size_t)nv, sizeof(Instr *));
+    int *defblk = calloc((size_t)nv, sizeof(int));
+    int *defidx = calloc((size_t)nv, sizeof(int));
+    int *usecnt = calloc((size_t)nv, sizeof(int));
+    int *use_tgt = malloc(sizeof(int) * (size_t)nv);
+    int *use_slot = calloc((size_t)nv, sizeof(int));
+    int *use_list = calloc((size_t)nv, sizeof(int));
+    int *use_srcblk = calloc((size_t)nv, sizeof(int));
+    for (int v = 0; v < nv; v++) { defblk[v] = -1; defidx[v] = -1; use_tgt[v] = -1; use_srcblk[v] = -1; }
     for (int b = 0; b < f->nblocks; b++) {
         Block *bl = &f->blocks[b];
         for (int i = 0; i < bl->nins; i++) {
             Instr *in = &bl->ins[i];
-            if (in->result >= 0) defins[in->result] = in;
+            if (in->result >= 0) { defins[in->result] = in; defblk[in->result] = b; defidx[in->result] = i; }
+        }
+    }
+    /* use census: counts every operand use; a use as a branch argument
+     * also records (source block, target block, slot, list) so the
+     * allocator can recognize sole-use edge values */
+    for (int b = 0; b < f->nblocks; b++) {
+        Block *bl = &f->blocks[b];
+        for (int i = 0; i < bl->nins; i++) {
+            Instr *in = &bl->ins[i];
+            if (in->a >= 0) usecnt[in->a]++;
+            if (in->b >= 0) usecnt[in->b]++;
+            if (in->op != OP_ALLOCA && in->c >= 0) usecnt[in->c]++;
+            for (int k = 0; k < in->nargs; k++) {
+                int v = in->args[k]; if (v < 0) continue; usecnt[v]++;
+                if (in->op == OP_BR || in->op == OP_CONDBR) { use_tgt[v] = in->blk; use_slot[v] = k; use_list[v] = 0; use_srcblk[v] = b; }
+            }
+            for (int k = 0; k < in->nargs2; k++) {
+                int v = in->args2[k]; if (v < 0) continue; usecnt[v]++;
+                if (in->op == OP_CONDBR) { use_tgt[v] = in->blk2; use_slot[v] = k; use_list[v] = 1; use_srcblk[v] = b; }
+            }
         }
     }
 
@@ -218,8 +246,13 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
             }
         qsort(ivs, (size_t)ni, sizeof(Iv), cmp_iv);
         /* active list: (start, end, reg, v, callee) */
-        typedef struct { int start, end, reg, v; bool callee; } Act;
+        typedef struct { int start, end, reg, v; bool callee; bool prot; } Act;
         Act *act = malloc(sizeof(Act) * (size_t)(ni > 0 ? ni : 1));
+        /* (block, pool register) pairs already claimed by a coalesced
+         * edge value in this class pass */
+        typedef struct { int blk, reg; } Coal;
+        Coal *coal = malloc(sizeof(Coal) * (size_t)(ni > 0 ? ni : 1));
+        int ncoal = 0;
         int na = 0;
         bool *regused = calloc((size_t)npool, 1);
         int *regowner_end = calloc((size_t)npool, sizeof(int));
@@ -234,6 +267,68 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
                 else act[wn++] = act[j];
             }
             na = wn;
+            /* Back-edge coalescing: a value whose only use is as the
+             * branch argument for parameter pv of the target block can
+             * be computed directly into pv's register when pv is
+             * already allocated there, pv has no use after the
+             * definition inside the source block (the terminator's own
+             * argument lists and condition included), and pv's active
+             * entry still guards the register. The successor value
+             * then lands in the parameter's register with no edge
+             * move -- the loop-carried update shape (accumulators,
+             * indices). pv's entry is marked protected so a later
+             * spill decision cannot hand the register away under the
+             * coalesced value, and at most one value per
+             * (block, register) coalesces, so two edge values never
+             * share a register in one block. */
+            bool coalesced = false;
+            if (usecnt[iv->v] == 1 && use_tgt[iv->v] >= 0 && defins[iv->v]) {
+                int tb = use_tgt[iv->v], slot = use_slot[iv->v], lst = use_list[iv->v];
+                Block *tblk = &f->blocks[tb];
+                int pv = slot < tblk->nargs ? tblk->arg_vals[slot] : -1;
+                Instr *dd = defins[iv->v];
+                if (pv >= 0 && pv != iv->v && defblk[iv->v] == use_srcblk[iv->v] &&
+                    bf->vclass[pv] == cls && bf->loc[pv].is_reg && bf->loc[pv].cls == cls &&
+                    dd->op != OP_CALL && dd->op != OP_TAILCALL && dd->op != OP_FMA &&
+                    dd->op != OP_MEMCPY && dd->op != OP_MEMSET && dd->op != OP_ALLOCA) {
+                    Block *sb = &f->blocks[defblk[iv->v]];
+                    Instr *term = &sb->ins[sb->nins - 1];
+                    bool ok = term->op == OP_BR || term->op == OP_CONDBR;
+                    if (ok && lst == 0 && term->blk != tb) ok = false;
+                    if (ok && lst == 1 && term->blk2 != tb) ok = false;
+                    if (ok) {
+                        const int *lp = lst == 0 ? term->args : term->args2;
+                        int nl = lst == 0 ? term->nargs : term->nargs2;
+                        if (slot >= nl || lp[slot] != iv->v) ok = false;
+                        if (term->a == pv) ok = false;
+                        for (int k = 0; k < term->nargs && ok; k++) if (term->args[k] == pv) ok = false;
+                        for (int k = 0; k < term->nargs2 && ok; k++) if (term->args2[k] == pv) ok = false;
+                    }
+                    for (int i = defidx[iv->v] + 1; ok && i < sb->nins - 1; i++) {
+                        Instr *u = &sb->ins[i];
+                        if (u->a == pv || u->b == pv || (u->op != OP_ALLOCA && u->c == pv)) ok = false;
+                        for (int k = 0; k < u->nargs && ok; k++) if (u->args[k] == pv) ok = false;
+                        for (int k = 0; k < u->nargs2 && ok; k++) if (u->args2[k] == pv) ok = false;
+                    }
+                    if (ok) {
+                        int pr = -1;
+                        for (int r = 0; r < npool; r++) if (pool[r].reg == bf->loc[pv].idx) { pr = r; break; }
+                        if (pr < 0) ok = false;
+                        if (ok && iv->cross && !pool[pr].callee_saved) ok = false;
+                        int aj = -1;
+                        for (int j = 0; ok && j < na; j++) if (act[j].v == pv && act[j].reg == pr) { aj = j; break; }
+                        if (aj < 0) ok = false;
+                        for (int j = 0; ok && j < ncoal; j++) if (coal[j].blk == defblk[iv->v] && coal[j].reg == pr) ok = false;
+                        if (ok) {
+                            bf->loc[iv->v] = bf->loc[pv];
+                            act[aj].prot = true;
+                            coal[ncoal].blk = defblk[iv->v]; coal[ncoal].reg = pr; ncoal++;
+                            coalesced = true;
+                        }
+                    }
+                }
+            }
+            if (!coalesced) {
             /* choose a register: if crossing, callee-saved only;
              * prefer caller-saved for non-crossing (preserve callee regs) */
             int pick = -1;
@@ -281,7 +376,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
             }
             if (pick >= 0) {
                 regused[pick] = true;
-                act[na].start = iv->start; act[na].end = iv->end; act[na].reg = pick; act[na].v = iv->v; act[na].callee = pool[pick].callee_saved != 0; na++;
+                act[na].start = iv->start; act[na].end = iv->end; act[na].reg = pick; act[na].v = iv->v; act[na].callee = pool[pick].callee_saved != 0; act[na].prot = false; na++;
                 bf->loc[iv->v].is_reg = 1;
                 bf->loc[iv->v].cls = (int8_t)cls;
                 bf->loc[iv->v].idx = pool[pick].reg;
@@ -293,6 +388,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
                 for (int b = 1; b < f->nblocks; b++)
                     if (bf->blkstart[b] > iv->start && bf->blkstart[b] <= iv->end) { iv_cross = true; break; }
                 for (int j = 0; j < na; j++) {
+                    if (act[j].prot) continue;
                     if (iv->cross && !act[j].callee) continue;
                     if (act[j].end - act[j].start > 15 && (iv->end - iv->start) < 8) continue;
                     /* An interval that crosses a block boundary is
@@ -323,6 +419,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
                     act[furthest].end = iv->end;
                     act[furthest].v = iv->v;
                     act[furthest].callee = pool[r].callee_saved != 0;
+                    act[furthest].prot = false;
                     bf->loc[iv->v].is_reg = 1;
                     bf->loc[iv->v].cls = (int8_t)cls;
                     bf->loc[iv->v].idx = pool[r].reg;
@@ -332,11 +429,13 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
                     bf->loc[iv->v].idx = spill_counter++;
                 }
             }
+            } /* if (!coalesced) */
         }
         if (spill_counter > maxslots) maxslots = spill_counter;
-        free(ivs); free(act); free(regused); free(regowner_end);
+        free(ivs); free(act); free(coal); free(regused); free(regowner_end);
     }
-    free(defins);
+    free(defins); free(defblk); free(defidx); free(usecnt);
+    free(use_tgt); free(use_slot); free(use_list); free(use_srcblk);
     bf->nspill_gp = 0; bf->nspill_fp = 0;
     for (int v = 0; v < f->nvalues; v++)
         if (!bf->loc[v].is_reg && bf->vclass[v] == BCLS_GP) bf->nspill_gp++;
