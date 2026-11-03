@@ -1960,6 +1960,316 @@ static void opt_hoist_loop_consts(Func *f, OptStats *st) {
     free(hv.v);
 }
 
+/* ---- WP9: linear two-term recurrence lowering ----
+ * Recognizes a pure self-recursive function of the exact shape
+ *   entry(n): condbr (n < 2) -> base, rec        (or the n >= 2 form)
+ *   base:     ret n                  (seeds f(0)=0, f(1)=1)
+ *             ret <iconst c>         (seeds f(0)=f(1)=c)
+ *   rec:      ret f(n-1) <op> f(n-2)             <op> in { add, mul }
+ * and rewrites it as an iterative two-slot loop:
+ *   entry: condbr -> base, setup(n)
+ *   setup(nv): br loop(nv, 2, f(0), f(1))
+ *   loop(nv, i, a, b):
+ *     cur = a <op> b
+ *     condbr (i == nv) -> exit(cur), loop(nv, i+1, b, cur)
+ *   exit(r): ret r
+ * The seeds are materialized in the setup block, never passed as
+ * constants across the guard block's own edge: backends may shortcut
+ * a guard-shaped entry (test + early return before the prologue) and
+ * not emit that block's remaining instructions, so a constant defined
+ * there would reach its register unmaterialized.
+ * Integer add/mul wrap modulo 2^bits, where both are associative and
+ * commutative, so reassociating the recursion into iteration order is
+ * exact for every input, negative n included (the guard routes n < 2
+ * to the original base block, which is kept untouched). Matching is by
+ * block content, cross-checked against the guard predicate, so a
+ * mislabelled arm order rejects instead of miscompiling. The rec block
+ * is left in place, unreachable; later DCE removes it. */
+typedef struct {
+    Type    ty;
+    int     combine_op;
+    int     base_blk, rec_blk;
+    int     cond_v;          /* entry's icmp result */
+    int     two_v;           /* the guard's iconst-2 value (defined in entry) */
+    int64_t seed0, seed1;
+} LrShape;
+
+static int lr_new_value(Func *f, Type t) {
+    if (f->nvalues >= f->vcap) {
+        f->vcap = f->vcap ? f->vcap * 2 : 32;
+        f->vtypes  = realloc(f->vtypes,  (size_t)f->vcap * sizeof(Type));
+        f->cval    = realloc(f->cval,    (size_t)f->vcap * sizeof(uint64_t));
+        f->isconst = realloc(f->isconst, (size_t)f->vcap);
+    }
+    int v = f->nvalues++;
+    f->vtypes[v] = t;
+    f->cval[v] = 0;
+    f->isconst[v] = 0;
+    return v;
+}
+
+static void lr_push(Block *b, Instr in) {
+    if (b->nins == b->cap) {
+        b->cap = b->cap ? b->cap * 2 : 16;
+        b->ins = realloc(b->ins, (size_t)b->cap * sizeof(Instr));
+    }
+    b->ins[b->nins++] = in;
+}
+
+/* block index of the OP_ICONST defining v, or -1 (with *out = its imm) */
+static int lr_iconst_def(Func *f, int v, int64_t *out) {
+    for (int b = 0; b < f->nblocks; b++) {
+        Block *bl = &f->blocks[b];
+        for (int i = 0; i < bl->nins; i++)
+            if (bl->ins[i].result == v && bl->ins[i].op == OP_ICONST) {
+                *out = bl->ins[i].imm;
+                return b;
+            }
+    }
+    return -1;
+}
+
+static int lr_cur_n(Block *b, const int32_t *passed, int npassed, int nv) {
+    if (b->nargs == 1 && npassed == 1 && passed[0] == nv) return b->arg_vals[0];
+    if (b->nargs == 0 && npassed == 0) return nv;
+    return -1;
+}
+
+static bool lr_base_shape(Func *f, int bidx, int curn, int64_t *s0, int64_t *s1) {
+    Block *b = &f->blocks[bidx];
+    Instr *ret = NULL;
+    for (int i = 0; i < b->nins; i++) {
+        Instr *in = &b->ins[i];
+        if (in->op == OP_ICONST) continue;
+        if (in->op != OP_RET || ret) return false;
+        ret = in;
+    }
+    if (!ret || b->nins == 0 || &b->ins[b->nins - 1] != ret) return false;
+    if (ret->a == curn) { *s0 = 0; *s1 = 1; return true; }
+    int64_t c;
+    int db = lr_iconst_def(f, ret->a, &c);
+    if (db == 0 || db == bidx) { *s0 = c; *s1 = c; return true; }
+    return false;
+}
+
+static bool lr_rec_shape(Func *f, int fi, int bidx, int curn, Instr **def, int *combine_op) {
+    Block *b = &f->blocks[bidx];
+    Instr *subs[2] = { NULL, NULL }, *calls[2] = { NULL, NULL }, *comb = NULL, *ret = NULL;
+    int nsub = 0, ncall = 0, nother = 0;
+    for (int i = 0; i < b->nins; i++) {
+        Instr *in = &b->ins[i];
+        switch (in->op) {
+        case OP_ICONST: break;
+        case OP_SUB:  if (nsub < 2) subs[nsub] = in;  nsub++;  break;
+        case OP_CALL: if (ncall < 2) calls[ncall] = in; ncall++; break;
+        case OP_ADD: case OP_MUL:
+            if (comb) nother++; else comb = in; break;
+        case OP_RET:  if (ret) nother++; else ret = in; break;
+        default: nother++; break;
+        }
+    }
+    if (nsub != 2 || ncall != 2 || !comb || !ret || nother != 0) return false;
+    if (b->nins == 0 || &b->ins[b->nins - 1] != ret) return false;
+    if (!ty_eq(comb->ty, f->ret)) return false;
+    if (ret->a < 0 || def[ret->a] != comb) return false;
+    /* combine's operands are exactly the two calls */
+    Instr *ca = (comb->a >= 0) ? def[comb->a] : NULL;
+    Instr *cb = (comb->b >= 0) ? def[comb->b] : NULL;
+    if (!ca || !cb || ca == cb) return false;
+    if (!((ca == calls[0] && cb == calls[1]) || (ca == calls[1] && cb == calls[0])))
+        return false;
+    int64_t ks[2] = { 0, 0 };
+    for (int i = 0; i < 2; i++) {
+        Instr *call = calls[i];
+        if (call->callee_extern || call->callee != fi || call->nargs != 1) return false;
+        if (!ty_eq(call->ty, f->ret)) return false;
+        Instr *sub = (call->args[0] >= 0) ? def[call->args[0]] : NULL;
+        if (!sub || sub->op != OP_SUB) return false;
+        if (sub != subs[0] && sub != subs[1]) return false;
+        if (!ty_eq(sub->ty, f->ret) || sub->a != curn) return false;
+        int64_t k;
+        int db = lr_iconst_def(f, sub->b, &k);
+        if (db != 0 && db != bidx) return false;
+        if (k != 1 && k != 2) return false;
+        ks[i] = k;
+    }
+    if (ks[0] == ks[1]) return false;
+    /* the two calls must consume the two distinct subs */
+    if (def[calls[0]->args[0]] == def[calls[1]->args[0]]) return false;
+    *combine_op = comb->op;
+    return true;
+}
+
+static bool lr_match(Func *f, int fi, LrShape *sh) {
+    if (f->nblocks != 3) return false;
+    if (f->ret.kind != TY_INT) return false;
+    Block *entry = &f->blocks[0];
+    if (entry->nargs != 1 || !ty_eq(entry->arg_types[0], f->ret)) return false;
+    if (entry->nins < 1) return false;
+    int nv = entry->arg_vals[0];
+    Instr *term = &entry->ins[entry->nins - 1];
+    if (term->op != OP_CONDBR) return false;
+
+    int nvv = f->nvalues;
+    Instr **def = calloc((size_t)(nvv ? nvv : 1), sizeof(Instr *));
+    for (int b = 0; b < f->nblocks; b++) {
+        Block *bl = &f->blocks[b];
+        for (int i = 0; i < bl->nins; i++)
+            if (bl->ins[i].result >= 0) def[bl->ins[i].result] = &bl->ins[i];
+    }
+    bool ok = false;
+    Instr *cmp = (term->a >= 0 && term->a < nvv) ? def[term->a] : NULL;
+    if (!cmp || cmp->op != OP_ICMP || cmp->a != nv) goto done;
+    if (cmp->pred != IC_SLT && cmp->pred != IC_SGE) goto done;
+    {
+        int64_t lim;
+        if (lr_iconst_def(f, cmp->b, &lim) != 0 || lim != 2) goto done;
+    }
+    /* entry may otherwise hold only iconsts and the guard icmp itself */
+    for (int i = 0; i + 1 < entry->nins; i++) {
+        Instr *in = &entry->ins[i];
+        if (in->op != OP_ICONST && in != cmp) goto done;
+    }
+    if (term->blk == term->blk2) goto done;
+    for (int arm = 0; arm < 2 && !ok; arm++) {
+        int bb = arm ? term->blk2 : term->blk;
+        int rb = arm ? term->blk : term->blk2;
+        const int32_t *ba = arm ? term->args2 : term->args;
+        int bn = arm ? term->nargs2 : term->nargs;
+        const int32_t *ra = arm ? term->args : term->args2;
+        int rn = arm ? term->nargs : term->nargs2;
+        if (bb <= 0 || bb >= 3 || rb <= 0 || rb >= 3) continue;
+        /* predicate cross-check: SLT's true arm is base, SGE's is rec */
+        if (cmp->pred == IC_SLT && term->blk != bb) continue;
+        if (cmp->pred == IC_SGE && term->blk != rb) continue;
+        int bc = lr_cur_n(&f->blocks[bb], ba, bn, nv);
+        int rc = lr_cur_n(&f->blocks[rb], ra, rn, nv);
+        if (bc < 0 || rc < 0) continue;
+        int64_t s0, s1;
+        int cop;
+        if (!lr_base_shape(f, bb, bc, &s0, &s1)) continue;
+        if (!lr_rec_shape(f, fi, rb, rc, def, &cop)) continue;
+        sh->ty = f->ret;
+        sh->combine_op = cop;
+        sh->base_blk = bb;
+        sh->rec_blk = rb;
+        sh->cond_v = term->a;
+        sh->two_v = cmp->b;
+        sh->seed0 = s0;
+        sh->seed1 = s1;
+        ok = true;
+    }
+done:
+    free(def);
+    return ok;
+}
+
+static void lr_rewrite(Func *f, const LrShape *sh, OptStats *st) {
+    Type T = sh->ty;
+    Block *entry = &f->blocks[0];
+    Instr *term = &entry->ins[entry->nins - 1];
+    /* copy the base arm's args before entry's list is replaced */
+    int32_t *base_args;
+    int base_nargs;
+    if (term->blk == sh->base_blk) {
+        base_args = ids_dup(term->args, term->nargs);
+        base_nargs = term->nargs;
+    } else {
+        base_args = ids_dup(term->args2, term->nargs2);
+        base_nargs = term->nargs2;
+    }
+    int nv = entry->arg_vals[0];
+
+    Type lat[4] = { T, T, T, T };
+    int setup_blk = func_add_block(f, &T, 1);
+    int loop_blk = func_add_block(f, lat, 4);
+    int exit_blk = func_add_block(f, &T, 1);
+    /* f->blocks may have moved; re-fetch */
+    entry = &f->blocks[0];
+    Block *setup = &f->blocks[setup_blk];
+    Block *loop = &f->blocks[loop_blk];
+    Block *exitb = &f->blocks[exit_blk];
+    int lnv = loop->arg_vals[0], li = loop->arg_vals[1];
+    int la = loop->arg_vals[2], lb = loop->arg_vals[3];
+
+    /* setup: materialize the loop's initial state, then enter it */
+    {
+        int snv = setup->arg_vals[0];
+        int two = lr_new_value(f, T);
+        Instr ti = ins_iconst(T, 2);
+        ti.result = two;
+        lr_push(setup, ti);
+        int s0 = lr_new_value(f, T);
+        Instr i0 = ins_iconst(T, sh->seed0);
+        i0.result = s0;
+        lr_push(setup, i0);
+        int s1 = lr_new_value(f, T);
+        Instr i1 = ins_iconst(T, sh->seed1);
+        i1.result = s1;
+        lr_push(setup, i1);
+        int32_t sa[4] = { snv, two, s0, s1 };
+        Instr br = ins_br(loop_blk, ids_dup(sa, 4), 4);
+        br.result = -1;
+        lr_push(setup, br);
+    }
+
+    Instr rt = ins_ret(exitb->arg_vals[0]);
+    rt.result = -1;
+    lr_push(exitb, rt);
+
+    int cur = lr_new_value(f, T);
+    Instr ci = ins_bin((uint8_t)sh->combine_op, T, la, lb);
+    ci.result = cur;
+    lr_push(loop, ci);
+    int one = lr_new_value(f, T);
+    Instr oi = ins_iconst(T, 1);
+    oi.result = one;
+    lr_push(loop, oi);
+    int inext = lr_new_value(f, T);
+    Instr ai = ins_bin(OP_ADD, T, li, one);
+    ai.result = inext;
+    lr_push(loop, ai);
+    int islast = lr_new_value(f, ty_i1());
+    Instr ei = ins_bin(OP_ICMP, ty_i1(), li, lnv);
+    ei.pred = IC_EQ;
+    ei.result = islast;
+    lr_push(loop, ei);
+    int32_t ea[1] = { cur };
+    int32_t la4[4] = { lnv, inext, lb, cur };
+    Instr cb = ins_condbr(islast, exit_blk, ids_dup(ea, 1), 1,
+                          loop_blk, ids_dup(la4, 4), 4);
+    cb.result = -1;
+    lr_push(loop, cb);
+
+    /* entry: keep everything but the old condbr; branch base | setup(n) */
+    InsVec nb = { 0 };
+    for (int i = 0; i + 1 < entry->nins; i++) iv_push(&nb, entry->ins[i]);
+    int32_t sa1[1] = { nv };
+    Instr ncb;
+    if (term->blk == sh->base_blk)
+        ncb = ins_condbr(sh->cond_v, sh->base_blk, base_args, base_nargs,
+                         setup_blk, ids_dup(sa1, 1), 1);
+    else
+        ncb = ins_condbr(sh->cond_v, setup_blk, ids_dup(sa1, 1), 1,
+                         sh->base_blk, base_args, base_nargs);
+    ncb.result = -1;
+    iv_push(&nb, ncb);
+    /* drop the old terminator's arg arrays, then install */
+    free(term->args);
+    free(term->args2);
+    free(entry->ins);
+    entry->ins = nb.v;
+    entry->nins = nb.n;
+    entry->cap = nb.cap;
+    st->rewritten++;
+}
+
+static void opt_lower_recurrences(Module *m, Func *f, int fi, OptStats *st) {
+    (void)m;
+    LrShape sh;
+    if (lr_match(f, fi, &sh)) lr_rewrite(f, &sh, st);
+}
+
 void opt_optimize(Module *m, const Cost *cost, OptStats *st) {
     OptStats local = { 0, 0, 0, 0 };
     if (!st) st = &local;
@@ -1968,6 +2278,7 @@ void opt_optimize(Module *m, const Cost *cost, OptStats *st) {
     uint8_t *snap = mod_encode(m, &slen);
     for (int fi = 0; fi < m->nfuncs; fi++) {
         Func *f = &m->funcs[fi];
+        opt_lower_recurrences(m, f, fi, st);
         opt_vectorize_loops(m, f, cost, st);
         opt_hoist_loop_consts(f, st);
         Opt o = { 0 };
