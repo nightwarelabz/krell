@@ -1163,6 +1163,8 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         }
 
         bool is_map = false;
+        bool is_copy = false;
+        bool is_dot = false;
         int map_src_arg_idx = -1;
         int map_k_arg_idx = -1;
         int64_t map_k_cval = 0;
@@ -1241,6 +1243,108 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         }
 
         if (!is_histo && !is_fnv && !is_map) {
+            /* two-stream census shared by the copy and dot classes:
+             * exactly two geps on the induction value, up to two
+             * loads, and at most one store / mul / add */
+            Instr *c_geps[2] = { NULL, NULL };
+            Instr *c_ld = NULL, *c_st = NULL;
+            Instr *c_ld2 = NULL, *c_mul = NULL, *c_add = NULL;
+            int c_ngep = 0;
+            bool c_bad = false;
+            for (int i = 0; i < B->nins - 1 && !c_bad; i++) {
+                Instr *in = &B->ins[i];
+                if (in == iv_add) continue;
+                if (in->op == OP_ICONST) continue;
+                if (in->op == OP_GEP && in->b == b_iv_val) {
+                    if (c_ngep >= 2) { c_bad = true; break; }
+                    c_geps[c_ngep++] = in;
+                } else if (in->op == OP_LOAD) {
+                    if (!c_ld) c_ld = in;
+                    else if (!c_ld2) c_ld2 = in;
+                    else { c_bad = true; break; }
+                } else if (in->op == OP_STORE) {
+                    if (c_st) { c_bad = true; break; }
+                    c_st = in;
+                } else if (in->op == OP_MUL) {
+                    if (c_mul) { c_bad = true; break; }
+                    c_mul = in;
+                } else if (in->op == OP_ADD) {
+                    if (c_add) { c_bad = true; break; }
+                    c_add = in;
+                } else { c_bad = true; break; }
+            }
+            if (!c_bad && c_ngep == 2) {
+                int s0 = (c_ld && c_ld->a == c_geps[0]->result) ? 0 :
+                         (c_ld && c_ld->a == c_geps[1]->result) ? 1 : -1;
+                int s1 = (c_ld2 && c_ld2->a == c_geps[0]->result) ? 0 :
+                         (c_ld2 && c_ld2->a == c_geps[1]->result) ? 1 : -1;
+                /* pure copy: one load, one store of the loaded value
+                 * to the other stream */
+                if (c_ld && !c_ld2 && c_st && !c_mul && !c_add && s0 >= 0) {
+                    int di = 1 - s0;
+                    if (c_st->a == c_geps[di]->result && c_st->b == c_ld->result &&
+                        c_geps[0]->ety.kind == c_geps[1]->ety.kind &&
+                        c_geps[0]->ety.bits == c_geps[1]->ety.bits &&
+                        c_ld->ty.kind == c_geps[s0]->ety.kind && c_ld->ty.bits == c_geps[s0]->ety.bits &&
+                        c_st->ty.kind == c_geps[di]->ety.kind && c_st->ty.bits == c_geps[di]->ety.bits) {
+                        int src_arg = -1, dst_arg = -1;
+                        for (int a = 0; a < B->nargs; a++) {
+                            if (B->arg_vals[a] == c_geps[s0]->a && h_to_b_args[a] == H->arg_vals[a] && bterm->args[a] == B->arg_vals[a]) src_arg = a;
+                            if (B->arg_vals[a] == c_geps[di]->a && h_to_b_args[a] == H->arg_vals[a] && bterm->args[a] == B->arg_vals[a]) dst_arg = a;
+                        }
+                        if (src_arg >= 0 && dst_arg >= 0) {
+                            is_copy = true;
+                            map_src_arg_idx = src_arg;
+                            base_arg_idx = dst_arg;
+                            gep_in = c_geps[di];
+                        }
+                    }
+                }
+                /* two-stream multiply-accumulate (dot product): feeds
+                 * the reduce machinery with a second stream pointer;
+                 * integer only, where reassociation is exact */
+                if (!is_copy && c_ld && c_ld2 && !c_st && c_mul && c_add && s0 >= 0 && s1 >= 0 && s0 != s1 &&
+                    ((c_mul->a == c_ld->result && c_mul->b == c_ld2->result) ||
+                     (c_mul->a == c_ld2->result && c_mul->b == c_ld->result)) &&
+                    c_geps[0]->ety.kind == c_geps[1]->ety.kind &&
+                    c_geps[0]->ety.bits == c_geps[1]->ety.bits && ty_is_int(c_geps[0]->ety)) {
+                    int acc_cand = -1;
+                    int other = (c_add->a == c_mul->result) ? c_add->b :
+                                (c_add->b == c_mul->result) ? c_add->a : -1;
+                    if (other >= 0) {
+                        for (int a = 0; a < B->nargs; a++) {
+                            if (a == iv_arg_idx) continue;
+                            if (B->arg_vals[a] == other && bterm->args[a] == c_add->result &&
+                                h_to_b_args[a] == H->arg_vals[a]) { acc_cand = a; break; }
+                        }
+                    }
+                    if (acc_cand >= 0) {
+                        int a_arg = -1, b_arg = -1;
+                        for (int a = 0; a < B->nargs; a++) {
+                            if (B->arg_vals[a] == c_geps[s0]->a && h_to_b_args[a] == H->arg_vals[a] && bterm->args[a] == B->arg_vals[a]) a_arg = a;
+                            if (B->arg_vals[a] == c_geps[s1]->a && h_to_b_args[a] == H->arg_vals[a] && bterm->args[a] == B->arg_vals[a]) b_arg = a;
+                        }
+                        /* Two-stream i64 takes the scalar-unroll path, whose
+                         * unrolled body keeps both pointers and all
+                         * accumulators live at once; the native allocator
+                         * spills it (measured +72.6% on the i64 bench
+                         * kernel), so the class fires only when real
+                         * vector lanes exist. */
+                        if (a_arg >= 0 && b_arg >= 0 &&
+                            !(c_geps[s0]->ety.kind == TY_INT && c_geps[s0]->ety.bits == 64)) {
+                            is_dot = true;
+                            is_reduce = true;
+                            acc_arg_idx = acc_cand;
+                            base_arg_idx = a_arg;
+                            map_src_arg_idx = b_arg;
+                            gep_in = c_geps[s0];
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!is_histo && !is_fnv && !is_map && !is_copy && !is_dot) {
             for (int i = 0; i < B->nins - 1; i++) {
                 Instr *in = &B->ins[i];
                 if (in == iv_add) continue;
@@ -1293,7 +1397,7 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
             }
         }
 
-        if (!is_fill && !is_reduce && !is_histo && !is_fnv && !is_map) continue;
+        if (!is_fill && !is_reduce && !is_histo && !is_fnv && !is_map && !is_copy) continue;
 
         Type elem_ty = gep_in->ety;
         bool use_scalar_unroll = (is_reduce && elem_ty.kind == TY_INT && elem_ty.bits == 64) || is_histo || is_fnv;
@@ -1337,7 +1441,7 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
 
         int total_step = lanes * U;
 
-        int step_idx = is_map ? 4 : 3;
+        int step_idx = (is_map || is_copy || is_dot) ? 4 : 3;
         int num_vec_args = is_reduce ? num_acc : ((is_fill || is_map) ? 1 : 0);
         int vec_start = step_idx + 1;
         int vhead_nargs = vec_start + num_vec_args + H->nargs;
@@ -1347,7 +1451,7 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         vhead_types[0] = iv_ty;
         vhead_types[1] = iv_ty; /* vec_limit */
         vhead_types[2] = H->arg_types[base_arg_idx]; /* cur_ptr */
-        if (is_map) vhead_types[3] = H->arg_types[map_src_arg_idx]; /* cur_src_ptr */
+        if (is_map || is_copy || is_dot) vhead_types[3] = H->arg_types[map_src_arg_idx]; /* cur_src_ptr */
         vhead_types[step_idx] = iv_ty; /* step */
         if (is_reduce) {
             for (int u = 0; u < num_acc; u++) vhead_types[vec_start + u] = acc_ty;
@@ -1396,7 +1500,7 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
 
         int init_p_src = -1;
-        if (is_map) {
+        if (is_map || is_copy || is_dot) {
             Instr gep_src = ins_bin(OP_GEP, H->arg_types[map_src_arg_idx], p_args[map_src_arg_idx], init_iv);
             gep_src.ety = elem_ty;
             init_p_src = opt_emit_before_term(f, pre_idx, gep_src);
@@ -1457,7 +1561,7 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         to_vhead[0] = init_iv;
         to_vhead[1] = vec_limit;
         to_vhead[2] = init_p;
-        if (is_map) to_vhead[3] = init_p_src;
+        if (is_map || is_copy || is_dot) to_vhead[3] = init_p_src;
         to_vhead[step_idx] = c_tot_pre_v;
         if (is_reduce) {
             for (int u = 0; u < num_acc; u++) to_vhead[vec_start + u] = vzval;
@@ -1509,6 +1613,42 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
                 Instr vst = ins_bin(OP_VSTORE, ty_void(), store_ptr, vval);
                 vst.ety = elem_ty;
                 emit(f, b_vbody, vst);
+            }
+        } else if (is_reduce && is_dot) {
+            int cur_s = VB->arg_vals[3];
+            for (int u = 0; u < num_acc; u++) cur_acc[u] = VB->arg_vals[vec_start + u];
+            for (int u = 0; u < U; u++) {
+                int load_ptr = cur_p;
+                int src_ptr = cur_s;
+                if (u > 0) {
+                    Instr gep_u = ins_bin(OP_GEP, H->arg_types[base_arg_idx], cur_p, c_u_v[u]);
+                    gep_u.ety = elem_ty;
+                    load_ptr = emit(f, b_vbody, gep_u);
+                    Instr gep_s = ins_bin(OP_GEP, H->arg_types[map_src_arg_idx], cur_s, c_u_v[u]);
+                    gep_s.ety = elem_ty;
+                    src_ptr = emit(f, b_vbody, gep_s);
+                }
+                int loaded_a, loaded_b;
+                if (use_scalar_reduce) {
+                    Instr sld = ins_un(OP_LOAD, elem_ty, load_ptr);
+                    sld.ety = elem_ty;
+                    loaded_a = emit(f, b_vbody, sld);
+                    Instr sld2 = ins_un(OP_LOAD, elem_ty, src_ptr);
+                    sld2.ety = elem_ty;
+                    loaded_b = emit(f, b_vbody, sld2);
+                } else {
+                    Instr vld = ins_un(OP_VLOAD, vec_ty, load_ptr);
+                    vld.ety = elem_ty;
+                    loaded_a = emit(f, b_vbody, vld);
+                    Instr vld2 = ins_un(OP_VLOAD, vec_ty, src_ptr);
+                    vld2.ety = elem_ty;
+                    loaded_b = emit(f, b_vbody, vld2);
+                }
+                Instr mul_in = ins_bin(use_scalar_reduce ? OP_MUL : OP_VMUL, acc_ty, loaded_a, loaded_b);
+                int prod = emit(f, b_vbody, mul_in);
+                int acc_i = u % num_acc;
+                Instr add_in = ins_bin(use_scalar_unroll ? OP_ADD : OP_VADD, acc_ty, cur_acc[acc_i], prod);
+                cur_acc[acc_i] = emit(f, b_vbody, add_in);
             }
         } else if (is_reduce) {
             for (int u = 0; u < num_acc; u++) cur_acc[u] = VB->arg_vals[vec_start + u];
@@ -1621,11 +1761,31 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
                 vst.ety = elem_ty;
                 emit(f, b_vbody, vst);
             }
+        } else if (is_copy) {
+            int cur_s = VB->arg_vals[3];
+            for (int u = 0; u < U; u++) {
+                int dst_ptr = cur_p;
+                int src_ptr = cur_s;
+                if (u > 0) {
+                    Instr gep_d = ins_bin(OP_GEP, H->arg_types[base_arg_idx], cur_p, c_u_v[u]);
+                    gep_d.ety = elem_ty;
+                    dst_ptr = emit(f, b_vbody, gep_d);
+                    Instr gep_s = ins_bin(OP_GEP, H->arg_types[map_src_arg_idx], cur_s, c_u_v[u]);
+                    gep_s.ety = elem_ty;
+                    src_ptr = emit(f, b_vbody, gep_s);
+                }
+                Instr vld_s = ins_un(OP_VLOAD, vec_ty, src_ptr);
+                vld_s.ety = elem_ty;
+                int vx = emit(f, b_vbody, vld_s);
+                Instr vst = ins_bin(OP_VSTORE, ty_void(), dst_ptr, vx);
+                vst.ety = elem_ty;
+                emit(f, b_vbody, vst);
+            }
         }
 
         /* Pointer bump and IV step */
         int next_s_v = -1;
-        if (is_map) {
+        if (is_map || is_copy || is_dot) {
             Instr next_s_in = ins_bin(OP_GEP, H->arg_types[map_src_arg_idx], VB->arg_vals[3], vb_step);
             next_s_in.ety = elem_ty;
             next_s_v = emit(f, b_vbody, next_s_in);
@@ -1645,7 +1805,7 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         to_loop[0] = next_iv_v;
         to_loop[1] = vb_vec_limit;
         to_loop[2] = next_p_v;
-        if (is_map) to_loop[3] = next_s_v;
+        if (is_map || is_copy || is_dot) to_loop[3] = next_s_v;
         to_loop[step_idx] = vb_step;
         if (is_reduce) {
             for (int u = 0; u < num_acc; u++) to_loop[vec_start + u] = cur_acc[u];
@@ -1657,7 +1817,7 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         to_exit[0] = next_iv_v;
         to_exit[1] = vb_vec_limit;
         to_exit[2] = next_p_v;
-        if (is_map) to_exit[3] = next_s_v;
+        if (is_map || is_copy || is_dot) to_exit[3] = next_s_v;
         to_exit[step_idx] = vb_step;
         if (is_reduce) {
             for (int u = 0; u < num_acc; u++) to_exit[vec_start + u] = cur_acc[u];
@@ -1669,7 +1829,7 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         emit(f, b_vbody, cbr_b);
 
         int ve_iv = f->blocks[b_vexit].arg_vals[0];
-        if (is_fill || is_histo || is_fnv || is_map) {
+        if (is_fill || is_histo || is_fnv || is_map || is_copy) {
             int32_t *to_h = malloc(sizeof(int32_t) * (size_t)f->blocks[h_idx].nargs);
             for (int a = 0; a < f->blocks[h_idx].nargs; a++) to_h[a] = f->blocks[b_vexit].arg_vals[invar_start + a];
             to_h[iv_arg_idx] = ve_iv;
