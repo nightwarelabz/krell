@@ -1167,6 +1167,8 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         bool is_dot = false;
         bool is_widen = false;
         Type widen_acc_ty = { 0 };
+        bool is_swar = false;
+        int swar_W = 0;      /* elements per accumulator-width word */
         int map_src_arg_idx = -1;
         int map_k_arg_idx = -1;
         int64_t map_k_cval = 0;
@@ -1386,6 +1388,22 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
                     acc_arg_idx = acc_cand;
                     base_arg_idx = base_cand;
                     gep_in = w_gep;
+                    /* SWAR form: when the accumulator word packs a
+                     * whole number W >= 2 of elements, the unrolled
+                     * body can load one accumulator-width word per
+                     * step and sum its elements in-register with a
+                     * mask/shift reduction (fields are mask-isolated
+                     * before every add and each field's maximum sum
+                     * fits its width, so the reduction is exact on
+                     * any endianness). */
+                    if (w_zx->ty.bits >= 16 && w_gep->ety.bits >= 8 &&
+                        w_zx->ty.bits % w_gep->ety.bits == 0) {
+                        int W = w_zx->ty.bits / w_gep->ety.bits;
+                        if (W >= 2) {
+                            is_swar = true;
+                            swar_W = W;
+                        }
+                    }
                 }
             }
         }
@@ -1486,7 +1504,14 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         if (num_acc > U) num_acc = U;
         if (num_acc != 1 && num_acc != 2 && num_acc != 4 && num_acc != 8) num_acc = 4;
 
+        /* The SWAR body carries the reduction constants as live-ins;
+         * past one word per iteration the native allocator spills
+         * the chain intermediates and the shape slows down (measured
+         * on the bench kernel: U=4 1.41M ns, U=2 1.00M, U=1 0.84M),
+         * so the class runs a single word with a single accumulator. */
+        if (is_swar) { U = 1; num_acc = 1; }
         int total_step = lanes * U;
+        if (is_swar) total_step = U * swar_W;
 
         int step_idx = (is_map || is_copy || is_dot) ? 4 : 3;
         int num_vec_args = is_reduce ? num_acc : ((is_fill || is_map) ? 1 : 0);
@@ -1536,6 +1561,56 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
             P = &f->blocks[pre_idx];
             p_term = &P->ins[P->nins - 1];
             p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
+        }
+
+        int sw_mask_v[3] = { 0, 0, 0 };
+        int sw_shift_v[3] = { 0, 0, 0 };
+        int sw_mul_v = 0, sw_top_v = 0;
+        int sw_off_v[16] = { 0 };
+        if (is_swar) {
+            /* One mask/shift level folds element pairs into fields
+             * of twice the element width (each field <= 2*(2^E - 1));
+             * a multiply by the field-replicated 1 then sums the
+             * fields into the top field: every partial field sum is
+             * bounded by fields * 2 * (2^E - 1) < 2^(2E), so no
+             * carry ever crosses a field boundary and the top field
+             * is the exact element sum. */
+            {
+                int field = (int)elem_ty.bits;
+                uint64_t m = 0;
+                uint64_t ones = field >= 64 ? ~0ULL : ((1ULL << field) - 1);
+                for (int pos = 0; pos < (int)widen_acc_ty.bits; pos += 2 * field) m |= ones << pos;
+                Instr cm = ins_iconst(widen_acc_ty, m);
+                sw_mask_v[0] = opt_emit_before_term(f, pre_idx, cm);
+                P = &f->blocks[pre_idx];
+                p_term = &P->ins[P->nins - 1];
+                p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
+                Instr cs = ins_iconst(ty_i64(), (uint64_t)field);
+                sw_shift_v[0] = opt_emit_before_term(f, pre_idx, cs);
+                P = &f->blocks[pre_idx];
+                p_term = &P->ins[P->nins - 1];
+                p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
+                int F = 2 * field;
+                uint64_t mc = 0;
+                for (int pos = 0; pos < (int)widen_acc_ty.bits; pos += F) mc |= 1ULL << pos;
+                Instr cc = ins_iconst(widen_acc_ty, mc);
+                sw_mul_v = opt_emit_before_term(f, pre_idx, cc);
+                P = &f->blocks[pre_idx];
+                p_term = &P->ins[P->nins - 1];
+                p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
+                Instr ct = ins_iconst(ty_i64(), (uint64_t)((int)widen_acc_ty.bits - F));
+                sw_top_v = opt_emit_before_term(f, pre_idx, ct);
+                P = &f->blocks[pre_idx];
+                p_term = &P->ins[P->nins - 1];
+                p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
+            }
+            for (int u = 1; u < U; u++) {
+                Instr co = ins_iconst(ty_i64(), (uint64_t)(u * swar_W));
+                sw_off_v[u] = opt_emit_before_term(f, pre_idx, co);
+                P = &f->blocks[pre_idx];
+                p_term = &P->ins[P->nins - 1];
+                p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
+            }
         }
 
         int init_base = p_args[base_arg_idx];
@@ -1695,6 +1770,34 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
                 int prod = emit(f, b_vbody, mul_in);
                 int acc_i = u % num_acc;
                 Instr add_in = ins_bin(use_scalar_unroll ? OP_ADD : OP_VADD, acc_ty, cur_acc[acc_i], prod);
+                cur_acc[acc_i] = emit(f, b_vbody, add_in);
+            }
+        } else if (is_reduce && is_swar) {
+            for (int u = 0; u < num_acc; u++) cur_acc[u] = VB->arg_vals[vec_start + u];
+            for (int u = 0; u < U; u++) {
+                int byte_ptr = cur_p;
+                if (u > 0) {
+                    Instr gep_u = ins_bin(OP_GEP, H->arg_types[base_arg_idx], cur_p, sw_off_v[u]);
+                    gep_u.ety = elem_ty;
+                    byte_ptr = emit(f, b_vbody, gep_u);
+                }
+                Instr wld = ins_un(OP_LOAD, acc_ty, byte_ptr);
+                wld.ety = acc_ty;
+                int w = emit(f, b_vbody, wld);
+                Instr a1 = ins_bin(OP_AND, acc_ty, w, sw_mask_v[0]);
+                int lo = emit(f, b_vbody, a1);
+                Instr sh = ins_bin(OP_LSHR, acc_ty, w, sw_shift_v[0]);
+                int hi = emit(f, b_vbody, sh);
+                Instr a2 = ins_bin(OP_AND, acc_ty, hi, sw_mask_v[0]);
+                int hi_m = emit(f, b_vbody, a2);
+                Instr ad = ins_bin(OP_ADD, acc_ty, lo, hi_m);
+                int fld = emit(f, b_vbody, ad);
+                Instr mu = ins_bin(OP_MUL, acc_ty, fld, sw_mul_v);
+                int prod = emit(f, b_vbody, mu);
+                Instr tp = ins_bin(OP_LSHR, acc_ty, prod, sw_top_v);
+                int sum = emit(f, b_vbody, tp);
+                int acc_i = u % num_acc;
+                Instr add_in = ins_bin(OP_ADD, acc_ty, cur_acc[acc_i], sum);
                 cur_acc[acc_i] = emit(f, b_vbody, add_in);
             }
         } else if (is_reduce && is_widen) {
