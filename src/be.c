@@ -289,9 +289,24 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
                 /* SpillAtInterval: find active interval that ends furthest after iv->end */
                 int furthest = -1;
                 int max_end = iv->end;
+                bool iv_cross = false;
+                for (int b = 1; b < f->nblocks; b++)
+                    if (bf->blkstart[b] > iv->start && bf->blkstart[b] <= iv->end) { iv_cross = true; break; }
                 for (int j = 0; j < na; j++) {
                     if (iv->cross && !act[j].callee) continue;
                     if (act[j].end - act[j].start > 15 && (iv->end - iv->start) < 8) continue;
+                    /* An interval that crosses a block boundary is
+                     * referenced from other blocks; evicting it for
+                     * an interval that lives and dies inside one
+                     * block trades one local spill for memory
+                     * traffic on every path through those blocks.
+                     * Protect the cross-block interval. */
+                    if (!iv_cross) {
+                        bool act_cross = false;
+                        for (int b = 1; b < f->nblocks; b++)
+                            if (bf->blkstart[b] > act[j].start && bf->blkstart[b] <= act[j].end) { act_cross = true; break; }
+                        if (act_cross) continue;
+                    }
                     if (act[j].end > max_end) {
                         max_end = act[j].end;
                         furthest = j;

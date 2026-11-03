@@ -693,6 +693,31 @@ static void optimize_func(Opt *o) {
             }
             case OP_ICMP: {
                 Type at = f->vtypes[w.a];
+                /* Boolean collapse: icmp.ne (zext c), 0 and
+                 * icmp.eq (zext c), 1 with c an i1 are exactly c --
+                 * the zext of an i1 is 0/1, so the test returns the
+                 * condition itself. Substituting the i1 lets the
+                 * producing compare fuse into the consuming branch
+                 * in the backends instead of materializing the
+                 * whole chain (the range-check idiom's output feeds
+                 * exactly this shape). */
+                {
+                    int xv = -1; int64_t kv = 0;
+                    if (hb) { xv = w.a; kv = kb; }
+                    else if (ha) { xv = w.b; kv = ka; }
+                    if (xv >= 0 && ((w.pred == IC_NE && kv == 0) ||
+                                    (w.pred == IC_EQ && kv == 1))) {
+                        Instr *dz = local_def(&nb, xv);
+                        if (dz && dz->op == OP_ZEXT &&
+                            f->vtypes[dz->a].kind == TY_INT &&
+                            f->vtypes[dz->a].bits == 1) {
+                            o->subst[w.result] = dz->a;
+                            drop_uses(o, &w); keep = false;
+                            o->st->rewritten++;
+                            break;
+                        }
+                    }
+                }
                 if (ha && hb) {
                     int r = eval_icmp(w.pred, at, (uint64_t)ka, (uint64_t)kb);
                     w = ins_iconst(t, r); w.result = b->ins[ii].result;
@@ -1861,6 +1886,80 @@ static bool opt_eliminate_block_args(Func *f, OptStats *st) {
     return any_eliminated;
 }
 
+/* Loop-constant hoist: an iconst/fconst defined inside a loop body is
+ * re-materialized by the backends on every iteration whenever it
+ * cannot fold into an immediate operand (a 64-bit constant never fits
+ * a 32-bit immediate field). Constants are pure and total, and the
+ * entry block dominates every block in the function, so moving the
+ * definition to the entry block is always legal: one materialization
+ * per function instead of one per iteration. Only definitions in
+ * blocks that lie on a cycle move. */
+static void opt_hoist_loop_consts(Func *f, OptStats *st) {
+    int nb = f->nblocks;
+    if (nb < 2) return;
+    bool *inloop = calloc((size_t)nb, sizeof(bool));
+    int *stack = malloc(sizeof(int) * (size_t)nb);
+    bool *vis = malloc(sizeof(bool) * (size_t)nb);
+    for (int b = 0; b < nb; b++) {
+        Block *bl = &f->blocks[b];
+        if (bl->nins < 1) continue;
+        Instr *t = &bl->ins[bl->nins - 1];
+        int succ[2] = { -1, -1 };
+        if (t->op == OP_BR) succ[0] = t->blk;
+        else if (t->op == OP_CONDBR) { succ[0] = t->blk; succ[1] = t->blk2; }
+        /* can b reach itself? DFS from its successors, marking on
+         * push so each block enters the stack at most once */
+        memset(vis, 0, sizeof(bool) * (size_t)nb);
+        int sp = 0;
+        for (int k = 0; k < 2; k++)
+            if (succ[k] >= 0 && succ[k] < nb && !vis[succ[k]]) {
+                vis[succ[k]] = true; stack[sp++] = succ[k];
+            }
+        while (sp > 0) {
+            int x = stack[--sp];
+            if (x == b) { inloop[b] = true; break; }
+            Block *xb = &f->blocks[x];
+            if (xb->nins < 1) continue;
+            Instr *xt = &xb->ins[xb->nins - 1];
+            int xs[2] = { -1, -1 };
+            if (xt->op == OP_BR) xs[0] = xt->blk;
+            else if (xt->op == OP_CONDBR) { xs[0] = xt->blk; xs[1] = xt->blk2; }
+            for (int k = 0; k < 2; k++)
+                if (xs[k] >= 0 && xs[k] < nb && !vis[xs[k]]) {
+                    vis[xs[k]] = true; stack[sp++] = xs[k];
+                }
+        }
+    }
+    free(stack); free(vis);
+    InsVec hv = { 0 };
+    for (int b = 1; b < nb; b++) {
+        if (!inloop[b]) continue;
+        Block *bl = &f->blocks[b];
+        int w = 0;
+        for (int i = 0; i < bl->nins; i++) {
+            Instr in = bl->ins[i];
+            if ((in.op == OP_ICONST || in.op == OP_FCONST) && in.result >= 0)
+                iv_push(&hv, in);
+            else
+                bl->ins[w++] = in;
+        }
+        bl->nins = w;
+    }
+    free(inloop);
+    if (hv.n == 0) { free(hv.v); return; }
+    Block *e = &f->blocks[0];
+    int pos = e->nins > 0 ? e->nins - 1 : 0;
+    if (e->nins + hv.n > e->cap) {
+        e->cap = (e->nins + hv.n) * 2;
+        e->ins = realloc(e->ins, sizeof(Instr) * (size_t)e->cap);
+    }
+    memmove(&e->ins[pos + hv.n], &e->ins[pos], sizeof(Instr) * (size_t)(e->nins - pos));
+    memcpy(&e->ins[pos], hv.v, sizeof(Instr) * (size_t)hv.n);
+    e->nins += hv.n;
+    st->rewritten += hv.n;
+    free(hv.v);
+}
+
 void opt_optimize(Module *m, const Cost *cost, OptStats *st) {
     OptStats local = { 0, 0, 0, 0 };
     if (!st) st = &local;
@@ -1870,6 +1969,7 @@ void opt_optimize(Module *m, const Cost *cost, OptStats *st) {
     for (int fi = 0; fi < m->nfuncs; fi++) {
         Func *f = &m->funcs[fi];
         opt_vectorize_loops(m, f, cost, st);
+        opt_hoist_loop_consts(f, st);
         Opt o = { 0 };
         o.f = f; o.cost = cost; o.st = st;
         opt_grow(&o, f->nvalues);

@@ -622,7 +622,7 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         int dreg = (dl->is_reg && dl->cls == BCLS_GP) ? dl->idx : -1;
         int dreg_use = (dreg >= 0) ? dreg : R11;
         int64_t imm;
-        if (in->op != OP_MUL && be_iconst_val(f, in->b, &imm) && imm >= -2147483648LL && imm <= 2147483647LL) {
+        if (be_iconst_val(f, in->b, &imm) && imm >= -2147483648LL && imm <= 2147483647LL) {
             snprintf(sb, sizeof sb, "%lld", (long long)imm);
         } else {
             locstr(c, sb, sizeof sb, in->b, t.bits == 64 ? 8 : 4);
@@ -1829,7 +1829,7 @@ static int emit_func(Ctx *c, int fi) {
         for (int ii = 0; ii < b->nins; ii++) {
             Instr *in = &b->ins[ii];
             if (in->op == OP_ICMP || (in->op >= OP_ADD && in->op <= OP_ASHR &&
-                                     in->op != OP_MUL && in->op != OP_UDIV && in->op != OP_SDIV &&
+                                     in->op != OP_UDIV && in->op != OP_SDIV &&
                                      in->op != OP_UREM && in->op != OP_SREM && in->op != OP_NEG && in->op != OP_NOT)) {
                 int64_t imm;
                 if (in->b >= 0 && be_iconst_val(f, in->b, &imm) && imm >= -2147483648LL && imm <= 2147483647LL) {
