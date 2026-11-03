@@ -1165,6 +1165,8 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         bool is_map = false;
         bool is_copy = false;
         bool is_dot = false;
+        bool is_widen = false;
+        Type widen_acc_ty = { 0 };
         int map_src_arg_idx = -1;
         int map_k_arg_idx = -1;
         int64_t map_k_cval = 0;
@@ -1345,6 +1347,50 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         }
 
         if (!is_histo && !is_fnv && !is_map && !is_copy && !is_dot) {
+            /* Widening reduction: gep + load of a narrow integer
+             * element, a zext to a wider integer type, and an
+             * accumulator add of the widened value (bytesum's
+             * shape). Rides the scalar reduce layout with a zext
+             * in place of the multiply. */
+            Instr *w_gep = NULL, *w_ld = NULL, *w_zx = NULL, *w_add = NULL;
+            bool w_bad = false;
+            for (int i = 0; i < B->nins - 1 && !w_bad; i++) {
+                Instr *in = &B->ins[i];
+                if (in == iv_add || in->op == OP_ICONST) continue;
+                if (in->op == OP_GEP && in->b == b_iv_val && !w_gep) w_gep = in;
+                else if (in->op == OP_LOAD && !w_ld) w_ld = in;
+                else if (in->op == OP_ZEXT && !w_zx) w_zx = in;
+                else if (in->op == OP_ADD && !w_add) w_add = in;
+                else w_bad = true;
+            }
+            if (!w_bad && w_gep && w_ld && w_zx && w_add &&
+                w_ld->a == w_gep->result &&
+                w_zx->a == w_ld->result &&
+                ty_is_int(w_gep->ety) && ty_is_int(w_zx->ty) &&
+                w_ld->ty.kind == w_gep->ety.kind && w_ld->ty.bits == w_gep->ety.bits &&
+                w_zx->ty.bits > w_gep->ety.bits && w_add->ty.kind == w_zx->ty.kind &&
+                w_add->ty.bits == w_zx->ty.bits &&
+                (w_add->a == w_zx->result || w_add->b == w_zx->result)) {
+                int other = (w_add->a == w_zx->result) ? w_add->b : w_add->a;
+                int acc_cand = -1, base_cand = -1;
+                for (int a = 0; a < B->nargs; a++) {
+                    if (B->arg_vals[a] == other && bterm->args[a] == w_add->result &&
+                        h_to_b_args[a] == H->arg_vals[a]) acc_cand = a;
+                    if (B->arg_vals[a] == w_gep->a && h_to_b_args[a] == H->arg_vals[a] &&
+                        bterm->args[a] == B->arg_vals[a]) base_cand = a;
+                }
+                if (acc_cand >= 0 && base_cand >= 0) {
+                    is_widen = true;
+                    is_reduce = true;
+                    widen_acc_ty = w_zx->ty;
+                    acc_arg_idx = acc_cand;
+                    base_arg_idx = base_cand;
+                    gep_in = w_gep;
+                }
+            }
+        }
+
+        if (!is_histo && !is_fnv && !is_map && !is_copy && !is_dot && !is_widen) {
             for (int i = 0; i < B->nins - 1; i++) {
                 Instr *in = &B->ins[i];
                 if (in == iv_add) continue;
@@ -1400,14 +1446,15 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         if (!is_fill && !is_reduce && !is_histo && !is_fnv && !is_map && !is_copy) continue;
 
         Type elem_ty = gep_in->ety;
-        bool use_scalar_unroll = (is_reduce && elem_ty.kind == TY_INT && elem_ty.bits == 64) || is_histo || is_fnv;
-        bool use_scalar_reduce = is_reduce && elem_ty.kind == TY_INT && elem_ty.bits == 64;
+        bool use_scalar_unroll = (is_reduce && elem_ty.kind == TY_INT && elem_ty.bits == 64) || is_histo || is_fnv || is_widen;
+        bool use_scalar_reduce = is_reduce && ((elem_ty.kind == TY_INT && elem_ty.bits == 64) || is_widen);
 
         int vl_i32 = cost_vl_i32(cost);
         int lanes = use_scalar_unroll ? 1 : ((vl_i32 * 32) / elem_ty.bits);
         if (lanes < 1 || (!use_scalar_unroll && lanes < 2)) continue;
         Type vec_ty = ty_vec(elem_ty, 1);
         Type acc_ty = use_scalar_unroll ? elem_ty : vec_ty;
+        if (is_widen) acc_ty = widen_acc_ty;
 
         if (!use_scalar_unroll) {
             if (cost_cliff(cost, OP_VLOAD, vec_ty)) continue;
@@ -1528,7 +1575,7 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
             p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
         }
         if (is_reduce) {
-            Instr zc = ins_iconst(elem_ty, 0);
+            Instr zc = ins_iconst(is_widen ? acc_ty : elem_ty, 0);
             int zval = opt_emit_before_term(f, pre_idx, zc);
             if (use_scalar_reduce) {
                 vzval = zval;
@@ -1648,6 +1695,25 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
                 int prod = emit(f, b_vbody, mul_in);
                 int acc_i = u % num_acc;
                 Instr add_in = ins_bin(use_scalar_unroll ? OP_ADD : OP_VADD, acc_ty, cur_acc[acc_i], prod);
+                cur_acc[acc_i] = emit(f, b_vbody, add_in);
+            }
+        } else if (is_reduce && is_widen) {
+            for (int u = 0; u < num_acc; u++) cur_acc[u] = VB->arg_vals[vec_start + u];
+            for (int u = 0; u < U; u++) {
+                int load_ptr = cur_p;
+                if (u > 0) {
+                    Instr gep_u = ins_bin(OP_GEP, H->arg_types[base_arg_idx], cur_p, c_u_v[u]);
+                    gep_u.ety = elem_ty;
+                    load_ptr = emit(f, b_vbody, gep_u);
+                }
+                Instr sld = ins_un(OP_LOAD, elem_ty, load_ptr);
+                sld.ety = elem_ty;
+                int loaded = emit(f, b_vbody, sld);
+                Instr zx = ins_make(OP_ZEXT, acc_ty);
+                zx.a = loaded;
+                int wide = emit(f, b_vbody, zx);
+                int acc_i = u % num_acc;
+                Instr add_in = ins_bin(OP_ADD, acc_ty, cur_acc[acc_i], wide);
                 cur_acc[acc_i] = emit(f, b_vbody, add_in);
             }
         } else if (is_reduce) {
@@ -1840,16 +1906,17 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
             for (int u = 0; u < num_acc; u++) ve_acc[u] = f->blocks[b_vexit].arg_vals[vec_start + u];
             int orig_acc = f->blocks[b_vexit].arg_vals[invar_start + acc_arg_idx];
 
+            Type comb_ty = is_widen ? acc_ty : elem_ty;
             int cur_sum;
             if (use_scalar_reduce) {
                 if (num_acc == 4) {
-                    int s01 = emit(f, b_vexit, ins_bin(OP_ADD, elem_ty, ve_acc[0], ve_acc[1]));
-                    int s23 = emit(f, b_vexit, ins_bin(OP_ADD, elem_ty, ve_acc[2], ve_acc[3]));
-                    cur_sum = emit(f, b_vexit, ins_bin(OP_ADD, elem_ty, s01, s23));
+                    int s01 = emit(f, b_vexit, ins_bin(OP_ADD, comb_ty, ve_acc[0], ve_acc[1]));
+                    int s23 = emit(f, b_vexit, ins_bin(OP_ADD, comb_ty, ve_acc[2], ve_acc[3]));
+                    cur_sum = emit(f, b_vexit, ins_bin(OP_ADD, comb_ty, s01, s23));
                 } else {
                     cur_sum = ve_acc[0];
                     for (int u = 1; u < num_acc; u++) {
-                        Instr a_u = ins_bin(OP_ADD, elem_ty, cur_sum, ve_acc[u]);
+                        Instr a_u = ins_bin(OP_ADD, comb_ty, cur_sum, ve_acc[u]);
                         cur_sum = emit(f, b_vexit, a_u);
                     }
                 }
@@ -1871,7 +1938,7 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
                     cur_sum = emit(f, b_vexit, sadd);
                 }
             }
-            Instr final_add = ins_bin(OP_ADD, elem_ty, orig_acc, cur_sum);
+            Instr final_add = ins_bin(OP_ADD, comb_ty, orig_acc, cur_sum);
             int final_acc = emit(f, b_vexit, final_add);
             int32_t *to_h = malloc(sizeof(int32_t) * (size_t)f->blocks[h_idx].nargs);
             for (int a = 0; a < f->blocks[h_idx].nargs; a++) to_h[a] = f->blocks[b_vexit].arg_vals[invar_start + a];
