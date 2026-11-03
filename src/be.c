@@ -1,5 +1,6 @@
 /* Krell backends — shared kit implementation. */
 #include "be.h"
+#include <limits.h>
 
 void be_err(char *err, size_t cap, const char *msg) { if (err) snprintf(err, cap, "%s", msg); }
 
@@ -35,6 +36,38 @@ static int cmp_iv(const void *a, const void *b) {
     if (x->start != y->start) return x->start < y->start ? -1 : 1;
     if (x->end != y->end) return x->end < y->end ? -1 : 1;
     return x->v < y->v ? -1 : x->v > y->v ? 1 : 0;
+}
+
+/* Next use of a value at or after position p, for the Belady spill
+ * choice. Use positions are static (block start + instruction
+ * index), so a loop-carried value whose remaining uses in this
+ * iteration all sit before p would otherwise read as "never used
+ * again" (INT_MAX) and be evicted ahead of genuinely cold values --
+ * parse's buffer pointer was spilled exactly this way, adding a
+ * stack reload to its per-byte loop. When no static use at or after
+ * p exists but the value's first use and p both lie inside a loop
+ * AND the value's interval spans the loop's back edge (it is live
+ * across the latch, so the use really does recur), the next dynamic
+ * use is the first use of the next iteration: report it as the
+ * virtual position latch_end + (first_use - header_start), which
+ * keeps wrapped distances comparable with plain ones. A body-local
+ * value whose interval ends before the latch does not span the
+ * edge: its early use is spent, not recurring, and it stays
+ * INT_MAX -- the correct first victim. */
+static int nu_next_use(const int *usepos, int lo, int hi, int p,
+                       int istart, int iend,
+                       const int *be_hp, const int *be_lp, int nbe) {
+    for (int k = lo; k < hi; k++) if (usepos[k] >= p) return usepos[k];
+    if (lo >= hi) return INT_MAX;
+    int u0 = usepos[lo], best = INT_MAX;
+    for (int e = 0; e < nbe; e++) {
+        if (be_hp[e] <= u0 && u0 <= be_lp[e] && be_hp[e] <= p && p <= be_lp[e] &&
+            istart <= be_lp[e] && iend >= be_lp[e]) {
+            int w = be_lp[e] + (u0 - be_hp[e]);
+            if (w < best) best = w;
+        }
+    }
+    return best;
 }
 
 BeFunc *be_analyze(Module *m, Func *f, const Pools *pools) {
@@ -231,6 +264,68 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
         }
     }
 
+    /* Per-value use positions in the allocator's global position
+     * space -- be_pos (block start + 1 + instruction index), the
+     * SAME space as defpos/endpos and the interval starts the spill
+     * decision compares against. (A blkstart+i spelling here once
+     * shifted every use one position early, which made an operand
+     * of the very instruction being allocated for look already
+     * spent and therefore evictable.) Appended in block
+     * order, hence sorted per value. The spill decision below uses
+     * them for a next-use (Belady) victim choice: evicting the
+     * interval whose next use is farthest away is the locally
+     * optimal trade, and it subsumes the older heuristics (evict
+     * the interval that ends last, length and cross-block guards),
+     * which could not see that a loop invariant's next use may be
+     * nearer than a hot intermediate's, or vice versa. */
+    int *useoff = malloc(sizeof(int) * (size_t)(nv + 1));
+    int tot_uses = 0;
+    for (int v = 0; v < nv; v++) { useoff[v] = tot_uses; tot_uses += usecnt[v]; }
+    useoff[nv] = tot_uses;
+    int *usepos = malloc(sizeof(int) * (size_t)(tot_uses > 0 ? tot_uses : 1));
+    {
+        int *usecur = malloc(sizeof(int) * (size_t)nv);
+        for (int v = 0; v < nv; v++) usecur[v] = useoff[v];
+        for (int b = 0; b < f->nblocks; b++) {
+            Block *bl = &f->blocks[b];
+            for (int i = 0; i < bl->nins; i++) {
+                Instr *in = &bl->ins[i];
+                int pos = be_pos(bf, b, i);
+                if (in->a >= 0 && usecur[in->a] < useoff[in->a + 1]) usepos[usecur[in->a]++] = pos;
+                if (in->b >= 0 && usecur[in->b] < useoff[in->b + 1]) usepos[usecur[in->b]++] = pos;
+                if (in->op != OP_ALLOCA && in->c >= 0 && usecur[in->c] < useoff[in->c + 1]) usepos[usecur[in->c]++] = pos;
+                for (int k = 0; k < in->nargs; k++) { int v = in->args[k]; if (v >= 0 && usecur[v] < useoff[v + 1]) usepos[usecur[v]++] = pos; }
+                for (int k = 0; k < in->nargs2; k++) { int v = in->args2[k]; if (v >= 0 && usecur[v] < useoff[v + 1]) usepos[usecur[v]++] = pos; }
+            }
+        }
+        free(usecur);
+    }
+
+    /* Back edges in position space: a terminator target whose block
+     * starts at or before the source block is a loop back edge; the
+     * pair (header start, latch end) spans the loop for the
+     * wrap-aware next-use computation in nu_next_use. */
+    int *be_hp = malloc(sizeof(int) * (size_t)(2 * nb > 0 ? 2 * nb : 1));
+    int *be_lp = malloc(sizeof(int) * (size_t)(2 * nb > 0 ? 2 * nb : 1));
+    int nbe = 0;
+    for (int b = 0; b < nb; b++) {
+        Block *bl = &f->blocks[b];
+        if (bl->nins < 1) continue;
+        Instr *t = &bl->ins[bl->nins - 1];
+        int tg[2] = { -1, -1 };
+        if (t->op == OP_BR) tg[0] = t->blk;
+        if (t->op == OP_CONDBR) { tg[0] = t->blk; tg[1] = t->blk2; }
+        for (int k = 0; k < 2; k++) {
+            int s = tg[k];
+            if (s < 0 || s >= nb) continue;
+            if (bf->blkstart[s] <= bf->blkstart[b]) {
+                be_hp[nbe] = bf->blkstart[s];
+                be_lp[nbe] = bf->blkstart[b] + bl->nins;
+                nbe++;
+            }
+        }
+    }
+
     int maxslots = 0;
     for (int cls = 0; cls < 2; cls++) {
         const PoolReg *pool = cls == BCLS_GP ? pools->gp : pools->fp;
@@ -260,7 +355,16 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
         int spill_counter = 0;
         for (int i = 0; i < ni; i++) {
             Iv *iv = &ivs[i];
-            /* expire */
+            /* expire: strictly-before only. An interval ending AT
+             * the incoming start is still occupying its register at
+             * that position: its last use is the instruction there,
+             * which is the very instruction that defines the incoming
+             * value, and an operand's register may be reused for a
+             * result only through the emitter-aware 2-address path
+             * below, never by freeing it here. (Freeing at == once
+             * let a shift result take its shift-count operand's
+             * register; the emitter read the count after the copy
+             * and 679 battery cases miscompiled.) */
             int wn = 0;
             for (int j = 0; j < na; j++) {
                 if (act[j].end < iv->start) { regused[act[j].reg] = false; }
@@ -337,7 +441,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
              * If iv->v is defined by an operation whose first operand a dies at iv->start,
              * and a is allocated to a register in this pool, reuse that register! */
             Instr *d = defins[iv->v];
-            if (d && (d->op == OP_VADD || d->op == OP_VSUB || d->op == OP_VMUL ||
+            if (d && (d->op == OP_VADD || d->op == OP_VSUB || d->op == OP_VMUL || d->op == OP_VLSHR ||
                       d->op == OP_ADD || d->op == OP_SUB || d->op == OP_MUL ||
                       d->op == OP_AND || d->op == OP_OR || d->op == OP_XOR ||
                       d->op == OP_ZEXT || d->op == OP_TRUNC)) {
@@ -381,30 +485,27 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
                 bf->loc[iv->v].cls = (int8_t)cls;
                 bf->loc[iv->v].idx = pool[pick].reg;
             } else {
-                /* SpillAtInterval: find active interval that ends furthest after iv->end */
+                /* SpillAtInterval, Belady form: among the eligible
+                 * active intervals, evict the one whose next use is
+                 * farthest from the current position; if the incoming
+                 * interval's own next use is farthest of all, spill
+                 * it instead. A use at the current position (an
+                 * operand of the defining instruction) is the
+                 * nearest possible and is never chosen. Coalesced
+                 * (prot) intervals and the call-crossing callee rule
+                 * remain hard constraints. */
                 int furthest = -1;
-                int max_end = iv->end;
-                bool iv_cross = false;
-                for (int b = 1; b < f->nblocks; b++)
-                    if (bf->blkstart[b] > iv->start && bf->blkstart[b] <= iv->end) { iv_cross = true; break; }
+                int best_next = nu_next_use(usepos, useoff[iv->v], useoff[iv->v + 1],
+                                            iv->start, iv->start, iv->end,
+                                            be_hp, be_lp, nbe);
                 for (int j = 0; j < na; j++) {
                     if (act[j].prot) continue;
                     if (iv->cross && !act[j].callee) continue;
-                    if (act[j].end - act[j].start > 15 && (iv->end - iv->start) < 8) continue;
-                    /* An interval that crosses a block boundary is
-                     * referenced from other blocks; evicting it for
-                     * an interval that lives and dies inside one
-                     * block trades one local spill for memory
-                     * traffic on every path through those blocks.
-                     * Protect the cross-block interval. */
-                    if (!iv_cross) {
-                        bool act_cross = false;
-                        for (int b = 1; b < f->nblocks; b++)
-                            if (bf->blkstart[b] > act[j].start && bf->blkstart[b] <= act[j].end) { act_cross = true; break; }
-                        if (act_cross) continue;
-                    }
-                    if (act[j].end > max_end) {
-                        max_end = act[j].end;
+                    int nu = nu_next_use(usepos, useoff[act[j].v], useoff[act[j].v + 1],
+                                         iv->start, act[j].start, act[j].end,
+                                         be_hp, be_lp, nbe);
+                    if (nu > best_next) {
+                        best_next = nu;
                         furthest = j;
                     }
                 }
@@ -435,6 +536,8 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
         free(ivs); free(act); free(coal); free(regused); free(regowner_end);
     }
     free(defins); free(defblk); free(defidx); free(usecnt);
+    free(usepos); free(useoff);
+    free(be_hp); free(be_lp);
     free(use_tgt); free(use_slot); free(use_list); free(use_srcblk);
     bf->nspill_gp = 0; bf->nspill_fp = 0;
     for (int v = 0; v < f->nvalues; v++)

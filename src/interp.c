@@ -344,7 +344,7 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
             break;
         }
         case OP_VADD: case OP_VSUB: case OP_VMUL: case OP_VUDIV:
-        case OP_VAND: case OP_VOR: case OP_VXOR:
+        case OP_VAND: case OP_VOR: case OP_VXOR: case OP_VLSHR:
         case OP_VFADD: case OP_VFSUB: case OP_VFMUL: case OP_VFDIV: {
             Type et = ty_elem(in->ty);
             int ln = ty_lanes(in->ty, 4);
@@ -370,6 +370,7 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
                     case OP_VAND: r = x & y; break;
                     case OP_VOR:  r = x | y; break;
                     case OP_VXOR: r = x ^ y; break;
+                    case OP_VLSHR: r = ((x & m) >> (y % (uint64_t)et.bits)) & m; break;
                     default: r = 0; break;
                     }
                 }

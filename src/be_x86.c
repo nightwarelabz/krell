@@ -1230,6 +1230,76 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         }
         break;
     }
+    case OP_VLSHR: {
+        Type et = ty_elem(t);
+        Loc *dl = &c->bf->loc[in->result], *al = &c->bf->loc[in->a], *bl = &c->bf->loc[in->b];
+        if (dl->is_reg && et.kind == TY_INT && et.bits == 64) {
+            /* psrlq reads the count from the low 64 bits of the
+             * operand, which for 64-bit lanes is exactly the lane's
+             * own shift amount: the packed form is lane-exact. */
+            int dreg = dl->idx;
+            if (al->is_reg && al->idx == dreg) { /* already in place */ }
+            else if (al->is_reg) E(c, "  movaps xmm%d, xmm%d", dreg, al->idx);
+            else E(c, "  movups xmm%d, [rbp - %d]", dreg, al->off);
+            if (bl->is_reg) E(c, "  psrlq xmm%d, xmm%d", dreg, bl->idx);
+            else E(c, "  psrlq xmm%d, [rbp - %d]", dreg, bl->off);
+            break;
+        }
+        /* Scalarized lane loop. Operands may live in registers or
+         * in slots; extract each lane from wherever it lives (the
+         * shared vector group's scalar path reads slot offsets
+         * unconditionally and is only safe for slot-resident
+         * operands -- do not copy that shortcut). */
+        int lanes = ty_lanes(t, c->vl);
+        int eb = et.bits / 8;
+        for (int i = 0; i < lanes; i++) {
+            const char *szp = eb == 1 ? "BYTE PTR" : eb == 2 ? "WORD PTR" : eb == 4 ? "DWORD PTR" : "QWORD PTR";
+            if (al->is_reg) {
+                if (et.bits == 64) {
+                    if (i == 0) E(c, "  movq r11, xmm%d", al->idx);
+                    else { E(c, "  movhlps xmm15, xmm%d", al->idx); E(c, "  movq r11, xmm15"); }
+                } else if (et.bits == 32) {
+                    if (i == 0) E(c, "  movd r11d, xmm%d", al->idx);
+                    else { E(c, "  pshufd xmm15, xmm%d, %d", al->idx, i); E(c, "  movd r11d, xmm15"); }
+                } else {
+                    E(c, "  pextr%c r11d, xmm%d, %d", et.bits == 16 ? 'w' : 'b', al->idx, i);
+                }
+            } else {
+                if (eb <= 2) E(c, "  movzx r11d, %s [rbp - %d]", szp, al->off - i * eb);
+                else if (eb == 4) E(c, "  mov r11d, DWORD PTR [rbp - %d]", al->off - i * eb);
+                else E(c, "  mov r11, QWORD PTR [rbp - %d]", al->off - i * eb);
+            }
+            if (bl->is_reg) {
+                if (et.bits == 64) {
+                    if (i == 0) E(c, "  movq rax, xmm%d", bl->idx);
+                    else { E(c, "  movhlps xmm15, xmm%d", bl->idx); E(c, "  movq rax, xmm15"); }
+                } else if (et.bits == 32) {
+                    if (i == 0) E(c, "  movd eax, xmm%d", bl->idx);
+                    else { E(c, "  pshufd xmm15, xmm%d, %d", bl->idx, i); E(c, "  movd eax, xmm15"); }
+                } else {
+                    E(c, "  pextr%c eax, xmm%d, %d", et.bits == 16 ? 'w' : 'b', bl->idx, i);
+                }
+            } else {
+                if (eb <= 2) E(c, "  movzx eax, %s [rbp - %d]", szp, bl->off - i * eb);
+                else if (eb == 4) E(c, "  mov eax, DWORD PTR [rbp - %d]", bl->off - i * eb);
+                else E(c, "  mov rax, QWORD PTR [rbp - %d]", bl->off - i * eb);
+            }
+            E(c, "  mov rcx, rax");
+            if (et.bits < 64) E(c, "  and ecx, %d", et.bits - 1);
+            E(c, "  shr r11, cl");
+            mask_r11(c, et);
+            if (dl->is_reg) {
+                if (eb == 1) E(c, "  pinsrb xmm%d, r11d, %d", dl->idx, i);
+                else if (eb == 2) E(c, "  pinsrw xmm%d, r11d, %d", dl->idx, i);
+                else if (eb == 4) E(c, "  pinsrd xmm%d, r11d, %d", dl->idx, i);
+                else E(c, "  pinsrq xmm%d, r11, %d", dl->idx, i);
+            } else {
+                const char *r = eb == 1 ? "r11b" : eb == 2 ? "r11w" : eb == 4 ? "r11d" : "r11";
+                E(c, "  mov [rbp - %d], %s", dl->off - i * eb, r);
+            }
+        }
+        break;
+    }
     case OP_VEXTRACT: {
         Type et = ty_elem(f->vtypes[in->a]);
         Loc *al = &c->bf->loc[in->a];

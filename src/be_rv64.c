@@ -688,7 +688,7 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         break;
     }
     case OP_VADD: case OP_VSUB: case OP_VMUL: case OP_VUDIV:
-    case OP_VAND: case OP_VOR: case OP_VXOR:
+    case OP_VAND: case OP_VOR: case OP_VXOR: case OP_VLSHR:
     case OP_VFADD: case OP_VFSUB: case OP_VFMUL: case OP_VFDIV: {
         Type et = ty_elem(t);
         Loc *dl = &c->bf->loc[in->result], *al = &c->bf->loc[in->a], *bl = &c->bf->loc[in->b];
@@ -709,6 +709,13 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                 E(c, "  divu x%d, x%d, x%d", T0, T0, T1);
                 E(c, "  snez x%d, x%d", T2, T1);
                 E(c, "  mul x%d, x%d, x%d", T0, T0, T2);
+            } else if (in->op == OP_VLSHR) {
+                /* Krell shift semantics take the amount modulo the
+                 * lane width; the native srl masks at 64. */
+                E(c, "  li x%d, %d", T2, et.bits);
+                E(c, "  remu x%d, x%d, x%d", T1, T1, T2);
+                E(c, "  srl x%d, x%d, x%d", T0, T0, T1);
+                mask_reg(c, T0, et);
             } else {
                 const char *nm = in->op == OP_VADD ? "add" : in->op == OP_VSUB ? "sub" :
                                  in->op == OP_VMUL ? "mul" : in->op == OP_VAND ? "and" :

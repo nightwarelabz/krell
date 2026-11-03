@@ -388,6 +388,7 @@ static void emit_instr(Ctx *c, Instr *in) {
     case OP_VAND: E(c, "  %s = and %s %s, %s", R, tb, ab, bb); break;
     case OP_VOR:  E(c, "  %s = or %s %s, %s", R, tb, ab, bb); break;
     case OP_VXOR: E(c, "  %s = xor %s %s, %s", R, tb, ab, bb); break;
+    case OP_VLSHR: E(c, "  %s = lshr %s %s, %s", R, tb, ab, bb); break;
     case OP_VEXTRACT: {
         char vb[48]; ty_str(c, f->vtypes[in->a], vb, sizeof vb);
         E(c, "  %s = extractelement %s %s, i64 %lld", R, vb, ab, (long long)in->imm);

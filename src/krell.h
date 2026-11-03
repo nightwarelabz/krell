@@ -68,6 +68,7 @@ enum {
     OP_VLOAD, OP_VSTORE, OP_VEXTRACT, OP_VINSERT,
     OP_ALOAD, OP_ASTORE, OP_AADD,
     OP_BR, OP_CONDBR, OP_RET, OP_CALL, OP_TAILCALL, OP_SELECT, OP_ASSUME,
+    OP_VLSHR,   /* appended: existing opcode numbers are binary-format */
     OP_COUNT
 };
 /* icmp predicates */

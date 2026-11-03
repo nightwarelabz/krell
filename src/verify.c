@@ -103,6 +103,7 @@ static const char *check_instr(Module *m, Func *f, Block *b, Instr *in, int idx)
         NEED(ty_is_vec(in->ty) && same_ty(VT(in->a), ty_elem(in->ty)), "vsplat element mismatch");
         break;
     case OP_VADD: case OP_VSUB: case OP_VMUL: case OP_VUDIV: case OP_VAND: case OP_VOR: case OP_VXOR:
+    case OP_VLSHR:
         NEED(ty_is_vec(in->ty) && same_ty(VT(in->a), in->ty) && same_ty(VT(in->b), in->ty), "vec binop mismatch");
         NEED(ty_elem(in->ty).kind == TY_INT, "int vec op needs int elements");
         break;

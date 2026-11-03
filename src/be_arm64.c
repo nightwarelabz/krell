@@ -634,11 +634,11 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         break;
     }
     case OP_VADD: case OP_VSUB: case OP_VMUL: case OP_VUDIV:
-    case OP_VAND: case OP_VOR: case OP_VXOR:
+    case OP_VAND: case OP_VOR: case OP_VXOR: case OP_VLSHR:
     case OP_VFADD: case OP_VFSUB: case OP_VFMUL: case OP_VFDIV: {
         Type et = ty_elem(t);
         Loc *dl = &c->bf->loc[in->result], *al = &c->bf->loc[in->a], *bl = &c->bf->loc[in->b];
-        bool scalarize = in->op == OP_VUDIV || (in->op == OP_VMUL && et.kind == TY_INT && et.bits == 64);
+        bool scalarize = in->op == OP_VUDIV || in->op == OP_VLSHR || (in->op == OP_VMUL && et.kind == TY_INT && et.bits == 64);
         if (!scalarize) {
             const char *nm;
             char arr[8];
@@ -675,6 +675,11 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                 addr_of(c, X17, bl->off - i * eb);
                 lane_load_gp(c, X17, eb);
                 if (in->op == OP_VUDIV) E(c, "  udiv x16, x16, x17");
+                else if (in->op == OP_VLSHR) {
+                    /* amount modulo the lane width (a power of two) */
+                    if (et.bits < 64) E(c, "  and x17, x17, #%d", et.bits - 1);
+                    E(c, "  lsr x16, x16, x17");
+                }
                 else E(c, "  mul x16, x16, x17");
                 mask_reg(c, X16, et);
                 addr_of(c, X17, dl->off - i * eb);

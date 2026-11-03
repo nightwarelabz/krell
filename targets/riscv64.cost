@@ -64,6 +64,7 @@ op vfdiv.v lat 80 thr 40 cliff 1
 op vand.v lat 12 thr 6
 op vor.v lat 12 thr 6
 op vxor.v lat 12 thr 6
+op vlshr.v lat 12 thr 6
 op vload.v lat 12 thr 6
 op vstore.v lat 8 thr 4
 op vextract.i lat 3 thr 1

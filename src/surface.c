@@ -319,7 +319,7 @@ static bool parse_instr(P *p, Func *f, int blk) {
     case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FDIV:
     case OP_VADD: case OP_VSUB: case OP_VMUL: case OP_VUDIV:
     case OP_VFADD: case OP_VFSUB: case OP_VFMUL: case OP_VFDIV:
-    case OP_VAND: case OP_VOR: case OP_VXOR: {
+    case OP_VAND: case OP_VOR: case OP_VXOR: case OP_VLSHR: {
         if (!parse_type(p, &ty)) return false;
         int a = parse_value(p, f, blk, ty);
         if (!eat_ch(p, ',')) { perr(p, "expected ,"); return false; }

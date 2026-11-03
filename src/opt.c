@@ -969,6 +969,8 @@ static bool opt_find_iconst(Func *f, int v, int64_t *out) {
     return false;
 }
 
+static int lr_new_value(Func *f, Type t);
+
 static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *st) {
     (void)m;
     int orig_nblocks = f->nblocks;
@@ -1163,6 +1165,12 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         }
 
         bool is_map = false;
+        bool is_gmap = false;
+        Instr *gmap_chain[24];
+        int gmap_nchain = 0;
+        int gmap_splat_src[8];
+        int gmap_nsplat = 0;
+        Instr *gmap_load = NULL;
         bool is_copy = false;
         bool is_dot = false;
         bool is_widen = false;
@@ -1241,6 +1249,134 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
                                 map_k_is_const = k_const;
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        if (!is_histo && !is_fnv && !is_map) {
+            /* General map: one load stream, one store stream, and
+             * a pure integer chain over the loaded value (the
+             * splitmix-style finalizer shape). Operands of the
+             * chain may be the loaded value, earlier chain results,
+             * constants, or loop-invariant block arguments; the
+             * constants and invariants are splatted in the
+             * preheader and the chain replays with vector ops. */
+            Instr *g_geps[2] = { NULL, NULL };
+            Instr *g_ld = NULL, *g_st = NULL;
+            Instr *g_chain[24];
+            int g_nchain = 0;
+            int g_splat[8];
+            int g_nsplat = 0;
+            bool g_lshr = false;
+            bool g_mul = false;
+            bool g_bad = false;
+            for (int i = 0; i < B->nins - 1 && !g_bad; i++) {
+                Instr *in = &B->ins[i];
+                if (in == iv_add) continue;
+                if (in->op == OP_ICONST) continue;
+                if (in->op == OP_GEP && in->b == b_iv_val) {
+                    if (g_geps[0] && g_geps[1]) { g_bad = true; break; }
+                    g_geps[g_geps[0] ? 1 : 0] = in;
+                } else if (in->op == OP_LOAD) {
+                    if (g_ld) { g_bad = true; break; }
+                    g_ld = in;
+                } else if (in->op == OP_STORE) {
+                    if (g_st) { g_bad = true; break; }
+                    g_st = in;
+                } else if (in->op == OP_ADD || in->op == OP_SUB || in->op == OP_MUL ||
+                           in->op == OP_AND || in->op == OP_OR || in->op == OP_XOR ||
+                           in->op == OP_LSHR) {
+                    if (g_nchain >= 24) { g_bad = true; break; }
+                    g_chain[g_nchain++] = in;
+                    if (in->op == OP_LSHR) g_lshr = true;
+                    if (in->op == OP_MUL) g_mul = true;
+                } else {
+                    g_bad = true; break;
+                }
+            }
+            if (!g_bad && g_geps[0] && g_geps[1] && g_ld && g_st) {
+                Instr *src_gep = (g_ld->a == g_geps[0]->result) ? g_geps[0] :
+                                 (g_ld->a == g_geps[1]->result) ? g_geps[1] : NULL;
+                Instr *dst_gep = (g_st->a == g_geps[0]->result) ? g_geps[0] :
+                                 (g_st->a == g_geps[1]->result) ? g_geps[1] : NULL;
+                if (!src_gep || !dst_gep || src_gep == dst_gep) g_bad = true;
+                if (!g_bad && (src_gep->ety.kind != TY_INT || !ty_eq(src_gep->ety, dst_gep->ety) ||
+                               !ty_eq(g_ld->ty, src_gep->ety) || !ty_eq(g_st->ty, src_gep->ety)))
+                    g_bad = true;
+                if (!g_bad && g_lshr && cost_cliff(cost, OP_VLSHR, ty_vec(src_gep->ety, 1))) g_bad = true;
+                /* A 64-bit vector multiply is a multi-instruction
+                 * decomposition on every current target (SSE2
+                 * pmuludq sequence; scalarized on AArch64), and it
+                 * measured slower than the scalar chain it replaces
+                 * (the bench's mix kernel: 1.013 scalar, 1.189
+                 * vectorized). Chains with a 64-bit multiply stay
+                 * scalar; narrower multiplies are single packed
+                 * instructions and vectorize freely. */
+                if (!g_bad && g_mul && src_gep->ety.bits == 64) g_bad = true;
+                /* chain operands and results must stay inside the chain */
+                for (int ci = 0; ci < g_nchain && !g_bad; ci++) {
+                    Instr *in = g_chain[ci];
+                    if (!ty_eq(in->ty, src_gep->ety)) { g_bad = true; break; }
+                    int ops[2] = { in->a, in->b };
+                    for (int o = 0; o < 2 && !g_bad; o++) {
+                        int v = ops[o];
+                        if (v == g_ld->result) continue;
+                        bool ok = false;
+                        for (int cj = 0; cj < ci; cj++) if (g_chain[cj]->result == v) { ok = true; break; }
+                        if (ok) continue;
+                        /* constant defined by an iconst in B, or a
+                         * loop-invariant block argument: a splat source */
+                        bool is_iconst = false;
+                        for (int k = 0; k < B->nins - 1; k++)
+                            if (B->ins[k].op == OP_ICONST && B->ins[k].result == v) { is_iconst = true; break; }
+                        bool is_invar = false;
+                        if (!is_iconst) {
+                            for (int a = 0; a < B->nargs; a++) {
+                                if (a == iv_arg_idx) continue;
+                                if (B->arg_vals[a] == v && bterm->args[a] == v && h_to_b_args[a] == H->arg_vals[a]) { is_invar = true; break; }
+                            }
+                        }
+                        if (!is_iconst && !is_invar) { g_bad = true; break; }
+                        bool dup = false;
+                        for (int s = 0; s < g_nsplat; s++) if (g_splat[s] == v) { dup = true; break; }
+                        if (!dup) {
+                            if (g_nsplat >= 8) { g_bad = true; break; }
+                            g_splat[g_nsplat++] = v;
+                        }
+                    }
+                }
+                if (!g_bad) {
+                    bool st_ok = (g_st->b == g_ld->result);
+                    for (int ci = 0; ci < g_nchain && !st_ok; ci++) if (g_st->b == g_chain[ci]->result) st_ok = true;
+                    if (!st_ok) g_bad = true;
+                }
+                if (!g_bad) {
+                    /* no chain result may escape (terminator args) */
+                    for (int ci = 0; ci < g_nchain && !g_bad; ci++) {
+                        for (int a = 0; a < bterm->nargs && !g_bad; a++)
+                            if (bterm->args[a] == g_chain[ci]->result) g_bad = true;
+                        for (int a = 0; a < bterm->nargs2 && !g_bad; a++)
+                            if (bterm->args2[a] == g_chain[ci]->result) g_bad = true;
+                    }
+                }
+                if (!g_bad) {
+                    int src_arg = -1, dst_arg = -1;
+                    for (int a = 0; a < B->nargs; a++) {
+                        if (B->arg_vals[a] == src_gep->a && h_to_b_args[a] == H->arg_vals[a] && bterm->args[a] == B->arg_vals[a]) src_arg = a;
+                        if (B->arg_vals[a] == dst_gep->a && h_to_b_args[a] == H->arg_vals[a] && bterm->args[a] == B->arg_vals[a]) dst_arg = a;
+                    }
+                    if (src_arg >= 0 && dst_arg >= 0) {
+                        is_map = true;
+                        is_gmap = true;
+                        map_src_arg_idx = src_arg;
+                        base_arg_idx = dst_arg;
+                        gep_in = dst_gep;
+                        gmap_nchain = g_nchain;
+                        for (int ci = 0; ci < g_nchain; ci++) gmap_chain[ci] = g_chain[ci];
+                        gmap_nsplat = g_nsplat;
+                        for (int s = 0; s < g_nsplat; s++) gmap_splat_src[s] = g_splat[s];
+                        gmap_load = g_ld;
                     }
                 }
             }
@@ -1514,7 +1650,7 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         if (is_swar) total_step = U * swar_W;
 
         int step_idx = (is_map || is_copy || is_dot) ? 4 : 3;
-        int num_vec_args = is_reduce ? num_acc : ((is_fill || is_map) ? 1 : 0);
+        int num_vec_args = is_reduce ? num_acc : (is_gmap ? gmap_nsplat : ((is_fill || is_map) ? 1 : 0));
         int vec_start = step_idx + 1;
         int vhead_nargs = vec_start + num_vec_args + H->nargs;
         int invar_start = vec_start + num_vec_args;
@@ -1527,6 +1663,8 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         vhead_types[step_idx] = iv_ty; /* step */
         if (is_reduce) {
             for (int u = 0; u < num_acc; u++) vhead_types[vec_start + u] = acc_ty;
+        } else if (is_gmap) {
+            for (int u = 0; u < gmap_nsplat; u++) vhead_types[vec_start + u] = vec_ty;
         } else if (is_fill || is_map) {
             vhead_types[vec_start] = vec_ty;
         }
@@ -1632,7 +1770,47 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         }
 
         int vzval = -1;
-        if (is_map) {
+        int gmap_splat_pre[8];
+        for (int s = 0; s < 8; s++) gmap_splat_pre[s] = -1;
+        if (is_gmap) {
+            /* splat each chain constant / invariant in the preheader */
+            Block *Bc = &f->blocks[body_idx];
+            for (int s = 0; s < gmap_nsplat; s++) {
+                int src = gmap_splat_src[s];
+                int64_t cv = 0;
+                int scalar = -1;
+                if (opt_find_iconst(f, src, &cv)) {
+                    /* Fresh definition in the preheader, appended
+                     * raw: emit() would return the body block's
+                     * hash-consed constant, and the loop-constant
+                     * hoist later relocates that definition into
+                     * the entry block behind this splat. */
+                    Block *pb = &f->blocks[pre_idx];
+                    Instr term = pb->ins[pb->nins - 1];
+                    pb->nins--;
+                    scalar = lr_new_value(f, elem_ty);
+                    Instr ic = ins_iconst(elem_ty, (uint64_t)cv);
+                    ic.result = scalar;
+                    if (pb->nins == pb->cap) {
+                        pb->cap = pb->cap ? pb->cap * 2 : 16;
+                        pb->ins = realloc(pb->ins, (size_t)pb->cap * sizeof(Instr));
+                    }
+                    pb->ins[pb->nins++] = ic;
+                    pb->ins[pb->nins++] = term;
+                    P = &f->blocks[pre_idx];
+                    p_term = &P->ins[P->nins - 1];
+                    p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
+                } else {
+                    for (int a = 0; a < Bc->nargs; a++)
+                        if (Bc->arg_vals[a] == src) { scalar = p_args[a]; break; }
+                }
+                Instr spl = ins_un(OP_VSPLAT, vec_ty, scalar);
+                gmap_splat_pre[s] = opt_emit_before_term(f, pre_idx, spl);
+                P = &f->blocks[pre_idx];
+                p_term = &P->ins[P->nins - 1];
+                p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
+            }
+        } else if (is_map) {
             int k_init;
             if (map_k_is_const) {
                 Instr kc = ins_iconst(elem_ty, (uint64_t)map_k_cval);
@@ -1687,6 +1865,8 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         to_vhead[step_idx] = c_tot_pre_v;
         if (is_reduce) {
             for (int u = 0; u < num_acc; u++) to_vhead[vec_start + u] = vzval;
+        } else if (is_gmap) {
+            for (int u = 0; u < gmap_nsplat; u++) to_vhead[vec_start + u] = gmap_splat_pre[u];
         } else if (is_fill || is_map) {
             to_vhead[vec_start] = vzval;
         }
@@ -1903,8 +2083,54 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
             }
             final_fnv_h = cur_h;
         } else if (is_map) {
-            int vval = VB->arg_vals[vec_start];
             int cur_s = VB->arg_vals[3];
+            if (is_gmap) {
+                for (int u = 0; u < U; u++) {
+                    int dst_ptr = cur_p;
+                    int src_ptr = cur_s;
+                    if (u > 0) {
+                        Instr gep_d = ins_bin(OP_GEP, H->arg_types[base_arg_idx], cur_p, c_u_v[u]);
+                        gep_d.ety = elem_ty;
+                        dst_ptr = emit(f, b_vbody, gep_d);
+                        Instr gep_s = ins_bin(OP_GEP, H->arg_types[map_src_arg_idx], cur_s, c_u_v[u]);
+                        gep_s.ety = elem_ty;
+                        src_ptr = emit(f, b_vbody, gep_s);
+                    }
+                    Instr vld = ins_un(OP_VLOAD, vec_ty, src_ptr);
+                    vld.ety = elem_ty;
+                    int vx = emit(f, b_vbody, vld);
+                    int mapped[24];
+                    int cur = vx;
+                    for (int ci = 0; ci < gmap_nchain; ci++) {
+                        Instr *cin = gmap_chain[ci];
+                        int ops[2] = { cin->a, cin->b };
+                        int vops[2];
+                        for (int o = 0; o < 2; o++) {
+                            int v = ops[o];
+                            if (v == gmap_load->result) { vops[o] = vx; continue; }
+                            vops[o] = -1;
+                            for (int cj = 0; cj < ci; cj++)
+                                if (gmap_chain[cj]->result == v) { vops[o] = mapped[cj]; break; }
+                            if (vops[o] < 0)
+                                for (int s = 0; s < gmap_nsplat; s++)
+                                    if (gmap_splat_src[s] == v) { vops[o] = VB->arg_vals[vec_start + s]; break; }
+                        }
+                        int vop = cin->op == OP_ADD ? OP_VADD :
+                                  cin->op == OP_SUB ? OP_VSUB :
+                                  cin->op == OP_MUL ? OP_VMUL :
+                                  cin->op == OP_AND ? OP_VAND :
+                                  cin->op == OP_OR  ? OP_VOR  :
+                                  cin->op == OP_XOR ? OP_VXOR : OP_VLSHR;
+                        Instr ve = ins_bin((uint8_t)vop, vec_ty, vops[0], vops[1]);
+                        cur = emit(f, b_vbody, ve);
+                        mapped[ci] = cur;
+                    }
+                    Instr vst = ins_bin(OP_VSTORE, ty_void(), dst_ptr, cur);
+                    vst.ety = elem_ty;
+                    emit(f, b_vbody, vst);
+                }
+            } else {
+            int vval = VB->arg_vals[vec_start];
             for (int u = 0; u < U; u++) {
                 int dst_ptr = cur_p;
                 int src_ptr = cur_s;
@@ -1929,6 +2155,7 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
                 Instr vst = ins_bin(OP_VSTORE, ty_void(), dst_ptr, sum);
                 vst.ety = elem_ty;
                 emit(f, b_vbody, vst);
+            }
             }
         } else if (is_copy) {
             int cur_s = VB->arg_vals[3];
