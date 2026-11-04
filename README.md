@@ -133,6 +133,20 @@ sumsq 1.95× / 1.80×, span 1.69× / 1.38×, dot 1.29× / 1.79×,
 parse 1.07× / 1.03×, mix 1.06× / 0.98×, fnv1a 1.00× / 1.00×,
 histo 1.00× / 1.01×.
 
+Two optimization rounds have landed since that run. WP19 raised the
+optimizer's unroll factor for 64-bit scalar reductions (dot, sumsq),
+widened the counted-loop unroller, strength-reduced small constant
+multiplies in the x86_64 emitter (LEA and shift forms in place of
+imul), and aligned function entries and loop heads to 16 bytes.
+WP20 taught the x86_64 emitter to fold chains of address adds into
+addressing displacements, skipping the intermediate adds entirely.
+Measured by interleaved A/B against the previous compiler with
+identical checksums, WP19 brought dot ~+15% and sumsq ~+25%, and
+WP20 brought sumsq a further ~+10%, mix ~+10%, and span ~+4%, with
+parse byte-identical. A KRELLPROOF record incorporating both rounds
+is pending a certified draw; the table above remains the current
+record.
+
 The full record — kernels, C references, methodology, per-run
 results and charts — lives in the
 [krellproof](https://github.com/nightwarelabz/krellproof)
