@@ -1920,6 +1920,43 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         E(c, "  jmp %s", name);
         break;
     }
+    case OP_FUNCP: {
+        /* the function's address in r11, then home. For an extern the
+         * symbol may live in a shared object: a GOT-relative load
+         * yields the right address on every link. */
+        if (in->callee_extern) E(c, "  mov r11, qword ptr [rip + %s@GOTPCREL]", c->m->exts[in->callee].name);
+        else E(c, "  lea r11, [rip + %s]", c->m->funcs[in->callee].name);
+        store_gp(c, in->result, R11);
+        break;
+    }
+    case OP_CALLI: {
+        Sig *g = &c->m->sigs[in->callee];
+        emit_call_args(c, in, g->params, false);
+        load_gp(c, R11, in->a);
+        E(c, "  call r11");
+        if (t.kind != TY_VOID) {
+            if (be_class_of(t) == BCLS_FP) store_fp(c, in->result, 0);
+            else if (be_class_of(t) == BCLS_MEM128) {
+                store128_half(c, in->result, RAX, 0);
+                store128_half(c, in->result, RDX, 1);
+            }
+            else store_gp(c, in->result, RAX);
+        }
+        break;
+    }
+    case OP_TAILCALLI: {
+        /* the pointer operand's home may be an argument register the
+         * setup overwrites, so park it on the stack first (all arg
+         * addressing is rbp-relative; the epilogue resets rsp) */
+        Sig *g = &c->m->sigs[in->callee];
+        load_gp(c, R11, in->a);
+        E(c, "  push r11");
+        emit_call_args(c, in, g->params, true);
+        E(c, "  pop r11");
+        emit_epilogue(c);
+        E(c, "  jmp r11");
+        break;
+    }
     case OP_SELECT: {
         int L = ++c->lbl;
         /* false arm first: copy_value routes through r11, so the condition

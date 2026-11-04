@@ -559,5 +559,57 @@ Module *build_battery(void) {
         for (int i = 0; i < 16; i++) r = B(f, b, OP_ADD, ty_i64(), r, vs[i]);
         emit(f, b, ins_ret(r));
     }
+    /* 34 tadd/tmul: indirect-call targets (no driver cases of their own) */
+    {
+        Func *f = mod_add_func(m, "tadd", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_i64(), ty_i64() }, 2);
+        emit(f, b, ins_ret(B(f, b, OP_ADD, ty_i64(), ARG(f, b, 0), ARG(f, b, 1))));
+    }
+    {
+        Func *f = mod_add_func(m, "tmul", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_i64(), ty_i64() }, 2);
+        emit(f, b, ins_ret(B(f, b, OP_MUL, ty_i64(), ARG(f, b, 0), ARG(f, b, 1))));
+    }
+    /* 35 vtable(i64 sel, i64 x) -> i64 : a two-entry function-pointer
+     * table in an alloca, indexed, loaded, and called indirectly */
+    {
+        int sg = mod_add_sig(m, (Type[]){ ty_i64(), ty_i64() }, 2, ty_i64());
+        Func *f = mod_add_func(m, "vtable", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_i64(), ty_i64() }, 2);
+        int sel = ARG(f, b, 0), x = ARG(f, b, 1);
+        Instr al = ins_make(OP_ALLOCA, ty_ptr()); al.imm = 16; al.c = 8;
+        int cell = emit(f, b, al);
+        int pa = emit(f, b, ins_funcptr(mod_find_func(m, "tadd"), false));
+        Instr st0 = ins_make(OP_STORE, ty_ptr()); st0.a = cell; st0.b = pa;
+        emit(f, b, st0);
+        Instr g1 = ins_make(OP_GEP, ty_ptr()); g1.a = cell; g1.b = K(f, b, ty_i64(), 1); g1.ety = ty_ptr();
+        int slot1 = emit(f, b, g1);
+        int pb = emit(f, b, ins_funcptr(mod_find_func(m, "tmul"), false));
+        Instr st1 = ins_make(OP_STORE, ty_ptr()); st1.a = slot1; st1.b = pb;
+        emit(f, b, st1);
+        int idx = B(f, b, OP_AND, ty_i64(), sel, K(f, b, ty_i64(), 1));
+        Instr gs = ins_make(OP_GEP, ty_ptr()); gs.a = cell; gs.b = idx; gs.ety = ty_ptr();
+        int slot = emit(f, b, gs);
+        Instr ld = ins_make(OP_LOAD, ty_ptr()); ld.a = slot;
+        int fp = emit(f, b, ld);
+        int r = emit(f, b, ins_calli(ty_i64(), sg, fp, ids_dup((int32_t[]){ x, K(f, b, ty_i64(), 10) }, 2), 2, false));
+        emit(f, b, ins_ret(r));
+    }
+    /* 36 vtail(i64 sel, i64 x) -> i64 : funcptr chosen by select,
+     * dispatched with an indirect tail call */
+    {
+        int sg = mod_add_sig(m, (Type[]){ ty_i64(), ty_i64() }, 2, ty_i64());
+        Func *f = mod_add_func(m, "vtail", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_i64(), ty_i64() }, 2);
+        int sel = ARG(f, b, 0), x = ARG(f, b, 1);
+        int pa = emit(f, b, ins_funcptr(mod_find_func(m, "tadd"), false));
+        int pb = emit(f, b, ins_funcptr(mod_find_func(m, "tmul"), false));
+        int bit = B(f, b, OP_AND, ty_i64(), sel, K(f, b, ty_i64(), 1));
+        Instr sc = ins_make(OP_ICMP, ty_i1()); sc.a = bit; sc.b = K(f, b, ty_i64(), 0); sc.pred = IC_NE;
+        int cond = emit(f, b, sc);
+        Instr sl = ins_make(OP_SELECT, ty_ptr()); sl.a = cond; sl.b = pb; sl.c = pa;
+        int fp = emit(f, b, sl);
+        emit(f, b, ins_calli(ty_i64(), sg, fp, ids_dup((int32_t[]){ x, K(f, b, ty_i64(), 7) }, 2), 2, true));
+    }
     return m;
 }

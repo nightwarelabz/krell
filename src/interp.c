@@ -77,6 +77,37 @@ static int ierr(Interp *it, const char *msg) { snprintf(it->err, sizeof it->err,
 /* ---------- scalar helpers ---------- */
 static uint64_t msk(int bits) { return bits >= 64 ? ~0ull : ((1ull << bits) - 1ull); }
 static unsigned __int128 val128(const uint64_t *L) { return ((unsigned __int128)L[1] << 64) | (unsigned __int128)L[0]; }
+
+/* indirect calls (v3.0): funcptr materializes a synthetic code
+ * address - internal functions at 0xF0000000 + 16*idx, externs at
+ * 0xF1000000 + 16*idx, disjoint from the flat data memory. A calli
+ * decodes the address back to a target, then checks the target's own
+ * signature against the call site's signature-table entry: a
+ * mismatch is a producer contract breach and is reported, as is a
+ * call through anything that is not a function address at all. */
+#define SYNTH_FN_BASE 0xF0000000ull
+#define SYNTH_EX_BASE 0xF1000000ull
+static const char *resolve_calli(Interp *it, uint64_t addr, int sigidx, int *callee, bool *ext) {
+    Module *m = it->m;
+    int idx; bool isext;
+    if (addr >= SYNTH_FN_BASE && addr < SYNTH_EX_BASE && ((addr - SYNTH_FN_BASE) & 15) == 0) {
+        idx = (int)((addr - SYNTH_FN_BASE) / 16); isext = false;
+        if (idx >= m->nfuncs) return "interp: calli target is not a function pointer";
+    } else if (addr >= SYNTH_EX_BASE && addr < SYNTH_EX_BASE + 0x100000 && ((addr - SYNTH_EX_BASE) & 15) == 0) {
+        idx = (int)((addr - SYNTH_EX_BASE) / 16); isext = true;
+        if (idx >= m->nexts) return "interp: calli target is not a function pointer";
+    } else return "interp: calli target is not a function pointer";
+    if (sigidx < 0 || sigidx >= m->nsigs) return "interp: calli signature index out of range";
+    Sig *g = &m->sigs[sigidx];
+    const Type *ps; int np; Type rt;
+    if (isext) { ps = m->exts[idx].params; np = m->exts[idx].nparams; rt = m->exts[idx].ret; }
+    else { Func *tg = &m->funcs[idx]; ps = tg->blocks[0].arg_types; np = tg->blocks[0].nargs; rt = tg->ret; }
+    if (np != g->nparams || !ty_eq(rt, g->ret)) return "interp: calli signature mismatch (producer contract breach)";
+    for (int i = 0; i < np; i++)
+        if (!ty_eq(ps[i], g->params[i])) return "interp: calli signature mismatch (producer contract breach)";
+    *callee = idx; *ext = isext;
+    return NULL;
+}
 static void put128(uint64_t *L, unsigned __int128 v) { L[0] = (uint64_t)v; L[1] = (uint64_t)(v >> 64); }
 static int64_t sx(uint64_t v, int bits) {
     if (bits >= 64) return (int64_t)v;
@@ -489,6 +520,33 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
             memcpy(it->mem + A[0], &nv, n);
             break;
         }
+        case OP_FUNCP:
+            R[0] = (in->callee_extern ? SYNTH_EX_BASE : SYNTH_FN_BASE) + 16ull * (uint64_t)in->callee;
+            break;
+        case OP_CALLI: {
+            int tc; bool tx;
+            const char *re = resolve_calli(it, A[0], in->callee, &tc, &tx);
+            if (re) return ierr(it, re);
+            IVal *cargs = malloc(sizeof(IVal) * (size_t)(in->nargs ? in->nargs : 1));
+            for (int i = 0; i < in->nargs; i++) cargs[i].lanes = fr->lanes[in->args[i]];
+            int rc;
+            if (tx) {
+                Extern *e = &it->m->exts[tc];
+                HostFn hf = NULL; void *ctx = NULL;
+                for (int h = 0; h < it->nhosts; h++)
+                    if (strcmp(it->hosts[h].name, e->name) == 0) { hf = it->hosts[h].fn; ctx = it->hosts[h].ctx; break; }
+                if (!hf) { free(cargs); return ierr(it, "interp: unresolved extern"); }
+                IVal rv; rv.lanes = R;
+                hf(it, ctx, cargs, in->nargs, &rv);
+                rc = 0;
+            } else {
+                IVal rv; rv.lanes = R;
+                rc = run_func(it, tc, cargs, in->nargs, in->ty.kind == TY_VOID ? NULL : &rv);
+            }
+            free(cargs);
+            if (rc) return rc;
+            break;
+        }
         case OP_CALL: {
             IVal *cargs = malloc(sizeof(IVal) * (size_t)(in->nargs ? in->nargs : 1));
             for (int i = 0; i < in->nargs; i++) cargs[i].lanes = fr->lanes[in->args[i]];
@@ -536,7 +594,7 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
             *done = true;
             return 0;
         }
-        case OP_TAILCALL: {
+        case OP_TAILCALL: case OP_TAILCALLI: {
             /* handled by run_func loop: signal via special state */
             *next_blk = -2;
             /* stash call info in pend: encode callee/args into static slots */
@@ -595,8 +653,13 @@ static int run_func(Interp *it, int fi, const IVal *args, int nargs, IVal *ret) 
             if (rc || done) break;
             if (next_blk == -2) {
                 Instr *in = (Instr *)pend;   /* the TAILCALL instruction */
-                if (in->callee_extern) {
-                    Extern *e = &it->m->exts[in->callee];
+                int tcal = in->callee; bool text = in->callee_extern != 0;
+                if (in->op == OP_TAILCALLI) {
+                    const char *re = resolve_calli(it, fr.lanes[in->a][0], in->callee, &tcal, &text);
+                    if (re) { rc = ierr(it, re); frame_free(&fr); break; }
+                }
+                if (text) {
+                    Extern *e = &it->m->exts[tcal];
                     HostFn hf = NULL; void *ctx = NULL;
                     for (int h = 0; h < it->nhosts; h++)
                         if (strcmp(it->hosts[h].name, e->name) == 0) { hf = it->hosts[h].fn; ctx = it->hosts[h].ctx; break; }
@@ -615,11 +678,11 @@ static int run_func(Interp *it, int fi, const IVal *args, int nargs, IVal *ret) 
                 /* snapshot the callee's arguments, release the frame, loop */
                 IVal *snap = malloc(sizeof(IVal) * (size_t)(in->nargs ? in->nargs : 1));
                 for (int i = 0; i < in->nargs; i++) snap[i].lanes = fr.lanes[in->args[i]];
-                IVal *na = args_copy(&it->m->funcs[in->callee], snap, in->nargs);
+                IVal *na = args_copy(&it->m->funcs[tcal], snap, in->nargs);
                 free(snap);
                 frame_free(&fr);
                 args_free(cur_args, cur_nargs);
-                cur_args = na; cur_nargs = in->nargs; cur_fi = in->callee;
+                cur_args = na; cur_nargs = in->nargs; cur_fi = tcal;
                 tailed = true;
                 break;
             }

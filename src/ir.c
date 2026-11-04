@@ -38,6 +38,7 @@ static const char *OPNAMES[OP_COUNT] = {
     [OP_ACMPXCHG]="acmpxchg", [OP_AXCHG]="axchg", [OP_ASUB]="asub",
     [OP_AAND]="aand", [OP_AOR]="aor", [OP_AXOR]="axor",
     [OP_AMINS]="amins", [OP_AMAXS]="amaxs", [OP_AMINU]="aminu", [OP_AMAXU]="amaxu",
+    [OP_FUNCP]="funcptr", [OP_CALLI]="calli", [OP_TAILCALLI]="tailcalli",
 };
 const char *op_name(int op) {
     if (op <= 0 || op >= OP_COUNT || !OPNAMES[op]) return "?op";
@@ -45,7 +46,7 @@ const char *op_name(int op) {
 }
 
 bool op_is_terminator(int op) {
-    return op == OP_BR || op == OP_CONDBR || op == OP_RET || op == OP_TAILCALL;
+    return op == OP_BR || op == OP_CONDBR || op == OP_RET || op == OP_TAILCALL || op == OP_TAILCALLI;
 }
 bool op_is_rmw(int op) {
     switch (op) {
@@ -64,6 +65,7 @@ bool op_is_pure(int op) {
     case OP_VSTORE: case OP_ALLOCA: case OP_LOADV: case OP_STOREV: case OP_FENCE:
     case OP_ACMPXCHG: case OP_AXCHG: case OP_ASUB: case OP_AAND: case OP_AOR:
     case OP_AXOR: case OP_AMINS: case OP_AMAXS: case OP_AMINU: case OP_AMAXU:
+    case OP_CALLI: case OP_TAILCALLI:
         return false;
     default:
         return true;
@@ -96,6 +98,8 @@ void mod_free(Module *m) {
     free(m->exts);
     for (int i = 0; i < m->ndata; i++) { free(m->data[i].name); free(m->data[i].bytes); }
     free(m->data);
+    for (int i = 0; i < m->nsigs; i++) free(m->sigs[i].params);
+    free(m->sigs);
     free(m);
 }
 
@@ -111,6 +115,27 @@ int mod_add_extern(Module *m, const char *name, const Type *params, int n, Type 
     e->nparams = n;
     e->ret = ret;
     return m->nexts++;
+}
+
+int mod_add_sig(Module *m, const Type *params, int n, Type ret) {
+    for (int i = 0; i < m->nsigs; i++) {
+        Sig *g = &m->sigs[i];
+        if (g->nparams == n && ty_eq(g->ret, ret)) {
+            bool same = true;
+            for (int j = 0; j < n; j++) if (!ty_eq(g->params[j], params[j])) { same = false; break; }
+            if (same) return i;
+        }
+    }
+    if (m->nsigs == m->capsigs) {
+        m->capsigs = m->capsigs ? m->capsigs * 2 : 8;
+        m->sigs = realloc(m->sigs, (size_t)m->capsigs * sizeof(Sig));
+    }
+    Sig *g = &m->sigs[m->nsigs];
+    g->params = malloc(sizeof(Type) * (size_t)(n ? n : 1));
+    for (int j = 0; j < n; j++) g->params[j] = params[j];
+    g->nparams = n;
+    g->ret = ret;
+    return m->nsigs++;
 }
 
 int mod_add_data(Module *m, const char *name, uint32_t align, const void *bytes, uint32_t len) {
@@ -219,6 +244,16 @@ Instr ins_call(Type ret, int callee, bool ext, int32_t *args, int n, bool tail) 
     in.callee = callee; in.callee_extern = ext ? 1 : 0;
     in.args = args; in.nargs = (uint16_t)n; return in;
 }
+Instr ins_funcptr(int callee, bool ext) {
+    Instr in = ins_make(OP_FUNCP, ty_ptr());
+    in.callee = callee; in.callee_extern = ext ? 1 : 0;
+    return in;
+}
+Instr ins_calli(Type ret, int sig, int fp, int32_t *args, int n, bool tail) {
+    Instr in = ins_make(tail ? OP_TAILCALLI : OP_CALLI, ret);
+    in.callee = sig; in.a = fp;
+    in.args = args; in.nargs = (uint16_t)n; return in;
+}
 int32_t *ids_dup(const int32_t *src, int n) {
     if (n <= 0) return NULL;
     int32_t *p = malloc(sizeof(int32_t) * (size_t)n);
@@ -306,12 +341,15 @@ static uint64_t hash_ins(const Instr *in) {
     h = (h ^ (uint64_t)in->imm2) * 1099511628211ull;
     h = (h ^ (uint64_t)in->pred) * 1099511628211ull;
     h = (h ^ (uint64_t)in->aux) * 1099511628211ull;
+    h = (h ^ (uint64_t)(uint32_t)in->callee) * 1099511628211ull;
+    h = (h ^ (uint64_t)in->callee_extern) * 1099511628211ull;
     return h;
 }
 static bool ins_eq(const Instr *x, const Instr *y) {
     return x->op == y->op && ty_pack(x->ty) == ty_pack(y->ty) &&
            x->a == y->a && x->b == y->b && x->c == y->c &&
-           x->imm == y->imm && x->imm2 == y->imm2 && x->pred == y->pred && x->aux == y->aux;
+           x->imm == y->imm && x->imm2 == y->imm2 && x->pred == y->pred && x->aux == y->aux &&
+           x->callee == y->callee && x->callee_extern == y->callee_extern;
 }
 static ConsTab *cons_tab(Func *f) {
     if (!f->cons) {

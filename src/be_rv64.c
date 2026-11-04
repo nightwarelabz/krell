@@ -1133,6 +1133,37 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         E(c, "  tail %s", name);
         break;
     }
+    case OP_FUNCP: {
+        if (in->callee_extern) E(c, "  la x%d, %s", T0, c->m->exts[in->callee].name);
+        else E(c, "  la x%d, %s", T0, c->m->funcs[in->callee].name);
+        store_gp(c, in->result, T0);
+        break;
+    }
+    case OP_CALLI: {
+        Sig *g = &c->m->sigs[in->callee];
+        emit_call_args(c, in, g->params, false);
+        load_gp(c, T1, in->a);
+        E(c, "  jalr ra, 0(x%d)", T1);
+        if (t.kind != TY_VOID) {
+            if (be_class_of(t) == BCLS_FP) store_fp(c, in->result, 10);
+            else if (be_class_of(t) == BCLS_MEM128) {
+                store128_half(c, in->result, 10, 0);
+                store128_half(c, in->result, 11, 1);
+            }
+            else store_gp(c, in->result, 10);
+        }
+        break;
+    }
+    case OP_TAILCALLI: {
+        /* t2 survives emit_call_args (its scratch is t0/t1); park the
+         * target there before the setup */
+        Sig *g = &c->m->sigs[in->callee];
+        load_gp(c, T2, in->a);
+        emit_call_args(c, in, g->params, true);
+        emit_epilogue(c);
+        E(c, "  jalr x0, 0(x%d)", T2);
+        break;
+    }
     case OP_ASSUME: break;
     case OP_FENCE:
         if (in->aux == AO_ACQUIRE) E(c, "  fence r, rw");

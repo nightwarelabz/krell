@@ -1057,6 +1057,43 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         E(c, "  b %s", name);
         break;
     }
+    case OP_FUNCP: {
+        if (in->callee_extern) {
+            E(c, "  adrp x16, %s@GOTPAGE", c->m->exts[in->callee].name);
+            E(c, "  ldr x16, [x16, %s@GOTPAGEOFF]", c->m->exts[in->callee].name);
+        } else {
+            E(c, "  adrp x16, %s", c->m->funcs[in->callee].name);
+            E(c, "  add x16, x16, :lo12:%s", c->m->funcs[in->callee].name);
+        }
+        store_gp(c, in->result, X16);
+        break;
+    }
+    case OP_CALLI: {
+        Sig *g = &c->m->sigs[in->callee];
+        emit_call_args(c, in, g->params, false);
+        load_gp(c, X16, in->a);
+        E(c, "  blr x16");
+        if (t.kind != TY_VOID) {
+            if (be_class_of(t) == BCLS_FP) store_fp(c, in->result, 0);
+            else if (be_class_of(t) == BCLS_MEM128) {
+                store128_half(c, in->result, 0, 0);
+                store128_half(c, in->result, 1, 1);
+            }
+            else store_gp(c, in->result, 0);
+        }
+        break;
+    }
+    case OP_TAILCALLI: {
+        /* x17 survives emit_call_args (its scratch is x16) and the
+         * epilogue; park the target there before the setup, which may
+         * overwrite the pointer operand's home */
+        Sig *g = &c->m->sigs[in->callee];
+        load_gp(c, X17, in->a);
+        emit_call_args(c, in, g->params, true);
+        emit_epilogue(c);
+        E(c, "  br x17");
+        break;
+    }
     case OP_ASSUME: break;
     case OP_FENCE:
         if (in->aux == AO_ACQUIRE) E(c, "  dmb ishld");

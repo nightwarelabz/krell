@@ -65,6 +65,8 @@ static const FSpec FUNCS[] = {
     { "vecext",  1, { AK_PTR }, RK_GP },
     { "gepneg",  1, { AK_PTR }, RK_GP },
     { "w128",    2, { AK_GP, AK_GP }, RK_GP },
+    { "vtable",  2, { AK_GP, AK_GP }, RK_GP },
+    { "vtail",   2, { AK_GP, AK_GP }, RK_GP },
 };
 #define NFUNC (sizeof(FUNCS) / sizeof(FUNCS[0]))
 static int func_index(const char *name) {
@@ -257,6 +259,10 @@ static void gen_cases(void) {
         push_bcase("rmw8", (uint64_t[]){ 0, rnd() });
     for (int i = 0; i < 12; i++)
         push_scalar("w128", (uint64_t[]){ rnd(), rnd() });
+    for (int i = 0; i < 12; i++)
+        push_scalar("vtable", (uint64_t[]){ (uint64_t)i, rnd() });
+    for (int i = 0; i < 12; i++)
+        push_scalar("vtail", (uint64_t[]){ (uint64_t)i, rnd() });
     for (int i = 0; i < 12; i++)
         push_bcase("vecadd", (uint64_t[]){ 128, 0 });
     for (int i = 0; i < 12; i++)

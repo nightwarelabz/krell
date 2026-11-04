@@ -177,6 +177,25 @@ static const char *check_instr(Module *m, Func *f, Block *b, Instr *in, int idx)
         if (f->ret.kind == TY_VOID) NEED(in->a == -1, "void function returns a value");
         else { NEED(in->a >= 0, "missing return value"); NEED(same_ty(VT(in->a), f->ret), "return type mismatch"); }
         break;
+    case OP_FUNCP:
+        if (in->callee_extern) NEED(in->callee >= 0 && in->callee < m->nexts, "funcptr extern index out of range");
+        else NEED(in->callee >= 0 && in->callee < m->nfuncs, "funcptr function index out of range");
+        NEED(in->ty.kind == TY_PTR, "funcptr result must be ptr");
+        break;
+    case OP_CALLI: case OP_TAILCALLI: {
+        NEED(VT(in->a).kind == TY_PTR, "calli target operand must be ptr");
+        NEED(in->callee >= 0 && in->callee < m->nsigs, "calli signature index out of range");
+        Sig *g = &m->sigs[in->callee];
+        NEED(in->nargs == g->nparams, "calli argument count mismatch with signature");
+        for (int i = 0; i < g->nparams; i++)
+            NEED(same_ty(VT(in->args[i]), g->params[i]), "calli argument type mismatch with signature");
+        NEED(same_ty(in->ty, g->ret), "calli result type mismatch with signature");
+        if (op == OP_TAILCALLI) {
+            NEED(idx == (int)b->nins - 1, "tailcalli must terminate its block");
+            NEED(same_ty(in->ty, f->ret), "tailcalli result type must match the enclosing function's return");
+        }
+        break;
+    }
     case OP_CALL: case OP_TAILCALL: {
         const Type *ps; int np; Type rt;
         if (in->callee_extern) {
@@ -333,6 +352,7 @@ const char *mod_verify_target(Module *m, const char *target) {
                 Instr *in = &b->ins[ii];
                 switch (in->op) {
                 case OP_BR: case OP_CONDBR: case OP_RET: case OP_CALL: case OP_TAILCALL:
+                case OP_CALLI: case OP_TAILCALLI:
                 case OP_ICONST: case OP_FCONST: case OP_FREEZE: case OP_ASSUME: case OP_DATAPTR:
                     continue;
                 default: break;

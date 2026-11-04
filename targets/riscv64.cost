@@ -113,3 +113,4 @@ op udiv.i128 lat 40 thr 1 cliff 1
 op sdiv.i128 lat 44 thr 1 cliff 1
 op urem.i128 lat 40 thr 1 cliff 1
 op srem.i128 lat 44 thr 1 cliff 1
+op funcptr.i lat 1 thr 1

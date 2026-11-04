@@ -171,7 +171,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
             Instr *in = &bl->ins[i];
             int p = be_pos(bf, b, i);
             if (in->result >= 0) { bf->defpos[in->result] = p; bf->endpos[in->result] = p; }
-            if (in->op == OP_CALL || in->op == OP_FMA || in->op == OP_MEMCPY || in->op == OP_MEMSET) {
+            if (in->op == OP_CALL || in->op == OP_CALLI || in->op == OP_FMA || in->op == OP_MEMCPY || in->op == OP_MEMSET) {
                 /* FMA/memcpy/memset lower to libcalls on some targets: any
                  * value live across them must survive a call */
                 if (ncall == callcap) { callcap = callcap ? callcap * 2 : 16; callpos = realloc(callpos, sizeof(int) * (size_t)callcap); }
@@ -278,7 +278,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
     for (int b = 0; b < f->nblocks; b++)
         for (int i = 0; i < f->blocks[b].nins; i++) {
             Instr *in = &f->blocks[b].ins[i];
-            if ((in->op == OP_CALL || in->op == OP_TAILCALL) && in->nargs > out_slots) out_slots = in->nargs;
+            if ((in->op == OP_CALL || in->op == OP_TAILCALL || in->op == OP_CALLI || in->op == OP_TAILCALLI) && in->nargs > out_slots) out_slots = in->nargs;
         }
     /* layout intent: allocation below decides slot indices; offsets computed
      * after allocation once we know how many slots are actually used. To keep
@@ -483,7 +483,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
                 Instr *dd = defins[iv->v];
                 if (pv >= 0 && pv != iv->v &&
                     bf->vclass[pv] == cls && bf->loc[pv].is_reg && bf->loc[pv].cls == cls &&
-                    dd->op != OP_CALL && dd->op != OP_TAILCALL && dd->op != OP_FMA &&
+                    dd->op != OP_CALL && dd->op != OP_TAILCALL && dd->op != OP_CALLI && dd->op != OP_TAILCALLI && dd->op != OP_FMA &&
                     dd->op != OP_MEMCPY && dd->op != OP_MEMSET && dd->op != OP_ALLOCA) {
                     Block *sb = &f->blocks[defblk[iv->v]];
                     Instr *term = &sb->ins[sb->nins - 1];
@@ -741,7 +741,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
         for (int b = 0; b < f->nblocks; b++)
             for (int i = 0; i < f->blocks[b].nins; i++) {
                 Instr *in = &f->blocks[b].ins[i];
-                if ((in->op == OP_CALL || in->op == OP_TAILCALL) && in->nargs * 8 > outb) outb = in->nargs * 8;
+                if ((in->op == OP_CALL || in->op == OP_TAILCALL || in->op == OP_CALLI || in->op == OP_TAILCALLI) && in->nargs * 8 > outb) outb = in->nargs * 8;
             }
         int frame = slot_base + total_scalar_slots * 8 + vec_unit_total * 16 + alloca_bytes + outb;
         frame = (frame + 15) & ~15;

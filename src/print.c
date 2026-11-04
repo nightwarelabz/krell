@@ -53,6 +53,13 @@ static void ins_dump(Func *f, Instr *in, FILE *out) {
         fprintf(out, " %s%d(", in->callee_extern ? "@" : "fn", in->callee);
         val_list(out, in->args, in->nargs); fputc(')', out);
         break;
+    case OP_FUNCP:
+        fprintf(out, " %s%d", in->callee_extern ? "@" : "fn", in->callee);
+        break;
+    case OP_CALLI: case OP_TAILCALLI:
+        fprintf(out, " sig%d %%%d(", in->callee, in->a);
+        val_list(out, in->args, in->nargs); fputc(')', out);
+        break;
     case OP_ALLOCA: fprintf(out, " %lld, align %d", (long long)in->imm, in->c); break;
     case OP_DATAPTR: fprintf(out, " data%d", (int)in->imm); break;
     case OP_GEP:

@@ -75,6 +75,9 @@ enum {
     OP_ACMPXCHG,          /* v3: atomic compare-exchange, a=ptr b=expected c=desired, aux = AO_* */
     OP_AXCHG, OP_ASUB, OP_AAND, OP_AOR, OP_AXOR,   /* v3: RMW family, a=ptr b=operand, aux = AO_* */
     OP_AMINS, OP_AMAXS, OP_AMINU, OP_AMAXU,        /* v3: RMW signed/unsigned min/max */
+    OP_FUNCP,                 /* v3: address of a function as a ptr value; callee/callee_extern select it */
+    OP_CALLI,                 /* v3: indirect call; a = ptr operand, callee = signature-table index */
+    OP_TAILCALLI,             /* v3: indirect tail call (terminator), same fields */
     OP_COUNT
 };
 /* icmp predicates */
@@ -149,10 +152,20 @@ typedef struct {
     uint32_t len;
 } DataBlob;
 
+/* a function signature in the module signature table (v3): indirect
+ * calls dispatch through a table entry, so a call site's expected
+ * signature is a module-level fact the verifier can check and the
+ * interpreter can enforce */
+typedef struct {
+    Type *params; int nparams;
+    Type  ret;
+} Sig;
+
 typedef struct Module {
     Func    *funcs;  int nfuncs,  capfuncs;
     Extern  *exts;   int nexts,   capexts;
     DataBlob *data;  int ndata,   capdata;
+    Sig     *sigs;   int nsigs,   capsigs;
 } Module;
 
 /* ---------------- builder (ir.c) ---------------- */
@@ -160,6 +173,7 @@ Module *mod_new(void);
 void    mod_free(Module *m);
 int     mod_add_extern(Module *m, const char *name, const Type *params, int n, Type ret);
 int     mod_add_data(Module *m, const char *name, uint32_t align, const void *bytes, uint32_t len);
+int     mod_add_sig(Module *m, const Type *params, int n, Type ret);   /* deduplicated; returns table index */
 Func   *mod_add_func(Module *m, const char *name, Type ret, uint8_t flags);
 int     mod_find_func(Module *m, const char *name);
 int     mod_find_extern(Module *m, const char *name);
@@ -178,6 +192,8 @@ Instr   ins_br(int blk, int32_t *args, int n);
 Instr   ins_condbr(int cond, int b1, int32_t *a1, int n1, int b2, int32_t *a2, int n2);
 Instr   ins_ret(int v);          /* v = -1 for void */
 Instr   ins_call(Type ret, int callee, bool ext, int32_t *args, int n, bool tail);
+Instr   ins_funcptr(int callee, bool ext);                              /* OP_FUNCP */
+Instr   ins_calli(Type ret, int sig, int fp, int32_t *args, int n, bool tail);
 int32_t *ids_dup(const int32_t *src, int n);
 Type     func_value_type(Func *f, int32_t v);
 void     func_rebuild_constants(Func *f);

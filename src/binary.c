@@ -39,6 +39,7 @@ static int fmt_ver = 1;
 
 static bool ty_is_i128(Type t) { return t.kind == TY_INT && t.bits == 128; }
 static bool mod_needs_v2(Module *m) {
+    if (m->nsigs > 0) return true;   /* the SIGS section is a v2 feature */
     for (int i = 0; i < m->nexts; i++) {
         for (int j = 0; j < m->exts[i].nparams; j++) if (ty_is_i128(m->exts[i].params[j])) return true;
         if (ty_is_i128(m->exts[i].ret)) return true;
@@ -85,6 +86,20 @@ static void bins(Buf *b, const Instr *in) {
         buleb(b, (uint64_t)in->callee); bput(b, in->callee_extern);
         buleb(b, in->nargs);
         for (int i = 0; i < in->nargs; i++) bval(b, in->args[i]);
+        return;
+    }
+    if (op == OP_CALLI || op == OP_TAILCALLI) {
+        /* call payload form, plus the pointer operand; the flag byte
+         * is written 0 (indirect calls have no extern bit) */
+        buleb(b, (uint64_t)in->callee); bput(b, 0);
+        bval(b, in->a);
+        buleb(b, in->nargs);
+        for (int i = 0; i < in->nargs; i++) bval(b, in->args[i]);
+        return;
+    }
+    if (op == OP_FUNCP) {
+        /* dataptr form (uleb index) plus the extern flag byte */
+        buleb(b, (uint64_t)in->callee); bput(b, in->callee_extern);
         return;
     }
     if (op == OP_RET) { bval(b, in->a); return; }
@@ -159,6 +174,18 @@ uint8_t *mod_encode(Module *m, size_t *out_len) {
             }
         }
         bput(&b, 4); buleb(&b, s.n); bputn(&b, s.p, s.n); free(s.p);
+    }
+    /* section 5: signature table (v2; emitted only when non-empty) */
+    if (m->nsigs > 0) {
+        Buf s = { 0 };
+        buleb(&s, (uint64_t)m->nsigs);
+        for (int i = 0; i < m->nsigs; i++) {
+            Sig *g = &m->sigs[i];
+            buleb(&s, (uint64_t)g->nparams);
+            for (int j = 0; j < g->nparams; j++) btype(&s, g->params[j]);
+            btype(&s, g->ret);
+        }
+        bput(&b, 5); buleb(&b, s.n); bputn(&b, s.p, s.n); free(s.p);
     }
     *out_len = b.n;
     return b.p;
@@ -247,6 +274,19 @@ static void rins(Rd *r, Instr *in) {
         in->nargs = (uint16_t)ruleb(r);
         in->args = malloc(sizeof(int32_t) * (in->nargs ? in->nargs : 1));
         for (int i = 0; i < in->nargs; i++) in->args[i] = rval(r);
+        return;
+    }
+    if (op == OP_CALLI || op == OP_TAILCALLI) {
+        in->callee = (int32_t)ruleb(r);
+        if (rbyte(r) != 0) { r->bad = 1; return; }
+        in->a = rval(r);
+        in->nargs = (uint16_t)ruleb(r);
+        in->args = malloc(sizeof(int32_t) * (in->nargs ? in->nargs : 1));
+        for (int i = 0; i < in->nargs; i++) in->args[i] = rval(r);
+        return;
+    }
+    if (op == OP_FUNCP) {
+        in->callee = (int32_t)ruleb(r); in->callee_extern = rbyte(r);
         return;
     }
     if (op == OP_RET) { in->a = rval(r); return; }
@@ -374,6 +414,16 @@ Module *mod_decode(const uint8_t *buf, size_t len, char *err, size_t errcap) {
                         b->ins[b->nins++] = in;
                     }
                 }
+            }
+        } else if (id == 5) {
+            int n = (int)ruleb(&r);
+            for (int i = 0; i < n && !r.bad; i++) {
+                int np = (int)ruleb(&r);
+                Type *ps = malloc(sizeof(Type) * (size_t)(np ? np : 1));
+                for (int j = 0; j < np; j++) ps[j] = rtype(&r);
+                Type ret = rtype(&r);
+                mod_add_sig(m, ps, np, ret);
+                free(ps);
             }
         }
         if (r.p != send) r.p = send;

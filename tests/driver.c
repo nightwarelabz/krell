@@ -94,6 +94,10 @@ static uint64_t sh_manyargs(const uint64_t *a) {
 static uint64_t sh_spills(const uint64_t *a) { return spills(a[0]); }
 extern uint64_t w128(uint64_t, uint64_t);
 static uint64_t sh_w128(const uint64_t *a) { return w128(a[0], a[1]); }
+extern uint64_t vtable(uint64_t, uint64_t);
+static uint64_t sh_vtable(const uint64_t *a) { return vtable(a[0], a[1]); }
+extern uint64_t vtail(uint64_t, uint64_t);
+static uint64_t sh_vtail(const uint64_t *a) { return vtail(a[0], a[1]); }
 
 typedef struct { const char *name; Shim shim; } SEntry;
 static const SEntry SCALARS[] = {
@@ -108,6 +112,7 @@ static const SEntry SCALARS[] = {
     { "fround", sh_fround }, { "fround2", sh_fround2 },
     { "manyargs", sh_manyargs }, { "spills", sh_spills },
     { "w128", sh_w128 },
+    { "vtable", sh_vtable }, { "vtail", sh_vtail },
 };
 
 static int failures = 0, total = 0;

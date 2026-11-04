@@ -329,6 +329,106 @@ int main(void) {
             mod_free(wm);
         }
     }
+    /* indirect calls (v3.0): a function-pointer table dispatch and a
+     * tail dispatch in the interpreter, signature-mismatch and
+     * not-a-function-pointer detection, and v2 encoding (the module
+     * carries a signature table) */
+    {
+        static const char *VT =
+        "sig bin(i64, i64) -> i64\n"
+        "fn oadd(i64, i64) -> i64 {\n"
+        "  entry(a: i64, b: i64):\n"
+        "    %s = add i64 a, b\n"
+        "    ret %s\n"
+        "}\n"
+        "fn omul(i64, i64) -> i64 {\n"
+        "  entry(a: i64, b: i64):\n"
+        "    %s = mul i64 a, b\n"
+        "    ret %s\n"
+        "}\n"
+        "fn apply(i64, i64, i64) -> i64 {\n"
+        "  entry(sel: i64, x: i64, y: i64):\n"
+        "    %cell = alloca 16, 8\n"
+        "    %p0 = funcptr oadd\n"
+        "    store ptr %cell, %p0\n"
+        "    %s1 = gep ptr %cell, 1\n"
+        "    %p1 = funcptr omul\n"
+        "    store ptr %s1, %p1\n"
+        "    %idx = and i64 sel, 1\n"
+        "    %slot = gep ptr %cell, %idx\n"
+        "    %fp = load ptr, %slot\n"
+        "    %r = calli i64 bin %fp(%x, %y)\n"
+        "    ret %r\n"
+        "}\n"
+        "fn tappy(i64, i64, i64) -> i64 {\n"
+        "  entry(sel: i64, x: i64, y: i64):\n"
+        "    %p0 = funcptr oadd\n"
+        "    %p1 = funcptr omul\n"
+        "    %bit = and i64 sel, 1\n"
+        "    %c = icmp.ne i64 %bit, 0\n"
+        "    %fp = select ptr %c, %p1, %p0\n"
+        "    tailcalli i64 bin %fp(%x, %y)\n"
+        "}\n";
+        Module *vm = surface_parse(VT, err, sizeof err);
+        if (!vm) { printf("FAIL vt parse: %s\n", err); failures++; }
+        else {
+            const char *vve = mod_verify(vm);
+            if (vve) { printf("FAIL vt verify: %s\n", vve); failures++; }
+            size_t vl2; uint8_t *vb = mod_encode(vm, &vl2);
+            if (!vb || vb[4] != 2) { printf("FAIL vt: encoding version is not 2\n"); failures++; }
+            Module *vm2 = vb ? mod_decode(vb, vl2, err, sizeof err) : NULL;
+            if (!vm2) { printf("FAIL vt decode: %s\n", err); failures++; }
+            Interp *vit = interp_new(vm2 ? vm2 : vm);
+            check(vit, "apply", (uint64_t[]){ 0, 5, 10 }, 3, 15);
+            check(vit, "apply", (uint64_t[]){ 1, 5, 10 }, 3, 50);
+            check(vit, "apply", (uint64_t[]){ 3, 6, 7 }, 3, 42);
+            check(vit, "tappy", (uint64_t[]){ 0, 5, 10 }, 3, 15);
+            check(vit, "tappy", (uint64_t[]){ 1, 5, 10 }, 3, 50);
+            interp_free(vit);
+            if (vm2) mod_free(vm2);
+            free(vb);
+            mod_free(vm);
+        }
+        /* mismatch: the pointer target's own signature differs from
+         * the call site's table entry - a producer contract breach
+         * the interpreter must report, not misexecute */
+        static const char *BAD =
+        "sig bin(i64, i64) -> i64\n"
+        "fn oth(i64) -> i64 {\n"
+        "  entry(a: i64):\n"
+        "    ret a\n"
+        "}\n"
+        "fn boom(i64, i64) -> i64 {\n"
+        "  entry(x: i64, y: i64):\n"
+        "    %p = funcptr oth\n"
+        "    %r = calli i64 bin %p(%x, %y)\n"
+        "    ret %r\n"
+        "}\n"
+        "fn boom2(ptr, i64, i64) -> i64 {\n"
+        "  entry(p: ptr, x: i64, y: i64):\n"
+        "    %r = calli i64 bin %p(%x, %y)\n"
+        "    ret %r\n"
+        "}\n";
+        Module *bm = surface_parse(BAD, err, sizeof err);
+        if (!bm) { printf("FAIL bad parse: %s\n", err); failures++; }
+        else {
+            Interp *bit2 = interp_new(bm);
+            uint64_t la[3][256]; IVal av[3], rv; uint64_t rb[256];
+            for (int i = 0; i < 3; i++) av[i].lanes = la[i];
+            rv.lanes = rb;
+            av[0].lanes[0] = 5; av[1].lanes[0] = 6;
+            if (interp_call(bit2, "boom", av, 2, &rv) == 0)
+                { printf("FAIL bad: signature mismatch not detected\n"); failures++; }
+            /* boom2 with a data pointer (not a function address) */
+            size_t msz2; interp_mem(bit2, &msz2);
+            uint64_t cell2 = interp_alloc(bit2, 64, 8);
+            av[0].lanes[0] = cell2; av[1].lanes[0] = 5; av[2].lanes[0] = 6;
+            if (interp_call(bit2, "boom2", av, 3, &rv) == 0)
+                { printf("FAIL bad: non-function pointer not detected\n"); failures++; }
+            interp_free(bit2);
+            mod_free(bm);
+        }
+    }
     /* i128 division is cliff-gated on every target in v3.0 */
     {
         static const char *D128 =
