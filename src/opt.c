@@ -1644,6 +1644,14 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         if (U > 16) U = 16;
         const char *env_u = getenv("KRELL_VECTOR_UNROLL");
         if (env_u && atoi(env_u) > 0) U = atoi(env_u);
+        /* WP19: the i64 scalar-reduce class (dot/sumsq shape) is bound
+         * by in-flight multiply latency, not loop overhead: measured
+         * interleaved A/B on the bench host, U=16 vs U=4 gains ~12%
+         * (dot) and ~24% (sumsq) with checksums unchanged, so the
+         * class default rises to 16 (the env override still wins). */
+        if (!env_u && use_scalar_reduce && !is_widen &&
+            elem_ty.kind == TY_INT && elem_ty.bits == 64)
+            U = 16;
 
         int num_acc = 4;
         const char *env_acc = getenv("KRELL_VECTOR_ACC");
@@ -3021,7 +3029,10 @@ static int unroll_mapval(Func *f, Block *C, Block *B, const int32_t *map,
 }
 
 static void opt_unroll_loops(Func *f, OptStats *st) {
-    const int U = 4;
+    const int U = 8; /* WP19: 8 clones measured ~2% faster than 4 on
+                      * the gather/span shape, ~1% on the map/mix shape,
+                      * no regression measured; guard cost is one
+                      * compare per 8 iterations instead of per 4. */
     int nb0 = f->nblocks;
     if (nb0 < 3) return;
     int *defblk = NULL;
@@ -3135,7 +3146,7 @@ static void opt_unroll_loops(Func *f, OptStats *st) {
         int32_t *hb_args = ids_dup(ht->args, ht->nargs);
         for (int j = 0; j < nargs; j++) { htypes[j] = H->arg_types[j]; btypes[j] = B->arg_types[j]; }
         int g = func_add_block(f, htypes, nargs);
-        int cl[4];
+        int cl[8];
         for (int k = 0; k < U; k++) cl[k] = func_add_block(f, btypes, nargs);
         free(htypes); free(btypes);
         H = &f->blocks[h]; B = &f->blocks[b];
