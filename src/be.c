@@ -448,12 +448,38 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
              * (block, register) coalesces, so two edge values never
              * share a register in one block. */
             bool coalesced = false;
-            if (usecnt[iv->v] == 1 && use_tgt[iv->v] >= 0 && defins[iv->v]) {
-                int tb = use_tgt[iv->v], slot = use_slot[iv->v], lst = use_list[iv->v];
+            if (defins[iv->v] && defblk[iv->v] >= 0) {
+                Block *sb0 = &f->blocks[defblk[iv->v]];
+                Instr *term0 = sb0->nins > 0 ? &sb0->ins[sb0->nins - 1] : NULL;
+                /* Every terminator-arg occurrence of this value is a
+                 * candidate target (WP16). A loop body's updated
+                 * values are passed to BOTH the back edge and the
+                 * exit edge of the same condbr, so the historical
+                 * sole-use rule (usecnt == 1) never fired for them
+                 * and the edge moves shuffled every loop-carried
+                 * pointer through scratch registers each iteration.
+                 * The census must account for exactly these
+                 * occurrences -- no other use anywhere; the
+                 * folded-use expansion keeps that conservative,
+                 * since any folded involvement inflates the census
+                 * past the occurrence count and skips the value. */
+                int occ_lst[8], occ_slot[8], occ_tgt[8], nocc = 0;
+                if (term0 && term0->op == OP_BR) {
+                    for (int k = 0; k < term0->nargs; k++)
+                        if (term0->args[k] == iv->v && nocc < 8) { occ_lst[nocc] = 0; occ_slot[nocc] = k; occ_tgt[nocc] = term0->blk; nocc++; }
+                } else if (term0 && term0->op == OP_CONDBR) {
+                    for (int k = 0; k < term0->nargs; k++)
+                        if (term0->args[k] == iv->v && nocc < 8) { occ_lst[nocc] = 0; occ_slot[nocc] = k; occ_tgt[nocc] = term0->blk; nocc++; }
+                    for (int k = 0; k < term0->nargs2; k++)
+                        if (term0->args2[k] == iv->v && nocc < 8) { occ_lst[nocc] = 1; occ_slot[nocc] = k; occ_tgt[nocc] = term0->blk2; nocc++; }
+                }
+                if (nocc > 0 && usecnt[iv->v] == nocc) {
+                for (int oi = 0; oi < nocc && !coalesced; oi++) {
+                int tb = occ_tgt[oi], slot = occ_slot[oi], lst = occ_lst[oi];
                 Block *tblk = &f->blocks[tb];
                 int pv = slot < tblk->nargs ? tblk->arg_vals[slot] : -1;
                 Instr *dd = defins[iv->v];
-                if (pv >= 0 && pv != iv->v && defblk[iv->v] == use_srcblk[iv->v] &&
+                if (pv >= 0 && pv != iv->v &&
                     bf->vclass[pv] == cls && bf->loc[pv].is_reg && bf->loc[pv].cls == cls &&
                     dd->op != OP_CALL && dd->op != OP_TAILCALL && dd->op != OP_FMA &&
                     dd->op != OP_MEMCPY && dd->op != OP_MEMSET && dd->op != OP_ALLOCA) {
@@ -488,12 +514,26 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
                         if (ok) {
                             bf->loc[iv->v] = bf->loc[pv];
                             act[aj].prot = true;
+                            /* The coalesced value occupies pv's
+                             * register from its own definition to
+                             * its last use (the edge), but no Act
+                             * entry of its own records that span --
+                             * pv's entry ends at pv's last in-block
+                             * use, which can be long before (an
+                             * accumulator updated early in a wide
+                             * unrolled body). Without this extension
+                             * the register looks free in between and
+                             * a later value is allocated into it,
+                             * clobbering the edge value. */
+                            if (iv->end > act[aj].end) act[aj].end = iv->end;
                             coal[ncoal].blk = defblk[iv->v]; coal[ncoal].reg = pr; ncoal++;
                             coalesced = true;
                         }
                     }
                 }
-            }
+                } /* for each occurrence */
+                } /* census == occurrences */
+                } /* defining block has a branch terminator */
             if (!coalesced) {
             /* choose a register: if crossing, callee-saved only;
              * prefer caller-saved for non-crossing (preserve callee regs) */

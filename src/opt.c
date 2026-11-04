@@ -2521,6 +2521,151 @@ static void opt_hoist_loop_consts(Func *f, OptStats *st) {
     free(hv.v);
 }
 
+/* ---- WP16: loop rotation for the canonical counted loop ----
+ * Recognizes the source loop shape
+ *   H(args): %c = icmp .. ; condbr %c, B(HB..), X(HX..)
+ *   B(args): .. ; br H(BH..)
+ * with H's only predecessors the preheader and B, and rewrites B's
+ * back edge into a self edge guarded by a clone of H's compare fed
+ * with B's outgoing values:
+ *   B(args): .. ; %c2 = icmp ..(BH-remapped) ; condbr %c2, B(..), X(..)
+ * H remains as the entry guard (the n == 0 case still exits before
+ * B runs once). The per-iteration path loses the jump back to a
+ * separate check block and the check itself from the loop's cycle:
+ * the compare now sits at the end of the body, where its inputs
+ * are already in registers. Operands and pass-through values must
+ * be H arguments (remapped through B's outgoing list) or values
+ * defined outside H and B (they dominate both); anything else
+ * rejects the rotation for that loop. */
+static void opt_rotate_loops(Func *f, OptStats *st) {
+    int nb = f->nblocks;
+    if (nb < 3) return;
+    /* defining block per value (block args define at their block) */
+    int *defblk = malloc(sizeof(int) * (size_t)(f->nvalues > 0 ? f->nvalues : 1));
+    for (int v = 0; v < f->nvalues; v++) defblk[v] = -1;
+    for (int b = 0; b < nb; b++) {
+        Block *bl = &f->blocks[b];
+        for (int k = 0; k < bl->nargs; k++) defblk[bl->arg_vals[k]] = b;
+        for (int i = 0; i < bl->nins; i++)
+            if (bl->ins[i].result >= 0) defblk[bl->ins[i].result] = b;
+    }
+    Opt o = { 0 };
+    o.f = f;
+    opt_grow(&o, f->nvalues);
+    for (int h = 0; h < nb; h++) {
+        Block *H = &f->blocks[h];
+        if (H->nins != 2) continue;
+        Instr *icmp = &H->ins[0];
+        Instr *ht = &H->ins[1];
+        if (icmp->op != OP_ICMP || icmp->result < 0) continue;
+        if (ht->op != OP_CONDBR || ht->a != icmp->result) continue;
+        int b = -1, x = -1;
+        const int32_t *argsHB = NULL, *argsHX = NULL;
+        int nHB = 0, nHX = 0;
+        /* body may sit on either condbr edge */
+        for (int e = 0; e < 2 && b < 0; e++) {
+            int tgt = e == 0 ? ht->blk : ht->blk2;
+            if (tgt < 0 || tgt >= nb || tgt == h) continue;
+            Block *cand = &f->blocks[tgt];
+            if (cand->nins < 1) continue;
+            Instr *ct = &cand->ins[cand->nins - 1];
+            if (ct->op == OP_BR && ct->blk == h) {
+                b = tgt;
+                if (e == 0) { argsHB = ht->args; nHB = ht->nargs; argsHX = ht->args2; nHX = ht->nargs2; x = ht->blk2; }
+                else { argsHB = ht->args2; nHB = ht->nargs2; argsHX = ht->args; nHX = ht->nargs; x = ht->blk; }
+            }
+        }
+        if (b < 0 || x < 0 || x == h || x == b) continue;
+        Block *B = &f->blocks[b];
+        Block *X = &f->blocks[x];
+        Instr *bt = &B->ins[B->nins - 1];
+        if (bt->op != OP_BR || bt->blk != h) continue;
+        if (nHB != B->nargs || bt->nargs != H->nargs || nHX != X->nargs) continue;
+        /* H's incoming edges: exactly B's back edge plus one other
+         * block (the preheader) */
+        int inedges = 0;
+        bool ok = true;
+        for (int p = 0; p < nb && ok; p++) {
+            Block *pb = &f->blocks[p];
+            if (pb->nins < 1) continue;
+            Instr *pt = &pb->ins[pb->nins - 1];
+            if (pt->op == OP_BR && pt->blk == h) { inedges++; if (p != b) { /* preheader */ } }
+            else if (pt->op == OP_CONDBR) {
+                if (pt->blk == h) inedges++;
+                if (pt->blk2 == h) inedges++;
+            }
+        }
+        if (inedges != 2) continue;
+        /* remap: H-scope value -> B-scope value. H args map through
+         * B's outgoing list; values defined outside H and B map to
+         * themselves; anything else rejects. */
+        /* (lambda-like helper via a small loop at each use site) */
+        int *bh = bt->args; /* B -> H values, H-arg order */
+        /* icmp operands */
+        int remap_a = -2, remap_b = -2;
+        const int ops[2] = { icmp->a, icmp->b };
+        int remapped[2] = { -2, -2 };
+        for (int k = 0; k < 2 && ok; k++) {
+            int v = ops[k];
+            if (v < 0) { remapped[k] = -1; continue; }
+            int slot = -1;
+            for (int j = 0; j < H->nargs; j++) if (H->arg_vals[j] == v) { slot = j; break; }
+            if (slot >= 0) remapped[k] = bh[slot];
+            else if (defblk[v] >= 0 && defblk[v] != h && defblk[v] != b) remapped[k] = v;
+            else ok = false;
+        }
+        remap_a = remapped[0]; remap_b = remapped[1];
+        if (!ok || remap_a == -2 || remap_b == -2) continue;
+        /* B-edge args: B-arg j next = HB[j] with H args replaced by
+         * their BH values */
+        int32_t *newB = malloc(sizeof(int32_t) * (size_t)(B->nargs > 0 ? B->nargs : 1));
+        int32_t *newX = malloc(sizeof(int32_t) * (size_t)(X->nargs > 0 ? X->nargs : 1));
+        for (int j = 0; j < B->nargs && ok; j++) {
+            int v = argsHB[j];
+            int slot = -1;
+            for (int q = 0; q < H->nargs; q++) if (H->arg_vals[q] == v) { slot = q; break; }
+            if (slot >= 0) newB[j] = bh[slot];
+            else if (v >= 0 && defblk[v] >= 0 && defblk[v] != h && defblk[v] != b) newB[j] = v;
+            else ok = false;
+        }
+        for (int j = 0; j < X->nargs && ok; j++) {
+            int v = argsHX[j];
+            int slot = -1;
+            for (int q = 0; q < H->nargs; q++) if (H->arg_vals[q] == v) { slot = q; break; }
+            if (slot >= 0) newX[j] = bh[slot];
+            else if (v >= 0 && defblk[v] >= 0 && defblk[v] != h && defblk[v] != b) newX[j] = v;
+            else ok = false;
+        }
+        if (!ok) { free(newB); free(newX); continue; }
+        /* clone the compare at the end of B */
+        int nv = opt_new_value(&o, f->vtypes[icmp->result]);
+        if (B->nins + 1 > B->cap) {
+            B->cap = (B->nins + 1) * 2;
+            B->ins = realloc(B->ins, sizeof(Instr) * (size_t)B->cap);
+        }
+        memmove(&B->ins[B->nins], &B->ins[B->nins - 1], sizeof(Instr));
+        Instr *cl = &B->ins[B->nins - 1];
+        *cl = *icmp;
+        cl->result = nv;
+        cl->a = remap_a;
+        cl->b = remap_b;
+        cl->args = NULL; cl->nargs = 0; cl->args2 = NULL; cl->nargs2 = 0;
+        B->nins++;
+        /* B's terminator becomes the rotated condbr */
+        Instr *nt = &B->ins[B->nins - 1];
+        free(nt->args); free(nt->args2);
+        nt->op = OP_CONDBR;
+        nt->a = nv;
+        nt->blk = b;
+        nt->args = newB; nt->nargs = (uint16_t)B->nargs;
+        nt->blk2 = x;
+        nt->args2 = newX; nt->nargs2 = (uint16_t)X->nargs;
+        st->rewritten++;
+    }
+    free(o.subst); free(o.usecount); free(o.konst); free(o.hask);
+    free(defblk);
+}
+
 /* ---- WP9: linear two-term recurrence lowering ----
  * Recognizes a pure self-recursive function of the exact shape
  *   entry(n): condbr (n < 2) -> base, rec        (or the n >= 2 form)
@@ -2849,6 +2994,7 @@ void opt_optimize(Module *m, const Cost *cost, OptStats *st) {
         /* seed float constant knowledge for the fold rules */
         optimize_func(&o);
         free(o.subst); free(o.usecount); free(o.konst); free(o.hask);
+        opt_rotate_loops(f, st);
         opt_eliminate_block_args(f, st);
     }
     const char *ve = mod_verify(m);
