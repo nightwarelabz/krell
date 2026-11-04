@@ -1623,7 +1623,7 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                 E(c, "  movups xmm15, %s", chunk_mstr);
                 E(c, "  movups [rbp - %d], xmm15", l->off - off);
             } else {
-                E(c, "  movups xmm15, [rbp - %d], xmm15", l->off - off);
+                E(c, "  movups xmm15, [rbp - %d]", l->off - off);
                 E(c, "  movups %s, xmm15", chunk_mstr);
             }
         }
