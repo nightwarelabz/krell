@@ -27,9 +27,11 @@ typedef struct {
     Instr **defins;
     bool *folded_ins;
     bool *cmp_fuse;
-    Instr *span_or;
-    int span_px;
-    int span_light;
+    Instr *span_or[512];
+    int span_px[512];
+    int span_light[512];
+    int span_blk[512];
+    int nspan;
     int fi;
     int lbl;
     int vl;
@@ -974,11 +976,14 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         break;
     }
     case OP_ADD: case OP_SUB: case OP_AND: case OP_OR: case OP_XOR: case OP_MUL: {
-        if (in == c->span_or) {
+        int span_m = -1;
+        for (int s2 = 0; s2 < c->nspan; s2++)
+            if (in == c->span_or[s2]) { span_m = s2; break; }
+        if (span_m >= 0) {
             Loc *dl = &c->bf->loc[in->result];
             int dreg = (dl->is_reg && dl->cls == BCLS_GP) ? dl->idx : -1;
             int dreg_use = (dreg >= 0) ? dreg : R11;
-            load_gp(c, R11, c->span_px);
+            load_gp(c, R11, c->span_px[span_m]);
             E(c, "  movd xmm13, r11d");
             E(c, "  punpcklbw xmm13, xmm14");
             E(c, "  pmullw xmm13, xmm15");
@@ -2333,20 +2338,23 @@ static int emit_func(Ctx *c, int fi) {
             for (int k = 0; k < in->nargs2; k++) uses[in->args2[k]]++;
         }
     }
-    c->span_or = NULL;
-    Instr *s_rb = NULL, *s_rb_shr = NULL, *s_rb_mul = NULL, *s_rb_and = NULL;
-    Instr *s_g = NULL, *s_g_mul = NULL, *s_g_and = NULL, *s_g_shr = NULL;
+    c->nspan = 0;
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = &f->blocks[bi];
+        Instr *s_rb = NULL, *s_rb_shr = NULL, *s_rb_mul = NULL, *s_rb_and = NULL;
+        Instr *s_g = NULL, *s_g_mul = NULL, *s_g_and = NULL, *s_g_shr = NULL;
         for (int ii = 0; ii < b->nins; ii++) {
             Instr *in = &b->ins[ii];
             int px = -1, light = -1;
             if (is_span_blend(c, in, &px, &light,
                               &s_rb, &s_rb_shr, &s_rb_mul, &s_rb_and,
                               &s_g, &s_g_mul, &s_g_and, &s_g_shr)) {
-                c->span_or = in;
-                c->span_px = px;
-                c->span_light = light;
+                if (c->nspan >= 512) break;
+                c->span_or[c->nspan] = in;
+                c->span_px[c->nspan] = px;
+                c->span_light[c->nspan] = light;
+                c->span_blk[c->nspan] = bi;
+                c->nspan++;
                 c->folded_ins[s_rb->result] = true;
                 c->folded_ins[s_rb_shr->result] = true;
                 c->folded_ins[s_rb_mul->result] = true;
@@ -2366,7 +2374,6 @@ static int emit_func(Ctx *c, int fi) {
                 break;
             }
         }
-        if (c->span_or) break;
     }
 
     /* RMW pass: find load64 + add 1 + store64 patterns */
@@ -2607,8 +2614,8 @@ static int emit_func(Ctx *c, int fi) {
                 }
             }
         }
-        if (c->span_or) {
-            load_gp(c, R11, c->span_light);
+        if (c->nspan > 0) {
+            load_gp(c, R11, c->span_light[0]);
             E(c, "  pxor xmm14, xmm14");
             E(c, "  movd xmm15, r11d");
             E(c, "  punpcklwd xmm15, xmm15");
@@ -2648,6 +2655,22 @@ static int emit_func(Ctx *c, int fi) {
     for (int b = 0; b < f->nblocks; b++) {
         if (er.eligible && (b == 0 || b == er.early_blk)) continue;
         E(c, ".Lb%d_%d:", fi, b);
+        /* A matched block whose light value is not the one splatted
+         * in the prologue (a different block argument carrying the
+         * same runtime value, e.g. an unrolled clone) splats its own
+         * light at the block head, before its packed sequence. */
+        int splatted = -1;
+        for (int s2 = 0; s2 < c->nspan; s2++) {
+            if (c->span_blk[s2] != b) continue;
+            int li = c->span_light[s2];
+            if (li < 0 || li == c->span_light[0] || li == splatted) continue;
+            load_gp(c, R11, li);
+            E(c, "  pxor xmm14, xmm14");
+            E(c, "  movd xmm15, r11d");
+            E(c, "  punpcklwd xmm15, xmm15");
+            E(c, "  pshufd xmm15, xmm15, 0");
+            splatted = li;
+        }
         for (int i = 0; i < f->blocks[b].nins; i++)
             emit_instr(c, b, i);
     }
