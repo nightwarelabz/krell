@@ -764,6 +764,10 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         break;
     }
     case OP_ASSUME: break;
+    case OP_FENCE:
+        if (in->aux == AO_ACQUIRE) E(c, "  dmb ishld");
+        else E(c, "  dmb ish");
+        break;
     case OP_BR:
         emit_branch(c, in->blk, in->args, in->nargs);
         break;

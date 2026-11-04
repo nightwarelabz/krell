@@ -888,7 +888,7 @@ static void optimize_func(Opt *o) {
                     /* volatile accesses are observable even when the
                      * loaded value is unused: root them so neither the
                      * access nor its operands can be eliminated */
-                    || in->op == OP_LOADV || in->op == OP_STOREV;
+                    || in->op == OP_LOADV || in->op == OP_STOREV || in->op == OP_FENCE;
                 if (root && !bmark[bi][ii]) { bmark[bi][ii] = 1; PUSH(bi, ii); }
             }
         }

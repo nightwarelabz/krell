@@ -802,6 +802,11 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         break;
     }
     case OP_ASSUME: break;
+    case OP_FENCE:
+        if (in->aux == AO_ACQUIRE) E(c, "  fence r, rw");
+        else if (in->aux == AO_RELEASE) E(c, "  fence rw, w");
+        else E(c, "  fence rw, rw");
+        break;
     case OP_BR:
         emit_branch(c, in->blk, in->args, in->nargs);
         break;

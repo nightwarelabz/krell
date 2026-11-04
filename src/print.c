@@ -64,6 +64,7 @@ static void ins_dump(Func *f, Instr *in, FILE *out) {
         fprintf(out, ".%d %%%d", in->aux, in->a);
         if (in->b >= 0) fprintf(out, ", %%%d", in->b);
         break;
+    case OP_FENCE: fprintf(out, ".%d", in->aux); break;
     case OP_SELECT: fprintf(out, " %%%d, %%%d, %%%d", in->a, in->b, in->c); break;
     default:
         if (in->a >= 0) fprintf(out, " %%%d", in->a);

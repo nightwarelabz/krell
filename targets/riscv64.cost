@@ -53,6 +53,7 @@ op memcpy.i lat 30 thr 10
 op memset.i lat 30 thr 10
 op aload.i lat 6 thr 2
 op astore.i lat 2 thr 1
+op fence.i lat 10 thr 5
 op aadd.i lat 16 thr 8
 op vsplat.v lat 8 thr 4
 op vadd.v lat 12 thr 6

@@ -90,6 +90,7 @@ static const char *PROG =
 "fn vround(ptr, i32) -> i32 {\n"
 "  entry(dst: ptr, val: i32):\n"
 "    storev i32 dst, val\n"
+"    fence.seqcst\n"
 "    %a = loadv i32, dst\n"
 "    %b = loadv i32, dst\n"
 "    %s = add i32 %a, %b\n"

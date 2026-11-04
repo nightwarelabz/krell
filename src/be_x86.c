@@ -1534,6 +1534,12 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         break;
     }
     case OP_ASSUME: break;
+    case OP_FENCE:
+        /* x86 TSO: acquire/release/acqrel fences are compiler-only
+         * (this emitter never reorders); seqcst needs the hardware
+         * fence */
+        if (in->aux == AO_SEQCST) E(c, "  mfence");
+        break;
     case OP_BR:
         if (in->nargs == 0 && in->blk == bi + 1) break;
         emit_branch(c, in->blk, in->args, in->nargs);

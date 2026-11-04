@@ -65,6 +65,7 @@ static void bins(Buf *b, const Instr *in) {
     if (op == OP_GEP) { bval(b, in->a); bval(b, in->b); btype(b, in->ety); return; }
     if (op == OP_VEXTRACT) { bval(b, in->a); buleb(b, (uint64_t)in->imm); return; }
     if (op == OP_VINSERT) { bval(b, in->a); bval(b, in->b); buleb(b, (uint64_t)in->imm); return; }
+    if (op == OP_FENCE) { bput(b, in->aux); return; }
     if (op == OP_ALOAD || op == OP_ASTORE || op == OP_AADD) {
         bput(b, in->aux); bval(b, in->a); if (in->op != OP_ALOAD) bval(b, in->b);
         return;
@@ -211,6 +212,7 @@ static void rins(Rd *r, Instr *in) {
     if (op == OP_GEP) { in->a = rval(r); in->b = rval(r); in->ety = rtype(r); return; }
     if (op == OP_VEXTRACT) { in->a = rval(r); in->imm = (int64_t)ruleb(r); return; }
     if (op == OP_VINSERT) { in->a = rval(r); in->b = rval(r); in->imm = (int64_t)ruleb(r); return; }
+    if (op == OP_FENCE) { in->aux = rbyte(r); return; }
     if (op == OP_ALOAD || op == OP_ASTORE || op == OP_AADD) {
         in->aux = rbyte(r); in->a = rval(r); if (op != OP_ALOAD) in->b = rval(r);
         return;

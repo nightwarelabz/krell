@@ -178,6 +178,8 @@ static int parse_order(P *p, const char *w) {
     if (!dot) return AO_RELAXED;
     if (strcmp(dot, ".acqrel") == 0) return AO_ACQREL;
     if (strcmp(dot, ".seqcst") == 0) return AO_SEQCST;
+    if (strcmp(dot, ".acquire") == 0) return AO_ACQUIRE;
+    if (strcmp(dot, ".release") == 0) return AO_RELEASE;
     return AO_RELAXED;
 }
 
@@ -502,6 +504,12 @@ static bool parse_instr(P *p, Func *f, int blk) {
         if (!eat_ch(p, ',')) return false;
         int b = parse_value(p, f, blk, ty);
         Instr in = ins_make(OP_ASTORE, ty); in.a = a; in.b = b; in.aux = (uint8_t)parse_order(p, w);
+        emit(f, blk, in);
+        result = -1;
+        break;
+    }
+    case OP_FENCE: {
+        Instr in = ins_make(OP_FENCE, ty_void()); in.aux = (uint8_t)parse_order(p, w);
         emit(f, blk, in);
         result = -1;
         break;

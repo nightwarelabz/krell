@@ -409,14 +409,14 @@ static void emit_instr(Ctx *c, Instr *in) {
         break;
     }
     case OP_ALOAD: {
-        const char *ord = in->aux == AO_SEQCST ? "seq_cst" : in->aux == AO_ACQREL ? "acquire" : "monotonic";
+        const char *ord = in->aux == AO_SEQCST ? "seq_cst" : (in->aux == AO_ACQREL || in->aux == AO_ACQUIRE) ? "acquire" : "monotonic";
         int al = t.bits >= 8 ? t.bits / 8 : 1;
         E(c, "  %s = load atomic %s, ptr %s %s, align %d", R, tb, ab, ord, al);
         break;
     }
     case OP_ASTORE: {
         char stb[48]; ty_str(c, f->vtypes[in->b], stb, sizeof stb);
-        const char *ord = in->aux == AO_SEQCST ? "seq_cst" : in->aux == AO_ACQREL ? "release" : "monotonic";
+        const char *ord = in->aux == AO_SEQCST ? "seq_cst" : (in->aux == AO_ACQREL || in->aux == AO_RELEASE) ? "release" : "monotonic";
         int al = f->vtypes[in->b].bits >= 8 ? f->vtypes[in->b].bits / 8 : 1;
         E(c, "  store atomic %s %s, ptr %s %s, align %d", stb, bb, ab, ord, al);
         break;
@@ -425,6 +425,12 @@ static void emit_instr(Ctx *c, Instr *in) {
         const char *ord = in->aux == AO_SEQCST ? "seq_cst" : in->aux == AO_ACQREL ? "acq_rel" : "monotonic";
         int al = t.bits >= 8 ? t.bits / 8 : 1;
         E(c, "  %s = atomicrmw add ptr %s, %s %s %s, align %d", R, ab, tb, bb, ord, al);
+        break;
+    }
+    case OP_FENCE: {
+        const char *ord = in->aux == AO_SEQCST ? "seq_cst" : in->aux == AO_ACQREL ? "acq_rel"
+                        : in->aux == AO_ACQUIRE ? "acquire" : "release";
+        E(c, "  fence %s", ord);
         break;
     }
     case OP_CALL: case OP_TAILCALL: {

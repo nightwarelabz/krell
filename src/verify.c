@@ -121,15 +121,22 @@ static const char *check_instr(Module *m, Func *f, Block *b, Instr *in, int idx)
         break;
     case OP_ALOAD:
         NEED(VT(in->a).kind == TY_PTR && ty_is_int(in->ty), "aload mismatch");
-        NEED(in->aux <= AO_SEQCST, "atomic ordering out of range");
+        NEED(in->aux == AO_RELAXED || in->aux == AO_ACQUIRE || in->aux == AO_ACQREL || in->aux == AO_SEQCST,
+             "aload ordering must be relaxed, acquire, acqrel or seqcst");
         break;
     case OP_ASTORE:
         NEED(VT(in->a).kind == TY_PTR && ty_is_int(VT(in->b)), "astore mismatch");
-        NEED(in->aux <= AO_SEQCST, "atomic ordering out of range");
+        NEED(in->aux == AO_RELAXED || in->aux == AO_RELEASE || in->aux == AO_ACQREL || in->aux == AO_SEQCST,
+             "astore ordering must be relaxed, release, acqrel or seqcst");
         break;
     case OP_AADD:
         NEED(VT(in->a).kind == TY_PTR && ty_is_int(VT(in->b)) && ty_is_int(in->ty), "aadd mismatch");
-        NEED(in->aux <= AO_SEQCST, "atomic ordering out of range");
+        NEED(in->aux <= AO_RELEASE, "atomic ordering out of range");
+        break;
+    case OP_FENCE:
+        /* a relaxed fence orders nothing and is rejected, not kept */
+        NEED(in->aux == AO_ACQUIRE || in->aux == AO_RELEASE || in->aux == AO_ACQREL || in->aux == AO_SEQCST,
+             "fence ordering must be acquire, release, acqrel or seqcst");
         break;
     case OP_BR: case OP_CONDBR: {
         if (op == OP_CONDBR) NEED(VT(in->a).kind == TY_INT && VT(in->a).bits == 1, "condbr condition must be i1");

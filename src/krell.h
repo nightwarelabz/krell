@@ -70,6 +70,7 @@ enum {
     OP_BR, OP_CONDBR, OP_RET, OP_CALL, OP_TAILCALL, OP_SELECT, OP_ASSUME,
     OP_VLSHR,   /* appended: existing opcode numbers are binary-format */
     OP_LOADV, OP_STOREV,  /* v3: volatile load/store (appended, v2 numbers unchanged) */
+    OP_FENCE,             /* v3: ordering fence, aux = AO_* (appended) */
     OP_COUNT
 };
 /* icmp predicates */
@@ -77,8 +78,8 @@ enum { IC_EQ, IC_NE, IC_ULT, IC_ULE, IC_UGT, IC_UGE, IC_SLT, IC_SLE, IC_SGT, IC_
 /* fcmp predicates */
 enum { FC_OEQ, FC_ONE, FC_OLT, FC_OLE, FC_OGT, FC_OGE,
        FC_UEQ, FC_UNE, FC_ULT, FC_ULE, FC_UGT, FC_UGE, FC_ORD, FC_UNO };
-/* atomic orderings */
-enum { AO_RELAXED = 0, AO_ACQREL = 1, AO_SEQCST = 2 };
+/* atomic orderings (v3 appends ACQUIRE/RELEASE; existing values are encoding) */
+enum { AO_RELAXED = 0, AO_ACQREL = 1, AO_SEQCST = 2, AO_ACQUIRE = 3, AO_RELEASE = 4 };
 
 const char *op_name(int op);
 bool op_is_pure(int op);        /* no side effects, hash-consable */

@@ -284,6 +284,7 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
             break;
         }
         case OP_ASSUME: break;
+        case OP_FENCE: break;   /* ordering barrier; no value semantics on one thread */
         case OP_ALLOCA: {
             uint64_t al = in->c > 0 ? (uint64_t)in->c : 1;
             it->bump = (it->bump + al - 1) & ~(al - 1);

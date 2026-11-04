@@ -34,6 +34,7 @@ static const char *OPNAMES[OP_COUNT] = {
     [OP_TAILCALL]="tailcall", [OP_SELECT]="select", [OP_ASSUME]="assume",
     [OP_VLSHR]="vlshr",
     [OP_LOADV]="loadv", [OP_STOREV]="storev",
+    [OP_FENCE]="fence",
 };
 const char *op_name(int op) {
     if (op <= 0 || op >= OP_COUNT || !OPNAMES[op]) return "?op";
@@ -48,7 +49,7 @@ bool op_is_pure(int op) {
     case OP_LOAD: case OP_STORE: case OP_ALOAD: case OP_ASTORE: case OP_AADD:
     case OP_MEMCPY: case OP_MEMSET: case OP_CALL: case OP_TAILCALL:
     case OP_BR: case OP_CONDBR: case OP_RET: case OP_ASSUME: case OP_VLOAD:
-    case OP_VSTORE: case OP_ALLOCA: case OP_LOADV: case OP_STOREV:
+    case OP_VSTORE: case OP_ALLOCA: case OP_LOADV: case OP_STOREV: case OP_FENCE:
         return false;
     default:
         return true;
@@ -212,6 +213,7 @@ static bool ins_has_result(const Instr *in) {
     switch (in->op) {
     case OP_STORE: case OP_VSTORE: case OP_BR: case OP_CONDBR: case OP_RET:
     case OP_ASSUME: case OP_ASTORE: case OP_MEMCPY: case OP_MEMSET: case OP_STOREV:
+    case OP_FENCE:
         return false;
     case OP_CALL:
         return in->ty.kind != TY_VOID;
