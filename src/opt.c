@@ -2985,6 +2985,238 @@ static void opt_lower_recurrences(Module *m, Func *f, int fi, OptStats *st) {
     if (lr_match(f, fi, &sh)) lr_rewrite(f, &sh, st);
 }
 
+/* ---- WP18: scalar unrolling for counted loops the vectorizer left
+ * scalar (gathers and other irregular bodies). For the canonical loop
+ *   H(args): [icmp.slt ind, bound; condbr -> B, X]
+ *   B(args): ...; br H(next)
+ * with a unique preheader P, insert a guard block G on the P->H edge:
+ *   G(args): diff = bound - ind; ok = icmp.sge diff, U*step;
+ *            condbr ok -> C0, H(identity)
+ *   C0..C{U-1}: clones of B chained by their stepped arg lists;
+ *   the last clone branches back to G.
+ * H+B remain untouched as the remainder loop, so the guard may only
+ * err toward the original loop: with ind < bound (signed) and
+ * bound - ind >= U*step in exact arithmetic, the next U iterations
+ * cannot reach or wrap past bound, and the clones execute exactly
+ * those iterations, in order; every other case falls back to H.
+ * Rejects: calls, allocas, or branches inside B; a step that is not a
+ * positive iconst add on the induction slot; a bound or body operand
+ * defined inside H; multiple preheaders. */
+static void unroll_push(Block *b, Instr in) {
+    if (b->nins + 1 > b->cap) {
+        b->cap = b->cap ? b->cap * 2 : 8;
+        b->ins = realloc(b->ins, sizeof(Instr) * (size_t)b->cap);
+    }
+    b->ins[b->nins++] = in;
+}
+
+static int unroll_mapval(Func *f, Block *C, Block *B, const int32_t *map,
+                         const uint8_t *has, int nv0, int v) {
+    if (v < 0) return -1;
+    for (int s = 0; s < B->nargs; s++)
+        if (v == B->arg_vals[s]) return C->arg_vals[s];
+    if (v < nv0 && has[v]) return map[v];
+    (void)f;
+    return v;
+}
+
+static void opt_unroll_loops(Func *f, OptStats *st) {
+    const int U = 4;
+    int nb0 = f->nblocks;
+    if (nb0 < 3) return;
+    int *defblk = NULL;
+    int defblk_n = 0;
+    bool defblk_dirty = true;
+    for (int h = 0; h < nb0; h++) {
+        Block *H = &f->blocks[h];
+        if (H->nins != 2 || H->nargs < 1) continue;
+        Instr *icmp = &H->ins[0];
+        Instr *ht = &H->ins[1];
+        if (icmp->op != OP_ICMP || icmp->pred != IC_SLT || icmp->result < 0) continue;
+        if (ht->op != OP_CONDBR || ht->a != icmp->result) continue;
+        int b = ht->blk, x = ht->blk2;
+        if (b < 0 || b >= nb0 || b == h || x < 0 || x >= nb0 || x == h || x == b) continue;
+        Block *B = &f->blocks[b];
+        if (B->nins < 2 || B->nargs != H->nargs || ht->nargs != B->nargs) continue;
+        if (B->nins > 200) continue;
+        Instr *bt = &B->ins[B->nins - 1];
+        if (bt->op != OP_BR || bt->blk != h || bt->nargs != H->nargs) continue;
+        if (defblk_dirty) {
+            free(defblk);
+            defblk_n = f->nvalues > 0 ? f->nvalues : 1;
+            defblk = malloc(sizeof(int) * (size_t)defblk_n);
+            for (int v = 0; v < defblk_n; v++) defblk[v] = -1;
+            for (int bi = 0; bi < f->nblocks; bi++) {
+                Block *bl = &f->blocks[bi];
+                for (int k = 0; k < bl->nargs; k++)
+                    if (bl->arg_vals[k] >= 0 && bl->arg_vals[k] < defblk_n) defblk[bl->arg_vals[k]] = bi;
+                for (int i = 0; i < bl->nins; i++)
+                    if (bl->ins[i].result >= 0 && bl->ins[i].result < defblk_n) defblk[bl->ins[i].result] = bi;
+            }
+            defblk_dirty = false;
+        }
+        /* induction slot: icmp.a is an H arg passed unchanged to B */
+        int si = -1;
+        for (int j = 0; j < H->nargs; j++) if (H->arg_vals[j] == icmp->a) si = j;
+        if (si < 0 || ht->args[si] != icmp->a) continue;
+        Type ity = H->arg_types[si];
+        if (ity.kind != TY_INT) continue;
+        int bound = icmp->b;
+        int bound_slot = -1;
+        for (int j = 0; j < H->nargs; j++) if (H->arg_vals[j] == bound) bound_slot = j;
+        if (bound_slot < 0 && bound >= 0 && bound < defblk_n &&
+            (defblk[bound] == h || defblk[bound] == b)) continue;
+        /* step: B's outgoing value for slot si is add(B arg si, iconst > 0) */
+        int outv = bt->args[si];
+        if (outv == B->arg_vals[si]) continue;
+        Instr *add = NULL;
+        for (int i = 0; i < B->nins - 1; i++)
+            if (B->ins[i].result == outv) { add = &B->ins[i]; break; }
+        if (!add || add->op != OP_ADD) continue;
+        int64_t step = 0;
+        if (add->a == B->arg_vals[si]) { if (!opt_find_iconst(f, add->b, &step)) continue; }
+        else if (add->b == B->arg_vals[si]) { if (!opt_find_iconst(f, add->a, &step)) continue; }
+        else continue;
+        if (step <= 0) continue;
+        /* body scan: no calls/allocas/terminators; no H-defined operands */
+        bool ok = true;
+        for (int i = 0; i < B->nins - 1 && ok; i++) {
+            Instr *in = &B->ins[i];
+            uint8_t op = in->op;
+            if (op == OP_CALL || op == OP_TAILCALL || op == OP_CALLI ||
+                op == OP_TAILCALLI || op == OP_ALLOCA || op_is_terminator(op)) { ok = false; break; }
+            const int ops[3] = { in->a, in->b, in->c };
+            for (int q = 0; q < 3 && ok; q++) {
+                int v = ops[q];
+                if (v >= 0 && v < defblk_n && defblk[v] == h) {
+                    bool isarg = false;
+                    for (int j = 0; j < H->nargs; j++) if (H->arg_vals[j] == v) isarg = true;
+                    if (!isarg) ok = false;
+                }
+            }
+            for (int q = 0; q < in->nargs && ok; q++) {
+                int v = in->args[q];
+                if (v >= 0 && v < defblk_n && defblk[v] == h) {
+                    bool isarg = false;
+                    for (int j = 0; j < H->nargs; j++) if (H->arg_vals[j] == v) isarg = true;
+                    if (!isarg) ok = false;
+                }
+            }
+        }
+        if (!ok) continue;
+        /* H->B edge args must be H args or defined outside H */
+        for (int j = 0; j < ht->nargs && ok; j++) {
+            int v = ht->args[j];
+            if (v >= 0 && v < defblk_n && defblk[v] == h) {
+                bool isarg = false;
+                for (int q = 0; q < H->nargs; q++) if (H->arg_vals[q] == v) isarg = true;
+                if (!isarg) ok = false;
+            }
+        }
+        if (!ok) continue;
+        /* preheader: exactly two inedges to H (B's back edge + P) */
+        int inedges = 0, p = -1;
+        for (int q = 0; q < f->nblocks; q++) {
+            if (q == b) continue;
+            Block *pb = &f->blocks[q];
+            if (pb->nins < 1) continue;
+            Instr *pt = &pb->ins[pb->nins - 1];
+            if (pt->op == OP_BR && pt->blk == h) { inedges++; p = q; }
+            else if (pt->op == OP_CONDBR) {
+                if (pt->blk == h) { inedges++; p = q; }
+                if (pt->blk2 == h) { inedges++; p = q; }
+            }
+        }
+        if (inedges != 1 || p < 0 || p == h) continue;
+        /* ---- transform ---- */
+        int nargs = H->nargs;
+        Type *htypes = malloc(sizeof(Type) * (size_t)nargs);
+        Type *btypes = malloc(sizeof(Type) * (size_t)nargs);
+        int32_t *hb_args = ids_dup(ht->args, ht->nargs);
+        for (int j = 0; j < nargs; j++) { htypes[j] = H->arg_types[j]; btypes[j] = B->arg_types[j]; }
+        int g = func_add_block(f, htypes, nargs);
+        int cl[4];
+        for (int k = 0; k < U; k++) cl[k] = func_add_block(f, btypes, nargs);
+        free(htypes); free(btypes);
+        H = &f->blocks[h]; B = &f->blocks[b];
+        bt = &B->ins[B->nins - 1];
+        Block *G = &f->blocks[g];
+        /* guard: diff = bound - ind; ok = (diff >= U*step) */
+        int ind_g = G->arg_vals[si];
+        int bound_g = bound_slot >= 0 ? G->arg_vals[bound_slot] : bound;
+        Instr din = ins_bin(OP_SUB, ity, bound_g, ind_g);
+        din.result = lr_new_value(f, ity);
+        unroll_push(G, din);
+        Instr cin = ins_iconst(ity, (int64_t)U * step);
+        cin.result = lr_new_value(f, ity);
+        f->isconst[cin.result] = 1;
+        f->cval[cin.result] = (uint64_t)((int64_t)U * step);
+        unroll_push(G, cin);
+        Instr ein = ins_make(OP_ICMP, ty_i1());
+        ein.a = din.result; ein.b = cin.result; ein.pred = IC_SGE;
+        ein.result = lr_new_value(f, ty_i1());
+        unroll_push(G, ein);
+        int32_t *edge0 = malloc(sizeof(int32_t) * (size_t)nargs);
+        for (int j = 0; j < nargs; j++) {
+            int v = hb_args[j], mv = v;
+            for (int s = 0; s < nargs; s++) if (v == H->arg_vals[s]) mv = G->arg_vals[s];
+            edge0[j] = mv;
+        }
+        free(hb_args);
+        Instr tin = ins_condbr(ein.result, cl[0], edge0, nargs,
+                               h, ids_dup(G->arg_vals, nargs), nargs);
+        unroll_push(G, tin);
+        /* clones of B */
+        int nv0 = f->nvalues;
+        int32_t *map = malloc(sizeof(int32_t) * (size_t)(nv0 > 0 ? nv0 : 1));
+        uint8_t *has = calloc((size_t)(nv0 > 0 ? nv0 : 1), 1);
+        for (int k = 0; k < U; k++) {
+            Block *C = &f->blocks[cl[k]];
+            memset(has, 0, (size_t)(nv0 > 0 ? nv0 : 1));
+            for (int i = 0; i < B->nins - 1; i++) {
+                Instr in = B->ins[i];
+                in.a = unroll_mapval(f, C, B, map, has, nv0, in.a);
+                in.b = unroll_mapval(f, C, B, map, has, nv0, in.b);
+                in.c = unroll_mapval(f, C, B, map, has, nv0, in.c);
+                if (in.args) {
+                    int32_t *na = malloc(sizeof(int32_t) * (size_t)(in.nargs > 0 ? in.nargs : 1));
+                    for (int q = 0; q < in.nargs; q++) na[q] = unroll_mapval(f, C, B, map, has, nv0, in.args[q]);
+                    in.args = na;
+                }
+                if (in.args2) {
+                    int32_t *na = malloc(sizeof(int32_t) * (size_t)(in.nargs2 > 0 ? in.nargs2 : 1));
+                    for (int q = 0; q < in.nargs2; q++) na[q] = unroll_mapval(f, C, B, map, has, nv0, in.args2[q]);
+                    in.args2 = na;
+                }
+                if (in.result >= 0) {
+                    int nr = lr_new_value(f, f->vtypes[in.result]);
+                    if (in.result < nv0) { map[in.result] = nr; has[in.result] = 1; }
+                    in.result = nr;
+                }
+                unroll_push(C, in);
+            }
+            int32_t *outargs = malloc(sizeof(int32_t) * (size_t)nargs);
+            for (int j = 0; j < nargs; j++)
+                outargs[j] = unroll_mapval(f, C, B, map, has, nv0, bt->args[j]);
+            Instr br = ins_br(k + 1 < U ? cl[k + 1] : g, outargs, nargs);
+            unroll_push(C, br);
+            bt = &B->ins[B->nins - 1];
+        }
+        free(map); free(has);
+        /* retarget the preheader edge from H to G */
+        Block *Pb = &f->blocks[p];
+        Instr *pt = &Pb->ins[Pb->nins - 1];
+        if (pt->op == OP_BR && pt->blk == h) pt->blk = g;
+        else if (pt->op == OP_CONDBR) {
+            if (pt->blk == h) pt->blk = g;
+            else if (pt->blk2 == h) pt->blk2 = g;
+        }
+        st->rewritten++;
+        defblk_dirty = true;
+    }
+    free(defblk);
+}
+
 void opt_optimize(Module *m, const Cost *cost, OptStats *st) {
     OptStats local = { 0, 0, 0, 0 };
     if (!st) st = &local;
@@ -3003,6 +3235,7 @@ void opt_optimize(Module *m, const Cost *cost, OptStats *st) {
         /* seed float constant knowledge for the fold rules */
         optimize_func(&o);
         free(o.subst); free(o.usecount); free(o.konst); free(o.hask);
+        opt_unroll_loops(f, st);
         opt_rotate_loops(f, st);
         opt_eliminate_block_args(f, st);
     }
