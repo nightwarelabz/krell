@@ -9,7 +9,7 @@ Krell is built and maintained by NIGHTWARE LABZ. The differential battery passes
 - [Krell repository](https://github.com/nightwarelabz/krell): source, specification, examples, and releases
 - [Specification](https://github.com/nightwarelabz/krell/blob/main/docs/SPEC.md): language and binary-format specification
 - [Examples](https://github.com/nightwarelabz/krell/tree/main/examples): example Krell programs
-- [Releases](https://github.com/nightwarelabz/krell/releases): v1, v1.1, v2.0, v2.1, and v2.2
+- [Releases](https://github.com/nightwarelabz/krell/releases): v1, v1.1, v2.0, v2.1, v2.2, and v3.0
 
 ## Related projects
 

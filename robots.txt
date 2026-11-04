@@ -197,9 +197,8 @@ User-agent: DotBot
 Allow: /
 
 # --- Sitemaps -----------------------------------------------------------------
-# Goes live at this URL when this file and sitemap.xml are served from the
-# project's GitHub Pages root. The canonical project home is the repo below.
-Sitemap: https://nightwarelabz.github.io/krell/sitemap.xml
+# The canonical sitemap is served at krell.cc.
+Sitemap: https://krell.cc/sitemap.xml
 
 # Canonical project home:
 # https://github.com/nightwarelabz/krell
