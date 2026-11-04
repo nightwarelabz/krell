@@ -55,6 +55,16 @@ op aload.i lat 6 thr 2
 op astore.i lat 2 thr 1
 op fence.i lat 10 thr 5
 op aadd.i lat 16 thr 8
+op acmpxchg.i lat 24 thr 12
+op axchg.i lat 16 thr 8
+op asub.i lat 16 thr 8
+op aand.i lat 16 thr 8
+op aor.i lat 16 thr 8
+op axor.i lat 16 thr 8
+op amins.i lat 16 thr 8
+op amaxs.i lat 16 thr 8
+op aminu.i lat 16 thr 8
+op amaxu.i lat 16 thr 8
 op vsplat.v lat 8 thr 4
 op vadd.v lat 12 thr 6
 op vsub.v lat 12 thr 6

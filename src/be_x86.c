@@ -1486,6 +1486,73 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         store_gp(c, in->result, R11);
         break;
     }
+    case OP_AXCHG: {
+        load_gp(c, RAX, in->a);
+        load_gp(c, R11, in->b);
+        const char *r = t.bits == 8 ? "r11b" : t.bits == 16 ? "r11w" : t.bits == 32 ? "r11d" : "r11";
+        E(c, "  xchg [rax], %s", r);   /* xchg with memory is implicitly locked */
+        mask_r11(c, t);
+        store_gp(c, in->result, R11);
+        break;
+    }
+    case OP_ACMPXCHG: {
+        /* expected must be in rax; result (old value) returns in rax.
+         * rax's upper bits above the cell width hold the expected
+         * value's (canonical, zero) upper bits, so masking r11 after
+         * the copy recovers the old value exactly. */
+        load_gp(c, RCX, in->a);
+        load_gp(c, RAX, in->b);
+        load_gp(c, R11, in->c);
+        const char *r = t.bits == 8 ? "r11b" : t.bits == 16 ? "r11w" : t.bits == 32 ? "r11d" : "r11";
+        E(c, "  lock cmpxchg [rcx], %s", r);
+        E(c, "  mov r11, rax");
+        mask_r11(c, t);
+        store_gp(c, in->result, R11);
+        break;
+    }
+    case OP_ASUB: case OP_AAND: case OP_AOR: case OP_AXOR:
+    case OP_AMINS: case OP_AMAXS: case OP_AMINU: case OP_AMAXU: {
+        /* no other x86 RMW form returns the old value: load the old
+         * value, compute the new one, and attempt a cmpxchg; retry on
+         * contention. Result is the old value from the successful
+         * cmpxchg (in rax). */
+        int L = ++c->lbl, L2 = ++c->lbl, L3 = ++c->lbl;
+        const char **gn = gname(t.bits / 8);
+        load_gp(c, RCX, in->a);
+        load_gp(c, RDX, in->b);
+        E(c, ".Lx%d_%d:", c->fi, L);
+        if (t.bits == 8 || t.bits == 16)
+            E(c, "  movzx eax, %s PTR [rcx]", t.bits == 8 ? "BYTE" : "WORD");
+        else if (t.bits == 32) E(c, "  mov eax, DWORD PTR [rcx]");
+        else E(c, "  mov rax, QWORD PTR [rcx]");
+        E(c, "  mov %s, %s", gn[R11], gn[RAX]);
+        switch (in->op) {
+        case OP_ASUB: E(c, "  sub %s, %s", gn[R11], gn[RDX]); break;
+        case OP_AAND: E(c, "  and %s, %s", gn[R11], gn[RDX]); break;
+        case OP_AOR:  E(c, "  or %s, %s", gn[R11], gn[RDX]); break;
+        case OP_AXOR: E(c, "  xor %s, %s", gn[R11], gn[RDX]); break;
+        default: {
+            /* min/max: r11 takes the operand iff it wins the compare.
+             * The sized cmp sets flags for the cell width, so signed
+             * and unsigned conditions are exact at 8/16 bits too. */
+            const char *jw = in->op == OP_AMINS ? "jg" : in->op == OP_AMAXS ? "jl"
+                           : in->op == OP_AMINU ? "ja" : "jb";
+            E(c, "  cmp %s, %s", gn[RAX], gn[RDX]);
+            E(c, "  %s .Lx%d_%d", jw, c->fi, L2);
+            E(c, "  jmp .Lx%d_%d", c->fi, L3);
+            E(c, ".Lx%d_%d:", c->fi, L2);
+            E(c, "  mov %s, %s", gn[R11], gn[RDX]);
+            E(c, ".Lx%d_%d:", c->fi, L3);
+            break;
+        }
+        }
+        E(c, "  lock cmpxchg [rcx], %s", gn[R11]);
+        E(c, "  jne .Lx%d_%d", c->fi, L);
+        E(c, "  mov r11, rax");
+        mask_r11(c, t);
+        store_gp(c, in->result, R11);
+        break;
+    }
     case OP_MEMCPY: case OP_MEMSET: {
         /* args (dst, src/byte, n) -> (rdi, rsi, rdx) via parallel moves */
         Loc srcs[3], dsts[3];

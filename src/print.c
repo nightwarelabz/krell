@@ -61,8 +61,13 @@ static void ins_dump(Func *f, Instr *in, FILE *out) {
     case OP_VEXTRACT: fprintf(out, " %%%d, %lld", in->a, (long long)in->imm); break;
     case OP_VINSERT: fprintf(out, " %%%d, %%%d, %lld", in->a, in->b, (long long)in->imm); break;
     case OP_ALOAD: case OP_ASTORE: case OP_AADD:
+    case OP_AXCHG: case OP_ASUB: case OP_AAND: case OP_AOR: case OP_AXOR:
+    case OP_AMINS: case OP_AMAXS: case OP_AMINU: case OP_AMAXU:
         fprintf(out, ".%d %%%d", in->aux, in->a);
         if (in->b >= 0) fprintf(out, ", %%%d", in->b);
+        break;
+    case OP_ACMPXCHG:
+        fprintf(out, ".%d %%%d, %%%d, %%%d", in->aux, in->a, in->b, in->c);
         break;
     case OP_FENCE: fprintf(out, ".%d", in->aux); break;
     case OP_SELECT: fprintf(out, " %%%d, %%%d, %%%d", in->a, in->b, in->c); break;

@@ -792,6 +792,47 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         store_gp(c, in->result, X16);
         break;
     }
+    case OP_ACMPXCHG: {
+        load_gp(c, X16, in->a);
+        load_gp(c, X17, in->b);   /* expected; cas leaves the old value here */
+        load_gp(c, 0, in->c);     /* desired */
+        const char *ord = in->aux == AO_ACQUIRE ? "a" : in->aux == AO_RELEASE ? "l"
+                        : in->aux == AO_RELAXED ? "" : "al";
+        const char *sz = t.bits == 8 ? "b" : t.bits == 16 ? "h" : "";
+        char wr = t.bits == 64 ? 'x' : 'w';
+        E(c, "  cas%s%s %c17, %c0, [x16]", ord, sz, wr, wr);
+        mask_reg(c, X17, t);
+        store_gp(c, in->result, X17);
+        break;
+    }
+    case OP_AXCHG: case OP_ASUB: case OP_AAND: case OP_AOR: case OP_AXOR:
+    case OP_AMINS: case OP_AMAXS: case OP_AMINU: case OP_AMAXU: {
+        load_gp(c, X16, in->a);
+        load_gp(c, X17, in->b);
+        const char *ord = in->aux == AO_ACQUIRE ? "a" : in->aux == AO_RELEASE ? "l"
+                        : in->aux == AO_RELAXED ? "" : "al";
+        const char *sz = t.bits == 8 ? "b" : t.bits == 16 ? "h" : "";
+        char wr = t.bits == 64 ? 'x' : 'w';
+        const char *nm;
+        switch (in->op) {
+        case OP_AXCHG: nm = "swp"; break;
+        case OP_ASUB:  /* LSE has no ldsub: add the negated operand */
+            E(c, "  neg %c17, %c17", wr, wr); nm = "ldadd"; break;
+        case OP_AAND:  /* ldclr clears the operand's bits: complement it */
+            E(c, "  mvn %c17, %c17", wr, wr); nm = "ldclr"; break;
+        case OP_AOR:   nm = "ldset"; break;
+        case OP_AXOR:  nm = "ldeor"; break;
+        case OP_AMINS: nm = "ldsmin"; break;
+        case OP_AMAXS: nm = "ldsmax"; break;
+        case OP_AMINU: nm = "ldumin"; break;
+        default:       nm = "ldumax"; break;
+        }
+        E(c, "  %s%s%s %c17, %c0, [x16]", nm, ord, sz, wr, wr);
+        E(c, "  mov x16, x0");
+        mask_reg(c, X16, t);
+        store_gp(c, in->result, X16);
+        break;
+    }
     case OP_ALOAD: {
         load_gp(c, X16, in->a);
         bool acq = in->aux >= AO_ACQREL;

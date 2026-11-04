@@ -54,6 +54,9 @@ static const FSpec FUNCS[] = {
     /* memory functions (B cases) */
     { "mem",     3, { AK_PTR, AK_GP, AK_GP }, RK_GP },
     { "atomic",  2, { AK_PTR, AK_GP }, RK_GP },
+    { "rmw",     2, { AK_PTR, AK_GP }, RK_GP },
+    { "rmw32",   2, { AK_PTR, AK_GP }, RK_GP },
+    { "rmw8",    2, { AK_PTR, AK_GP }, RK_GP },
     { "vecadd",  2, { AK_PTR, AK_PTR }, RK_VOID },
     { "vecf",    3, { AK_PTR, AK_PTR, AK_F32 }, RK_VOID },
     { "vecins",  3, { AK_PTR, AK_PTR, AK_GP }, RK_VOID },
@@ -245,6 +248,12 @@ static void gen_cases(void) {
         push_bcase("mem", (uint64_t[]){ 32, (uint64_t)(rnd() % 41), (uint64_t)(uint32_t)rnd() });
     for (int i = 0; i < 12; i++)
         push_bcase("atomic", (uint64_t[]){ 0, rnd() });
+    for (int i = 0; i < 12; i++)
+        push_bcase("rmw", (uint64_t[]){ 0, rnd() });
+    for (int i = 0; i < 12; i++)
+        push_bcase("rmw32", (uint64_t[]){ 0, (uint64_t)(uint32_t)rnd() });
+    for (int i = 0; i < 12; i++)
+        push_bcase("rmw8", (uint64_t[]){ 0, rnd() });
     for (int i = 0; i < 12; i++)
         push_bcase("vecadd", (uint64_t[]){ 128, 0 });
     for (int i = 0; i < 12; i++)

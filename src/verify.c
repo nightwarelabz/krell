@@ -133,6 +133,21 @@ static const char *check_instr(Module *m, Func *f, Block *b, Instr *in, int idx)
         NEED(VT(in->a).kind == TY_PTR && ty_is_int(VT(in->b)) && ty_is_int(in->ty), "aadd mismatch");
         NEED(in->aux <= AO_RELEASE, "atomic ordering out of range");
         break;
+    case OP_ACMPXCHG:
+        NEED(VT(in->a).kind == TY_PTR && ty_is_int(VT(in->b)) && ty_is_int(VT(in->c)) && ty_is_int(in->ty), "acmpxchg mismatch");
+        NEED(VT(in->b).bits == in->ty.bits && VT(in->c).bits == in->ty.bits, "acmpxchg operand width mismatch");
+        NEED(in->ty.bits == 8 || in->ty.bits == 16 || in->ty.bits == 32 || in->ty.bits == 64,
+             "acmpxchg cell width must be 8, 16, 32 or 64");
+        NEED(in->aux <= AO_RELEASE, "atomic ordering out of range");
+        break;
+    case OP_AXCHG: case OP_ASUB: case OP_AAND: case OP_AOR: case OP_AXOR:
+    case OP_AMINS: case OP_AMAXS: case OP_AMINU: case OP_AMAXU:
+        NEED(VT(in->a).kind == TY_PTR && ty_is_int(VT(in->b)) && ty_is_int(in->ty), "atomic rmw mismatch");
+        NEED(VT(in->b).bits == in->ty.bits, "atomic rmw operand width mismatch");
+        NEED(in->ty.bits == 8 || in->ty.bits == 16 || in->ty.bits == 32 || in->ty.bits == 64,
+             "atomic rmw cell width must be 8, 16, 32 or 64");
+        NEED(in->aux <= AO_RELEASE, "atomic ordering out of range");
+        break;
     case OP_FENCE:
         /* a relaxed fence orders nothing and is rejected, not kept */
         NEED(in->aux == AO_ACQUIRE || in->aux == AO_RELEASE || in->aux == AO_ACQREL || in->aux == AO_SEQCST,

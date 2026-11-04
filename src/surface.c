@@ -487,13 +487,19 @@ static bool parse_instr(P *p, Func *f, int blk) {
         result = -1;
         break;
     }
-    case OP_ALOAD: case OP_AADD: {
+    case OP_ALOAD: case OP_AADD: case OP_AXCHG: case OP_ASUB: case OP_AAND:
+    case OP_AOR: case OP_AXOR: case OP_AMINS: case OP_AMAXS: case OP_AMINU:
+    case OP_AMAXU: case OP_ACMPXCHG: {
         if (!parse_type(p, &ty)) return false;
         int a = parse_value(p, f, blk, ty_ptr());
         Instr in = ins_make((uint8_t)op, ty); in.a = a; in.aux = (uint8_t)parse_order(p, w);
-        if (op == OP_AADD) {
+        if (op != OP_ALOAD) {
             if (!eat_ch(p, ',')) return false;
             in.b = parse_value(p, f, blk, ty);
+        }
+        if (op == OP_ACMPXCHG) {
+            if (!eat_ch(p, ',')) return false;
+            in.c = parse_value(p, f, blk, ty);
         }
         result = emit(f, blk, in);
         break;

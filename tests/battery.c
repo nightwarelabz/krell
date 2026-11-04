@@ -300,7 +300,86 @@ Module *build_battery(void) {
         int r = B(f, b, OP_MUL, ty_i64(), old, K(f, b, ty_i64(), 1000));
         emit(f, b, ins_ret(B(f, b, OP_ADD, ty_i64(), r, cur)));
     }
-    /* 22 vecadd(ptr dst, ptr src) */
+    /* 22 rmw(ptr p, i64 v) -> i64 : the v3 RMW family + cmpxchg over one
+     * cell. Every op returns the old value; fold them together and finish
+     * with the final cell contents (memory is compared too, via the B-case
+     * image). The first cmpxchg must succeed (expected = current cell),
+     * the second must fail unless the cell coincidentally holds 42. */
+    {
+        Func *f = mod_add_func(m, "rmw", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_ptr(), ty_i64() }, 2);
+        int p = ARG(f, b, 0), v = ARG(f, b, 1);
+        #define RMW1(op, operand) ({ Instr _i = ins_make((op), ty_i64()); _i.a = p; _i.b = (operand); _i.aux = AO_SEQCST; emit(f, b, _i); })
+        int o1 = RMW1(OP_AXCHG, v);
+        int o2 = RMW1(OP_ASUB, K(f, b, ty_i64(), 5));
+        int o3 = RMW1(OP_AAND, v);
+        int o4 = RMW1(OP_AOR, K(f, b, ty_i64(), 0x5a5a));
+        int o5 = RMW1(OP_AXOR, v);
+        int o6 = RMW1(OP_AMINS, K(f, b, ty_i64(), -3));
+        int o7 = RMW1(OP_AMAXS, K(f, b, ty_i64(), 17));
+        int o8 = RMW1(OP_AMINU, K(f, b, ty_i64(), 1000));
+        int o9 = RMW1(OP_AMAXU, K(f, b, ty_i64(), 3));
+        #undef RMW1
+        Instr al = ins_make(OP_ALOAD, ty_i64()); al.a = p; al.aux = AO_SEQCST;
+        int cur = emit(f, b, al);
+        Instr cx = ins_make(OP_ACMPXCHG, ty_i64()); cx.a = p; cx.b = cur; cx.c = K(f, b, ty_i64(), 42); cx.aux = AO_SEQCST;
+        int oc = emit(f, b, cx);
+        Instr cx2 = ins_make(OP_ACMPXCHG, ty_i64()); cx2.a = p; cx2.b = cur; cx2.c = K(f, b, ty_i64(), 43); cx2.aux = AO_ACQREL;
+        int oc2 = emit(f, b, cx2);
+        Instr al2 = ins_make(OP_ALOAD, ty_i64()); al2.a = p; al2.aux = AO_RELAXED;
+        int fin = emit(f, b, al2);
+        int olds[11] = { o1, o2, o3, o4, o5, o6, o7, o8, o9, oc, oc2 };
+        int r = fin;
+        for (int i = 0; i < 11; i++)
+            r = B(f, b, OP_ADD, ty_i64(), B(f, b, OP_MUL, ty_i64(), r, K(f, b, ty_i64(), 31)), olds[i]);
+        emit(f, b, ins_ret(r));
+    }
+    /* 23 rmw32(ptr p, i32 v) -> i32 : the 32-bit forms */
+    {
+        Func *f = mod_add_func(m, "rmw32", ty_i32(), 0);
+        int b = func_add_block(f, (Type[]){ ty_ptr(), ty_i32() }, 2);
+        int p = ARG(f, b, 0), v = ARG(f, b, 1);
+        #define RMW32(op, operand) ({ Instr _i = ins_make((op), ty_i32()); _i.a = p; _i.b = (operand); _i.aux = AO_SEQCST; emit(f, b, _i); })
+        int o1 = RMW32(OP_AXCHG, v);
+        int o2 = RMW32(OP_ASUB, K(f, b, ty_i32(), 100000));
+        int o3 = RMW32(OP_AMINS, K(f, b, ty_i32(), -7));
+        int o4 = RMW32(OP_AMAXU, K(f, b, ty_i32(), 65536));
+        #undef RMW32
+        Instr al = ins_make(OP_ALOAD, ty_i32()); al.a = p; al.aux = AO_SEQCST;
+        int cur = emit(f, b, al);
+        Instr cx = ins_make(OP_ACMPXCHG, ty_i32()); cx.a = p; cx.b = cur; cx.c = K(f, b, ty_i32(), -1); cx.aux = AO_SEQCST;
+        int oc = emit(f, b, cx);
+        int olds[5] = { o1, o2, o3, o4, oc };
+        int r = cur;
+        for (int i = 0; i < 5; i++)
+            r = B(f, b, OP_ADD, ty_i32(), B(f, b, OP_MUL, ty_i32(), r, K(f, b, ty_i32(), 31)), olds[i]);
+        emit(f, b, ins_ret(r));
+    }
+    /* 24 rmw8(ptr p, i64 v) -> i64 : the 8-bit (sub-word) forms */
+    {
+        Func *f = mod_add_func(m, "rmw8", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_ptr(), ty_i64() }, 2);
+        int p = ARG(f, b, 0), v = ARG(f, b, 1);
+        int v8 = U(f, b, OP_TRUNC, ty_i8(), v);
+        #define RMW8(op, operand) ({ Instr _i = ins_make((op), ty_i8()); _i.a = p; _i.b = (operand); _i.aux = AO_SEQCST; emit(f, b, _i); })
+        int o1 = RMW8(OP_AXCHG, v8);
+        int o2 = RMW8(OP_ASUB, K(f, b, ty_i8(), 3));
+        int o3 = RMW8(OP_AAND, v8);
+        int o4 = RMW8(OP_AMAXS, K(f, b, ty_i8(), -2));
+        #undef RMW8
+        Instr al = ins_make(OP_ALOAD, ty_i8()); al.a = p; al.aux = AO_SEQCST;
+        int cur = emit(f, b, al);
+        Instr cx = ins_make(OP_ACMPXCHG, ty_i8()); cx.a = p; cx.b = cur; cx.c = K(f, b, ty_i8(), 0x55); cx.aux = AO_SEQCST;
+        int oc = emit(f, b, cx);
+        int olds[5] = { o1, o2, o3, o4, oc };
+        int r = U(f, b, OP_ZEXT, ty_i64(), cur);
+        for (int i = 0; i < 5; i++) {
+            int z = U(f, b, OP_ZEXT, ty_i64(), olds[i]);
+            r = B(f, b, OP_ADD, ty_i64(), B(f, b, OP_MUL, ty_i64(), r, K(f, b, ty_i64(), 31)), z);
+        }
+        emit(f, b, ins_ret(r));
+    }
+    /* 25 vecadd(ptr dst, ptr src) */
     {
         Func *f = mod_add_func(m, "vecadd", ty_void(), 0);
         int b = func_add_block(f, (Type[]){ ty_ptr(), ty_ptr() }, 2);

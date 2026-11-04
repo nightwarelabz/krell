@@ -869,6 +869,136 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         }
         break;
     }
+    case OP_ACMPXCHG: {
+        load_gp(c, 16, in->c);    /* desired -> a6 (the sub-word dance owns a0..a5) */
+        load_gp(c, T0, in->a);
+        load_gp(c, T1, in->b);    /* expected */
+        const char *lrs = (in->aux == AO_ACQUIRE || in->aux == AO_ACQREL || in->aux == AO_SEQCST) ? ".aq" : "";
+        const char *scs = (in->aux == AO_RELEASE || in->aux == AO_ACQREL || in->aux == AO_SEQCST) ? ".rl" : "";
+        int L = ++c->lbl, L2 = ++c->lbl;
+        if (t.bits == 64) {
+            E(c, ".Lx%d_%d:", c->fi, L);
+            E(c, "  lr.d%s x%d, (x%d)", lrs, T2, T0);
+            E(c, "  bne x%d, x%d, .Lx%d_%d", T2, T1, c->fi, L2);
+            E(c, "  sc.d%s a1, a6, (x%d)", scs, T0);
+            E(c, "  bnez a1, .Lx%d_%d", c->fi, L);
+            E(c, ".Lx%d_%d:", c->fi, L2);
+            E(c, "  mv x%d, x%d", T0, T2);
+        } else if (t.bits == 32) {
+            /* lr.w sign-extends the loaded word: compare zero-extended */
+            E(c, "  slli x%d, x%d, 32", T1, T1);
+            E(c, "  srli x%d, x%d, 32", T1, T1);
+            E(c, ".Lx%d_%d:", c->fi, L);
+            E(c, "  lr.w%s a3, (x%d)", lrs, T0);
+            E(c, "  slli x%d, a3, 32", T2);
+            E(c, "  srli x%d, x%d, 32", T2, T2);
+            E(c, "  bne x%d, x%d, .Lx%d_%d", T2, T1, c->fi, L2);
+            E(c, "  sc.w%s a1, a6, (x%d)", scs, T0);
+            E(c, "  bnez a1, .Lx%d_%d", c->fi, L);
+            E(c, ".Lx%d_%d:", c->fi, L2);
+            E(c, "  mv x%d, x%d", T0, T2);
+        } else {
+            int eb = t.bits / 8;
+            E(c, "  andi x%d, x%d, -4", T2, T0);
+            E(c, "  andi a0, x%d, 3", T0);
+            E(c, "  slli a0, a0, 3");
+            E(c, "  li a1, %d", eb == 1 ? 0xff : 0xffff);
+            E(c, "  and a4, x%d, a1", T1);   /* expected lane */
+            E(c, ".Lx%d_%d:", c->fi, L);
+            E(c, "  lr.w%s a2, (x%d)", lrs, T2);
+            E(c, "  srl a3, a2, a0");
+            E(c, "  and a3, a3, a1");        /* old lane */
+            E(c, "  bne a3, a4, .Lx%d_%d", c->fi, L2);
+            E(c, "  sll a5, a1, a0");
+            E(c, "  not a5, a5");
+            E(c, "  and a2, a2, a5");
+            E(c, "  and a5, a6, a1");
+            E(c, "  sll a5, a5, a0");
+            E(c, "  or a2, a2, a5");
+            E(c, "  sc.w%s a5, a2, (x%d)", scs, T2);
+            E(c, "  bnez a5, .Lx%d_%d", c->fi, L);
+            E(c, ".Lx%d_%d:", c->fi, L2);
+            E(c, "  mv x%d, a3", T0);
+        }
+        mask_reg(c, T0, t);
+        store_gp(c, in->result, T0);
+        break;
+    }
+    case OP_AXCHG: case OP_ASUB: case OP_AAND: case OP_AOR: case OP_AXOR:
+    case OP_AMINS: case OP_AMAXS: case OP_AMINU: case OP_AMAXU: {
+        load_gp(c, T0, in->a);
+        load_gp(c, T1, in->b);
+        const char *ord = in->aux == AO_ACQUIRE ? ".aq" : in->aux == AO_RELEASE ? ".rl"
+                        : in->aux == AO_RELAXED ? "" : ".aqrl";
+        const char *nm = in->op == OP_AXCHG ? "amoswap" : in->op == OP_ASUB ? "amoadd"
+                       : in->op == OP_AAND ? "amoand" : in->op == OP_AOR ? "amoor"
+                       : in->op == OP_AXOR ? "amoxor" : in->op == OP_AMINS ? "amomin"
+                       : in->op == OP_AMAXS ? "amomax" : in->op == OP_AMINU ? "amominu" : "amomaxu";
+        if (t.bits == 64 || t.bits == 32) {
+            if (in->op == OP_ASUB) E(c, "  neg x%d, x%d", T1, T1);   /* no amosub: add the negation */
+            E(c, "  %s.%s%s x%d, x%d, (x%d)", nm, t.bits == 64 ? "d" : "w", ord, T2, T1, T0);
+            E(c, "  mv x%d, x%d", T0, T2);
+        } else {
+            /* sub-word: lr/sc word dance, as in aadd */
+            int L = ++c->lbl, L2 = ++c->lbl, L3 = ++c->lbl;
+            int eb = t.bits / 8;
+            const char *lrs = (in->aux == AO_ACQUIRE || in->aux == AO_ACQREL || in->aux == AO_SEQCST) ? ".aq" : "";
+            const char *scs = (in->aux == AO_RELEASE || in->aux == AO_ACQREL || in->aux == AO_SEQCST) ? ".rl" : "";
+            E(c, "  andi x%d, x%d, -4", T2, T0);
+            E(c, "  andi a0, x%d, 3", T0);
+            E(c, "  slli a0, a0, 3");
+            E(c, "  li a1, %d", eb == 1 ? 0xff : 0xffff);
+            E(c, ".Lx%d_%d:", c->fi, L);
+            E(c, "  lr.w%s a2, (x%d)", lrs, T2);
+            E(c, "  srl a3, a2, a0");
+            E(c, "  and a3, a3, a1");        /* old lane in a3 */
+            E(c, "  and a4, x%d, a1", T1);   /* operand lane in a4 */
+            switch (in->op) {
+            case OP_AXCHG: break;            /* new lane is the operand lane */
+            case OP_ASUB: E(c, "  sub a4, a3, a4"); E(c, "  and a4, a4, a1"); break;
+            case OP_AAND: E(c, "  and a4, a3, a4"); break;
+            case OP_AOR:  E(c, "  or a4, a3, a4"); break;
+            case OP_AXOR: E(c, "  xor a4, a3, a4"); break;
+            case OP_AMINS: case OP_AMAXS: {
+                /* signed compare needs sign-extended lanes */
+                int sh = 64 - t.bits;
+                E(c, "  slli a5, a3, %d", sh); E(c, "  srai a5, a5, %d", sh);
+                E(c, "  slli a6, a4, %d", sh); E(c, "  srai a6, a6, %d", sh);
+                E(c, "  %s a6, a5, .Lx%d_%d", in->op == OP_AMINS ? "bge" : "ble", c->fi, L2);
+                E(c, "  j .Lx%d_%d", c->fi, L3);
+                E(c, ".Lx%d_%d:", c->fi, L2);
+                E(c, "  mv a4, a3");
+                E(c, ".Lx%d_%d:", c->fi, L3);
+                break;
+            }
+            case OP_AMINU:
+                E(c, "  bgeu a4, a3, .Lx%d_%d", c->fi, L2);
+                E(c, "  j .Lx%d_%d", c->fi, L3);
+                E(c, ".Lx%d_%d:", c->fi, L2);
+                E(c, "  mv a4, a3");
+                E(c, ".Lx%d_%d:", c->fi, L3);
+                break;
+            default:   /* OP_AMAXU */
+                E(c, "  bleu a4, a3, .Lx%d_%d", c->fi, L2);
+                E(c, "  j .Lx%d_%d", c->fi, L3);
+                E(c, ".Lx%d_%d:", c->fi, L2);
+                E(c, "  mv a4, a3");
+                E(c, ".Lx%d_%d:", c->fi, L3);
+                break;
+            }
+            E(c, "  sll a5, a1, a0");
+            E(c, "  not a5, a5");
+            E(c, "  and a2, a2, a5");
+            E(c, "  sll a4, a4, a0");
+            E(c, "  or a2, a2, a4");
+            E(c, "  sc.w%s a5, a2, (x%d)", scs, T2);
+            E(c, "  bnez a5, .Lx%d_%d", c->fi, L);
+            E(c, "  mv x%d, a3", T0);
+        }
+        mask_reg(c, T0, t);
+        store_gp(c, in->result, T0);
+        break;
+    }
     case OP_AADD: {
         load_gp(c, T0, in->a);
         load_gp(c, T1, in->b);

@@ -46,6 +46,9 @@ extern int32_t krell_alloca(int32_t);
 /* memory functions */
 extern int32_t mem(void *, int64_t, int32_t);
 extern uint64_t atomic(void *, uint64_t);
+extern uint64_t rmw(void *, uint64_t);
+extern uint32_t rmw32(void *, uint32_t);
+extern uint64_t rmw8(void *, uint64_t);
 extern void vecadd(void *, const void *);
 extern void vecf(void *, const void *, float);
 extern void vecins(void *, const void *, int32_t);
@@ -133,6 +136,9 @@ static uint64_t run_bcase(const FInfo *fi, uint8_t *img, const uint64_t *args) {
     void *base = img;
     if (strcmp(fi->name, "mem") == 0) return (uint64_t)(uint32_t)mem(base + args[0], (int64_t)args[1], (int32_t)args[2]);
     if (strcmp(fi->name, "atomic") == 0) return atomic(base + args[0], args[1]);
+    if (strcmp(fi->name, "rmw") == 0) return rmw(base + args[0], args[1]);
+    if (strcmp(fi->name, "rmw32") == 0) return (uint64_t)(uint32_t)rmw32(base + args[0], (uint32_t)args[1]);
+    if (strcmp(fi->name, "rmw8") == 0) return rmw8(base + args[0], args[1]);
     if (strcmp(fi->name, "vecadd") == 0) { vecadd(base + args[0], base + args[1]); return 0; }
     if (strcmp(fi->name, "vecf") == 0) { vecf(base + args[0], base + args[1], ffrom(args[2])); return 0; }
     if (strcmp(fi->name, "vecins") == 0) { vecins(base + args[0], base + args[1], (int32_t)args[2]); return 0; }

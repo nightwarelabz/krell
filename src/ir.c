@@ -35,6 +35,9 @@ static const char *OPNAMES[OP_COUNT] = {
     [OP_VLSHR]="vlshr",
     [OP_LOADV]="loadv", [OP_STOREV]="storev",
     [OP_FENCE]="fence",
+    [OP_ACMPXCHG]="acmpxchg", [OP_AXCHG]="axchg", [OP_ASUB]="asub",
+    [OP_AAND]="aand", [OP_AOR]="aor", [OP_AXOR]="axor",
+    [OP_AMINS]="amins", [OP_AMAXS]="amaxs", [OP_AMINU]="aminu", [OP_AMAXU]="amaxu",
 };
 const char *op_name(int op) {
     if (op <= 0 || op >= OP_COUNT || !OPNAMES[op]) return "?op";
@@ -44,12 +47,23 @@ const char *op_name(int op) {
 bool op_is_terminator(int op) {
     return op == OP_BR || op == OP_CONDBR || op == OP_RET || op == OP_TAILCALL;
 }
+bool op_is_rmw(int op) {
+    switch (op) {
+    case OP_AADD: case OP_AXCHG: case OP_ASUB: case OP_AAND: case OP_AOR:
+    case OP_AXOR: case OP_AMINS: case OP_AMAXS: case OP_AMINU: case OP_AMAXU:
+        return true;
+    default:
+        return false;
+    }
+}
 bool op_is_pure(int op) {
     switch (op) {
     case OP_LOAD: case OP_STORE: case OP_ALOAD: case OP_ASTORE: case OP_AADD:
     case OP_MEMCPY: case OP_MEMSET: case OP_CALL: case OP_TAILCALL:
     case OP_BR: case OP_CONDBR: case OP_RET: case OP_ASSUME: case OP_VLOAD:
     case OP_VSTORE: case OP_ALLOCA: case OP_LOADV: case OP_STOREV: case OP_FENCE:
+    case OP_ACMPXCHG: case OP_AXCHG: case OP_ASUB: case OP_AAND: case OP_AOR:
+    case OP_AXOR: case OP_AMINS: case OP_AMAXS: case OP_AMINU: case OP_AMAXU:
         return false;
     default:
         return true;

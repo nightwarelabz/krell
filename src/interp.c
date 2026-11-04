@@ -405,6 +405,42 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
             memcpy(it->mem + A[0], &nv, n);
             break;
         }
+        case OP_ACMPXCHG: {
+            /* strong cmpxchg: result is the old value; the cell takes
+             * the desired value iff old == expected (no spurious failure) */
+            size_t n = mem_ty_size(in->ty);
+            if (A[0] + n > MEM_SIZE) return ierr(it, "interp: acmpxchg out of range");
+            uint64_t v = 0; memcpy(&v, it->mem + A[0], n);
+            R[0] = v & msk(in->ty.bits);
+            if (R[0] == (B[0] & msk(in->ty.bits))) {
+                uint64_t nv = C[0] & msk(in->ty.bits);
+                memcpy(it->mem + A[0], &nv, n);
+            }
+            break;
+        }
+        case OP_AXCHG: case OP_ASUB: case OP_AAND: case OP_AOR: case OP_AXOR:
+        case OP_AMINS: case OP_AMAXS: case OP_AMINU: case OP_AMAXU: {
+            size_t n = mem_ty_size(in->ty);
+            if (A[0] + n > MEM_SIZE) return ierr(it, "interp: atomic rmw out of range");
+            uint64_t v = 0; memcpy(&v, it->mem + A[0], n);
+            uint64_t old = v & msk(in->ty.bits);
+            R[0] = old;
+            uint64_t b = B[0] & msk(in->ty.bits);
+            uint64_t nv;
+            switch (in->op) {
+            case OP_AXCHG: nv = b; break;
+            case OP_ASUB:  nv = (old - b) & msk(in->ty.bits); break;
+            case OP_AAND:  nv = old & b; break;
+            case OP_AOR:   nv = old | b; break;
+            case OP_AXOR:  nv = old ^ b; break;
+            case OP_AMINS: nv = sx(old, in->ty.bits) < sx(b, in->ty.bits) ? old : b; break;
+            case OP_AMAXS: nv = sx(old, in->ty.bits) > sx(b, in->ty.bits) ? old : b; break;
+            case OP_AMINU: nv = old < b ? old : b; break;
+            default:       nv = old > b ? old : b; break;   /* OP_AMAXU */
+            }
+            memcpy(it->mem + A[0], &nv, n);
+            break;
+        }
         case OP_CALL: {
             IVal *cargs = malloc(sizeof(IVal) * (size_t)(in->nargs ? in->nargs : 1));
             for (int i = 0; i < in->nargs; i++) cargs[i].lanes = fr->lanes[in->args[i]];

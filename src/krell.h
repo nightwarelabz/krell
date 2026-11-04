@@ -71,6 +71,9 @@ enum {
     OP_VLSHR,   /* appended: existing opcode numbers are binary-format */
     OP_LOADV, OP_STOREV,  /* v3: volatile load/store (appended, v2 numbers unchanged) */
     OP_FENCE,             /* v3: ordering fence, aux = AO_* (appended) */
+    OP_ACMPXCHG,          /* v3: atomic compare-exchange, a=ptr b=expected c=desired, aux = AO_* */
+    OP_AXCHG, OP_ASUB, OP_AAND, OP_AOR, OP_AXOR,   /* v3: RMW family, a=ptr b=operand, aux = AO_* */
+    OP_AMINS, OP_AMAXS, OP_AMINU, OP_AMAXU,        /* v3: RMW signed/unsigned min/max */
     OP_COUNT
 };
 /* icmp predicates */
@@ -84,6 +87,7 @@ enum { AO_RELAXED = 0, AO_ACQREL = 1, AO_SEQCST = 2, AO_ACQUIRE = 3, AO_RELEASE 
 const char *op_name(int op);
 bool op_is_pure(int op);        /* no side effects, hash-consable */
 bool op_is_terminator(int op);
+bool op_is_rmw(int op);         /* atomic RMW returning the old value (aadd + v3 family) */
 
 /* ---------------- IR structures ---------------- */
 typedef struct {

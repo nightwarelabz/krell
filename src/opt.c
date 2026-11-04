@@ -885,6 +885,7 @@ static void optimize_func(Opt *o) {
                     || in->op == OP_STORE || in->op == OP_VSTORE || in->op == OP_CALL
                     || in->op == OP_MEMCPY || in->op == OP_MEMSET
                     || in->op == OP_ASTORE || in->op == OP_AADD
+                    || in->op == OP_ACMPXCHG || op_is_rmw(in->op)
                     /* volatile accesses are observable even when the
                      * loaded value is unused: root them so neither the
                      * access nor its operands can be eliminated */

@@ -97,6 +97,17 @@ static const char *PROG =
 "    ret %s\n"
 "}\n"
 "\n"
+"fn armw(ptr, i64) -> i64 {\n"
+"  entry(dst: ptr, val: i64):\n"
+"    %o1 = axchg.seqcst i64 dst, val\n"
+"    %o2 = asub.acqrel i64 dst, 5\n"
+"    %cur = sub i64 %o2, 5\n"
+"    %o3 = acmpxchg.seqcst i64 dst, %cur, 9\n"
+"    %o4 = aminu.relaxed i64 dst, 100\n"
+"    %r = add i64 %o3, %o4\n"
+"    ret %r\n"
+"}\n"
+"\n"
 "fn maybe_set(ptr, i32, i1) -> void {\n"
 "  entry(dst: ptr, val: i32, flag: i1):\n"
 "    condbr flag, set(dst, val), skip()\n"
@@ -168,6 +179,15 @@ int main(void) {
         rv.lanes = lb[0] + 16;
         if (interp_call(it, "vround", av, 2, &rv) != 0) { printf("FAIL vround interp\n"); failures++; }
         else if (rv.lanes[0] != 154 || img[0] != 77) { printf("FAIL vround: got %llu cell %u want 154/77\n", (unsigned long long)rv.lanes[0], img[0]); failures++; }
+        /* armw: axchg (old=77, cell=50), asub 5 (old=50, cell=45),
+         * acmpxchg expecting 45 -> 9 (old=45), aminu 100 (old=9, cell=9);
+         * returns 45 + 9 = 54 and leaves 9 in the cell */
+        uint64_t *cell = (uint64_t *)(mem + base + 16);
+        *cell = 77;
+        av[0].lanes[0] = base + 16; av[1].lanes[0] = 50;
+        rv.lanes = lb[0] + 16;
+        if (interp_call(it, "armw", av, 2, &rv) != 0) { printf("FAIL armw interp\n"); failures++; }
+        else if (rv.lanes[0] != 54 || *cell != 9) { printf("FAIL armw: got %llu cell %llu want 54/9\n", (unsigned long long)rv.lanes[0], (unsigned long long)*cell); failures++; }
     }
     interp_free(it);
     /* a condbr to a block that does not exist is a parse error,

@@ -427,6 +427,33 @@ static void emit_instr(Ctx *c, Instr *in) {
         E(c, "  %s = atomicrmw add ptr %s, %s %s %s, align %d", R, ab, tb, bb, ord, al);
         break;
     }
+    case OP_ACMPXCHG: {
+        /* strong cmpxchg; the IR result is the old value (first element
+         * of LLVM's {ty, i1} pair). The failure ordering is the success
+         * ordering weakened: acq_rel -> acquire, release -> monotonic
+         * (LLVM forbids release/acq_rel as a failure ordering). */
+        char ctb[48]; ty_str(c, f->vtypes[in->c], ctb, sizeof ctb);
+        const char *ord = in->aux == AO_SEQCST ? "seq_cst" : in->aux == AO_ACQREL ? "acq_rel"
+                        : in->aux == AO_ACQUIRE ? "acquire" : in->aux == AO_RELEASE ? "release" : "monotonic";
+        const char *ford = in->aux == AO_ACQREL ? "acquire" : in->aux == AO_RELEASE ? "monotonic" : ord;
+        int al = t.bits >= 8 ? t.bits / 8 : 1;
+        int n = emit_tmp(c, "cmpxchg ptr %s, %s %s, %s %s %s %s, align %d",
+                         ab, tb, bb, ctb, cb, ord, ford, al);
+        E(c, "  %s = extractvalue { %s, i1 } %%t%d, 0", R, tb, n);
+        break;
+    }
+    case OP_AXCHG: case OP_ASUB: case OP_AAND: case OP_AOR: case OP_AXOR:
+    case OP_AMINS: case OP_AMAXS: case OP_AMINU: case OP_AMAXU: {
+        const char *nm = in->op == OP_AXCHG ? "xchg" : in->op == OP_ASUB ? "sub"
+                       : in->op == OP_AAND ? "and" : in->op == OP_AOR ? "or"
+                       : in->op == OP_AXOR ? "xor" : in->op == OP_AMINS ? "min"
+                       : in->op == OP_AMAXS ? "max" : in->op == OP_AMINU ? "umin" : "umax";
+        const char *ord = in->aux == AO_SEQCST ? "seq_cst" : in->aux == AO_ACQREL ? "acq_rel"
+                        : in->aux == AO_ACQUIRE ? "acquire" : in->aux == AO_RELEASE ? "release" : "monotonic";
+        int al = t.bits >= 8 ? t.bits / 8 : 1;
+        E(c, "  %s = atomicrmw %s ptr %s, %s %s %s, align %d", R, nm, ab, tb, bb, ord, al);
+        break;
+    }
     case OP_FENCE: {
         const char *ord = in->aux == AO_SEQCST ? "seq_cst" : in->aux == AO_ACQREL ? "acq_rel"
                         : in->aux == AO_ACQUIRE ? "acquire" : "release";
