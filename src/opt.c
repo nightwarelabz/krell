@@ -121,6 +121,14 @@ static uint64_t eval_bin(int op, Type t, uint64_t A, uint64_t B) {
     }
     return 0;
 }
+static uint64_t eval_tri(int op, Type t, uint64_t A, uint64_t B, uint64_t C) {
+    int bits = t.bits;
+    uint64_t m = msk64(bits);
+    A &= m; B &= m;
+    uint64_t s = C % (uint64_t)bits;
+    if (op == OP_FSHL) return (s ? ((A << s) | (B >> ((uint64_t)bits - s))) : A) & m;
+    return (s ? ((A << ((uint64_t)bits - s)) | (B >> s)) : B) & m;
+}
 static uint64_t eval_un(int op, Type t, uint64_t A) {
     int bits = t.bits;
     uint64_t m = msk64(bits);
@@ -239,6 +247,69 @@ static Instr *local_def(InsVec *nb, int v) {
     return NULL;
 }
 
+/* ---- assumption facts ----
+ * An `assume c` instruction asserts c is true from that point on.
+ * Within the remainder of the same block the optimizer trusts the
+ * assertion: a select or branch whose condition the assertion decides
+ * (the asserted value itself, its negation, or a comparison against
+ * the same constant with the same or the complementary predicate)
+ * resolves statically, and so does a later comparison the assertion
+ * pins. Facts never cross block boundaries and never survive the
+ * block, so a producer only has to keep the assertion true on the
+ * paths that reach it in its own block. This is how a producer
+ * contract ("this count is nonzero here") removes the defensive
+ * select a total-semantics op would otherwise force on a hot loop. */
+static int icmp_neg_pred(int p) {
+    switch (p) {
+    case IC_EQ: return IC_NE;  case IC_NE: return IC_EQ;
+    case IC_ULT: return IC_UGE; case IC_UGE: return IC_ULT;
+    case IC_ULE: return IC_UGT; case IC_UGT: return IC_ULE;
+    case IC_SLT: return IC_SGE; case IC_SGE: return IC_SLT;
+    case IC_SLE: return IC_SGT; case IC_SGT: return IC_SLE;
+    }
+    return -1;
+}
+static int icmp_swap_pred(int p) {
+    switch (p) {
+    case IC_ULT: return IC_UGT; case IC_UGT: return IC_ULT;
+    case IC_ULE: return IC_UGE; case IC_UGE: return IC_ULE;
+    case IC_SLT: return IC_SGT; case IC_SGT: return IC_SLT;
+    case IC_SLE: return IC_SGE; case IC_SGE: return IC_SLE;
+    default: return p;
+    }
+}
+typedef struct { int32_t x; int64_t k; uint8_t pred; } AFact;
+/* truth of (x pred k) under the facts: 1 decided-true, 0 decided-false,
+ * -1 not decided */
+static int afact_query(const AFact *fs, int n, int pred, int32_t x, int64_t k) {
+    for (int i = 0; i < n; i++)
+        if (fs[i].x == x && fs[i].k == k) {
+            if (fs[i].pred == (uint8_t)pred) return 1;
+            if (icmp_neg_pred(fs[i].pred) == pred) return 0;
+        }
+    return -1;
+}
+/* truth of a condition value under the block's assumption facts */
+static int cond_truth(Opt *o, InsVec *nb, const int32_t *at, int nat,
+                      const AFact *fs, int nfs, int cv) {
+    for (int i = 0; i < nat; i++) if (at[i] == cv) return 1;
+    Instr *d = local_def(nb, cv);
+    if (!d) return -1;
+    if (d->op == OP_ICMP) {
+        int64_t kv; int xv = -1, pred = d->pred;
+        if (isk(o, d->b, &kv)) xv = d->a;
+        else if (isk(o, d->a, &kv)) { xv = d->b; pred = icmp_swap_pred(pred); }
+        if (xv >= 0) return afact_query(fs, nfs, pred, xv, kv);
+        return -1;
+    }
+    if (d->op == OP_NOT) {
+        int inner = cond_truth(o, nb, at, nat, fs, nfs, d->a);
+        return inner < 0 ? -1 : !inner;
+    }
+    return -1;
+}
+
+
 static bool match_rgb_scale(Opt *o, InsVec *nb, Instr *pk_in, int *out_px, int *out_light) {
     if (pk_in->op != OP_ADD && pk_in->op != OP_OR) return false;
     if (pk_in->ty.kind != TY_INT || pk_in->ty.bits != 32) return false;
@@ -321,6 +392,126 @@ static bool match_rgb_scale(Opt *o, InsVec *nb, Instr *pk_in, int *out_px, int *
     return false;
 }
 
+/* ---- identity block-argument elimination ----
+ * A block parameter is an identity parameter when every predecessor
+ * edge passes it the same value (resolving through other identity
+ * parameters), where an edge that passes the parameter itself — the
+ * loop back-edge carrying a value the loop never changes — is
+ * consistent with any anchor. Such a parameter always holds its
+ * anchor value, so every use can name the anchor directly and the
+ * parameter (and its per-edge traffic) disappears. This is the
+ * standard all-same-incoming phi elimination, applied to block
+ * arguments: loop-invariant values stop being copied around the loop
+ * on every iteration, in spill slots as often as in registers.
+ * Soundness is the phi argument: on entry the parameter equals the
+ * anchor (the anchoring edges), and a self edge preserves whatever
+ * the parameter already holds. Entry-block parameters are the
+ * function's arguments and are never eliminated, only anchored to. */
+static int idresolve(const int32_t *elim, int v) {
+    int guard = 0;
+    while (v >= 0 && elim[v] >= 0) {
+        if (++guard > 100000) return -1;   /* cycle: not anchored */
+        v = elim[v];
+    }
+    return v;
+}
+static void elim_identity_params(Func *f) {
+    if (f->nblocks < 2 || f->nvalues <= 0) return;
+    int32_t *elim = malloc(sizeof(int32_t) * (size_t)f->nvalues);
+    for (int i = 0; i < f->nvalues; i++) elim[i] = -1;
+    /* fixpoint: mark parameters whose edges all anchor to one value */
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int bi = 1; bi < f->nblocks; bi++) {
+            Block *b = &f->blocks[bi];
+            for (int j = 0; j < b->nargs; j++) {
+                int32_t p = b->arg_vals[j];
+                if (elim[p] >= 0) continue;
+                int32_t anchor = -2;
+                for (int xi = 0; xi < f->nblocks && anchor != -1; xi++) {
+                    Block *x = &f->blocks[xi];
+                    if (x->nins == 0) continue;
+                    Instr *t = &x->ins[x->nins - 1];
+                    const int32_t *eas[2] = { NULL, NULL };
+                    if (t->op == OP_BR && t->blk == bi) eas[0] = t->args;
+                    else if (t->op == OP_CONDBR) {
+                        if (t->blk == bi) eas[0] = t->args;
+                        if (t->blk2 == bi) eas[1] = t->args2;
+                    }
+                    if (!eas[0] && !eas[1]) continue;
+                    for (int e = 0; e < 2 && anchor != -1; e++) {
+                        if (!eas[e]) continue;
+                        int32_t r = idresolve(elim, eas[e][j]);
+                        if (r < 0) { anchor = -1; break; }
+                        if (r == p) continue;      /* self edge: consistent */
+                        if (anchor == -2) anchor = r;
+                        else if (anchor != r) { anchor = -1; break; }
+                    }
+                }
+                if (anchor >= 0) { elim[p] = anchor; changed = true; }
+            }
+        }
+    }
+    bool any = false;
+    for (int i = 0; i < f->nvalues; i++) if (elim[i] >= 0) { any = true; break; }
+    if (!any) { free(elim); return; }
+    /* snapshot every block's original parameter values: edge-arg
+     * filtering is positional against this list */
+    int32_t **snap = malloc(sizeof(int32_t *) * (size_t)f->nblocks);
+    int *snapn = malloc(sizeof(int) * (size_t)f->nblocks);
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = &f->blocks[bi];
+        snapn[bi] = b->nargs;
+        snap[bi] = malloc(sizeof(int32_t) * (size_t)(b->nargs ? b->nargs : 1));
+        memcpy(snap[bi], b->arg_vals, sizeof(int32_t) * (size_t)b->nargs);
+    }
+    /* filter each terminator's edge args: keep position j iff the
+     * target's original parameter j survived */
+    for (int xi = 0; xi < f->nblocks; xi++) {
+        Block *x = &f->blocks[xi];
+        if (x->nins == 0) continue;
+        Instr *t = &x->ins[x->nins - 1];
+        int ne = t->op == OP_CONDBR ? 2 : t->op == OP_BR ? 1 : 0;
+        for (int e = 0; e < ne; e++) {
+            int32_t tb = e == 0 ? t->blk : t->blk2;
+            int32_t **args = e == 0 ? &t->args : &t->args2;
+            uint16_t *n = e == 0 ? &t->nargs : &t->nargs2;
+            int w = 0;
+            for (int j = 0; j < *n; j++)
+                if (elim[snap[tb][j]] < 0) (*args)[w++] = (*args)[j];
+            *n = (uint16_t)w;
+        }
+    }
+    /* rewrite every operand use to its anchor */
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *b = &f->blocks[bi];
+        for (int ii = 0; ii < b->nins; ii++) {
+            Instr *in = &b->ins[ii];
+            if (in->a >= 0) in->a = idresolve(elim, in->a);
+            if (in->b >= 0) in->b = idresolve(elim, in->b);
+            if (in->c >= 0 && in->op != OP_ALLOCA) in->c = idresolve(elim, in->c);
+            for (int i = 0; i < in->nargs; i++) in->args[i] = idresolve(elim, in->args[i]);
+            for (int i = 0; i < in->nargs2; i++) in->args2[i] = idresolve(elim, in->args2[i]);
+        }
+    }
+    /* drop the parameters from each block */
+    for (int bi = 1; bi < f->nblocks; bi++) {
+        Block *b = &f->blocks[bi];
+        int w = 0;
+        for (int j = 0; j < b->nargs; j++)
+            if (elim[b->arg_vals[j]] < 0) {
+                b->arg_vals[w] = b->arg_vals[j];
+                b->arg_types[w] = b->arg_types[j];
+                w++;
+            }
+        b->nargs = w;
+    }
+    for (int bi = 0; bi < f->nblocks; bi++) free(snap[bi]);
+    free(snap); free(snapn);
+    free(elim);
+}
+
 static void optimize_func(Opt *o) {
     Func *f = o->f;
     /* phase 1: original constant map + use counts */
@@ -344,6 +535,9 @@ static void optimize_func(Opt *o) {
         Block *b = &f->blocks[bi];
         InsVec nb = { 0 };
         KCache kc = { 0 };
+        /* block-local assumption facts (see the helpers above) */
+        int32_t atrue[32]; int na_true = 0;
+        AFact afacts[32]; int na_facts = 0;
         for (int ii = 0; ii < b->nins; ii++) {
             Instr w = b->ins[ii];
             /* rewrite operands through the substitution map */
@@ -402,6 +596,19 @@ static void optimize_func(Opt *o) {
             case OP_FREEZE:
                 o->subst[w.result] = w.a; drop_uses(o, &w); keep = false; o->st->rewritten++;
                 break;
+            case OP_FSHL: case OP_FSHR: {
+                if (ha && hb && hc) {
+                    uint64_t r = eval_tri(w.op, t, (uint64_t)ka, (uint64_t)kb, (uint64_t)kcst);
+                    w = ins_iconst(t, (int64_t)(r & msk64(t.bits)));
+                    w.result = b->ins[ii].result;
+                    o->hask[w.result] = 1; o->konst[w.result] = (int64_t)(r & msk64(t.bits));
+                    o->st->folded++;
+                } else if (hc && ((uint64_t)kcst % (uint64_t)t.bits) == 0) {
+                    o->subst[w.result] = w.op == OP_FSHL ? w.a : w.b;
+                    drop_uses(o, &w); keep = false; o->st->rewritten++;
+                }
+                break;
+            }
             case OP_ADD: case OP_SUB: case OP_MUL: case OP_UDIV: case OP_SDIV:
             case OP_UREM: case OP_SREM: case OP_AND: case OP_OR: case OP_XOR:
             case OP_SHL: case OP_LSHR: case OP_ASHR: {
@@ -720,6 +927,18 @@ static void optimize_func(Opt *o) {
                         }
                     }
                 }
+                {
+                    /* assumption facts pin this comparison statically */
+                    int fx = -1; int64_t fk = 0; int fp = w.pred;
+                    if (hb) { fx = w.a; fk = kb; }
+                    else if (ha) { fx = w.b; fk = ka; fp = icmp_swap_pred(fp); }
+                    int tr = fx >= 0 ? afact_query(afacts, na_facts, fp, fx, fk) : -1;
+                    if (tr >= 0) {
+                        w = ins_iconst(t, tr); w.result = b->ins[ii].result;
+                        o->hask[w.result] = 1; o->konst[w.result] = tr; o->st->folded++;
+                        break;
+                    }
+                }
                 if (ha && hb) {
                     int r = eval_icmp(w.pred, at, (uint64_t)ka, (uint64_t)kb);
                     w = ins_iconst(t, r); w.result = b->ins[ii].result;
@@ -741,7 +960,38 @@ static void optimize_func(Opt *o) {
                     o->hask[w.result] = 1; o->konst[w.result] = (int64_t)r; o->st->folded++;
                 } else {
                     Instr *d = local_def(&nb, w.a);
-                    if (d && (d->op == OP_ZEXT || d->op == OP_SEXT) && w.op == OP_TRUNC) {
+                    if (w.op == OP_ZEXT && d && o->usecount[w.a] == 1 &&
+                        (d->op == OP_LSHR || d->op == OP_AND || d->op == OP_OR || d->op == OP_XOR)) {
+                        /* zext commutes with bitwise ops and with lshr:
+                         * the narrow op's zeroed high bits are exactly
+                         * the wide op's zero operand bits. Widening the
+                         * op removes the separate extend copy from
+                         * field-extraction chains (extract a field at
+                         * narrow width, extend for the consumer). The
+                         * lshr amount must be a genuine narrow shift
+                         * (amounts are modulo width, so an amount >=
+                         * the narrow width would mean different shifts
+                         * at the two widths). For or/xor the constant
+                         * must fit the narrow width: the narrow op
+                         * masks K to that width, but the widened op
+                         * would apply K's full value and import its
+                         * bits above the narrow width into the
+                         * zero-extended result. (and needs no guard:
+                         * zext(x)'s high bits are 0.) */
+                        int64_t kv;
+                        if (isk(o, d->b, &kv) && (d->op != OP_LSHR || (kv >= 0 && kv < at.bits)) &&
+                            ((d->op != OP_OR && d->op != OP_XOR) || (kv >= 0 && (((uint64_t)kv & ~msk64(at.bits)) == 0)))) {
+                            int da = d->a;
+                            int zx = opt_new_value(o, t);
+                            Instr ze = ins_un(OP_ZEXT, t, da); ze.result = zx; iv_push(&nb, ze);
+                            o->usecount[da]++;
+                            o->usecount[zx] = 1;
+                            w.op = d->op; w.a = zx;
+                            w.b = block_iconst(o, &nb, &kc, t, kv);
+                            o->st->rewritten++;
+                        }
+                    }
+                    else if (d && (d->op == OP_ZEXT || d->op == OP_SEXT) && w.op == OP_TRUNC) {
                         Type inner = f->vtypes[d->a];
                         if (t.bits == inner.bits) { o->subst[w.result] = d->a; drop_uses(o, &w); keep = false; o->st->rewritten++; }
                         else if (t.bits > inner.bits) { w.op = d->op; w.a = d->a; o->st->rewritten++; }
@@ -752,8 +1002,29 @@ static void optimize_func(Opt *o) {
                 }
                 break;
             }
+            case OP_ASSUME: {
+                /* record block-local facts from the assertion; the
+                 * instruction itself stays (phase 3 sweeps assumes,
+                 * they emit no code) */
+                if (na_true < 32) atrue[na_true++] = w.a;
+                Instr *d = local_def(&nb, w.a);
+                if (d && d->op == OP_ICMP) {
+                    int64_t kv; int xv = -1, pred = d->pred;
+                    if (isk(o, d->b, &kv)) xv = d->a;
+                    else if (isk(o, d->a, &kv)) { xv = d->b; pred = icmp_swap_pred(pred); }
+                    if (xv >= 0 && na_facts < 32) {
+                        afacts[na_facts].x = xv; afacts[na_facts].k = kv;
+                        afacts[na_facts].pred = (uint8_t)pred; na_facts++;
+                    }
+                }
+                break;
+            }
             case OP_SELECT: {
-                if (ha) {
+                int tr = cond_truth(o, &nb, atrue, na_true, afacts, na_facts, w.a);
+                if (tr >= 0) {
+                    o->subst[w.result] = tr ? w.b : w.c;
+                    drop_uses(o, &w); keep = false; o->st->rewritten++;
+                } else if (ha) {
                     o->subst[w.result] = ka ? w.b : w.c;
                     drop_uses(o, &w); keep = false; o->st->rewritten++;
                 } else if (w.b == w.c) {
@@ -763,6 +1034,10 @@ static void optimize_func(Opt *o) {
                 break;
             }
             case OP_CONDBR: {
+                if (!ha) {
+                    int tr = cond_truth(o, &nb, atrue, na_true, afacts, na_facts, w.a);
+                    if (tr >= 0) { ha = true; ka = tr; }
+                }
                 if (ha) {
                     int32_t *args = ka ? w.args : w.args2;
                     int n = ka ? w.nargs : w.nargs2;
@@ -2611,6 +2886,44 @@ static void opt_rotate_loops(Func *f, OptStats *st) {
             }
         }
         if (inedges != 2) continue;
+        /* The rotation binds B's next-iteration values only through
+         * B's own parameters (the self edge's argument list). If any
+         * non-terminator instruction in B references an H parameter
+         * -- or H's compare result -- directly, that reference has
+         * no binding on the self edge and would keep whatever value
+         * H held on the preheader edge, freezing the carried state.
+         * Identity block-argument elimination produces exactly this
+         * shape when it removes B's pass-through parameters (every
+         * B parameter anchored to the H parameter it mirrors), so
+         * the check is: B may only touch H-scope values through its
+         * own parameters. Reject the rotation otherwise. */
+        {
+            bool direct = false;
+            for (int ii = 0; ii + 1 < B->nins && !direct; ii++) {
+                Instr *in = &B->ins[ii];
+                const int32_t ops3[3] = { in->a, in->b, in->c };
+                for (int k = 0; k < 3 && !direct; k++) {
+                    int32_t v = ops3[k];
+                    if (v < 0) continue;
+                    if (v == icmp->result) { direct = true; break; }
+                    for (int j = 0; j < H->nargs; j++)
+                        if (v == H->arg_vals[j]) { direct = true; break; }
+                }
+                for (int k = 0; k < in->nargs && !direct; k++) {
+                    int32_t v = in->args[k];
+                    if (v == icmp->result) direct = true;
+                    for (int j = 0; j < H->nargs && !direct; j++)
+                        if (v == H->arg_vals[j]) direct = true;
+                }
+                for (int k = 0; k < in->nargs2 && !direct; k++) {
+                    int32_t v = in->args2[k];
+                    if (v == icmp->result) direct = true;
+                    for (int j = 0; j < H->nargs && !direct; j++)
+                        if (v == H->arg_vals[j]) direct = true;
+                }
+            }
+            if (direct) continue;
+        }
         /* remap: H-scope value -> B-scope value. H args map through
          * B's outgoing list; values defined outside H and B map to
          * themselves; anything else rejects. */
@@ -3247,6 +3560,12 @@ void opt_optimize(Module *m, const Cost *cost, OptStats *st) {
         optimize_func(&o);
         free(o.subst); free(o.usecount); free(o.konst); free(o.hask);
         opt_unroll_loops(f, st);
+        /* identity block-argument elimination runs after the unroller:
+         * run at the head of optimize_func it changes loop shapes the
+         * unroller's pattern recognition depends on, and span/mix lost
+         * their unrolled forms (WP24 round 2). The unroller now sees
+         * the same shapes the base pipeline presents. */
+        elim_identity_params(f);
         opt_rotate_loops(f, st);
         opt_eliminate_block_args(f, st);
     }

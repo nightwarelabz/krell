@@ -40,6 +40,8 @@ Constants and identity:
 Integer: `add sub mul udiv sdiv urem srem neg and or xor not shl lshr ashr`
 `icmp.<pred>` (pred in eq ne ult ule ugt uge slt sle sgt sge)
 `popcount clz ctz bswap` (bswap: i16/i32/i64)
+`fshl fshr` (funnel shifts: three operands — high part, low part, shift
+amount; i8/i16/i32/i64)
 `trunc zext sext`
 
 Float: `fadd fsub fmul fdiv fneg fabs fma`

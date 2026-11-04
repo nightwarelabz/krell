@@ -39,12 +39,17 @@ extern double fround(float);
 extern float fround2(double);
 extern uint64_t manyargs(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, double, double);
 extern uint64_t spills(uint64_t);
+extern uint64_t clobx(uint64_t);
+extern uint64_t clobcall(uint64_t);
+extern uint64_t selx(uint64_t);
+extern uint64_t rotw(uint64_t, uint64_t);
 /* battery name "alloca" collides with libc's; the IR function is emitted
  * under its module name "alloca" — see note in the build script: the
  * emitted symbol is renamed there. We declare the renamed symbol. */
 extern int32_t krell_alloca(int32_t);
 /* memory functions */
 extern int32_t mem(void *, int64_t, int32_t);
+extern uint64_t stx(void *, void *, int64_t);
 extern uint64_t atomic(void *, uint64_t);
 extern uint64_t rmw(void *, uint64_t);
 extern uint32_t rmw32(void *, uint32_t);
@@ -77,6 +82,16 @@ static uint64_t sh_cvt_f32i(const uint64_t *a) { return (uint64_t)(uint32_t)cvt_
 static uint64_t sh_cmp64(const uint64_t *a) { return cmp64(a[0], a[1]); }
 static uint64_t sh_fcmp64(const uint64_t *a) { return fcmp64(dfrom(a[0]), dfrom(a[1])); }
 static uint64_t sh_sel(const uint64_t *a) { return sel(a[0], a[1], a[2]); }
+extern uint64_t asmchk(uint64_t, uint64_t);
+static uint64_t sh_asmchk(const uint64_t *a) { return asmchk(a[0], a[1]); }
+extern uint64_t extch(uint32_t, uint32_t);
+static uint64_t sh_extch(const uint64_t *a) { return extch((uint32_t)a[0], (uint32_t)a[1]); }
+extern uint64_t fsh64(uint64_t, uint64_t, uint64_t);
+static uint64_t sh_fsh64(const uint64_t *a) { return fsh64(a[0], a[1], a[2]); }
+extern uint32_t fsh32(uint32_t, uint32_t, uint32_t);
+static uint64_t sh_fsh32(const uint64_t *a) { return (uint64_t)fsh32((uint32_t)a[0], (uint32_t)a[1], (uint32_t)a[2]); }
+extern uint16_t fsh16(uint16_t, uint16_t, uint16_t);
+static uint64_t sh_fsh16(const uint64_t *a) { return (uint64_t)fsh16((uint16_t)a[0], (uint16_t)a[1], (uint16_t)a[2]); }
 static uint64_t sh_branch(const uint64_t *a) { return branch(a[0]); }
 static uint64_t sh_loop(const uint64_t *a) { return loop(a[0]); }
 static uint64_t sh_caller(const uint64_t *a) { return caller(a[0], a[1]); }
@@ -92,6 +107,10 @@ static uint64_t sh_manyargs(const uint64_t *a) {
     return manyargs(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], dfrom(a[8]), dfrom(a[9]));
 }
 static uint64_t sh_spills(const uint64_t *a) { return spills(a[0]); }
+static uint64_t sh_clobx(const uint64_t *a) { return clobx(a[0]); }
+static uint64_t sh_clobcall(const uint64_t *a) { return clobcall(a[0]); }
+static uint64_t sh_selx(const uint64_t *a) { return selx(a[0]); }
+static uint64_t sh_rotw(const uint64_t *a) { return rotw(a[0], a[1]); }
 /* AL probes: tiny asm stubs (not C functions - a C prologue may
  * itself use AL) that return the AL value the caller set, which for
  * a fixed-signature extern call must equal the number of FP
@@ -134,9 +153,13 @@ static const SEntry SCALARS[] = {
     { "bitcast_df", sh_bitcast_df }, { "bitcast_id", sh_bitcast_id },
     { "fround", sh_fround }, { "fround2", sh_fround2 },
     { "manyargs", sh_manyargs }, { "spills", sh_spills },
+    { "clobx", sh_clobx }, { "clobcall", sh_clobcall }, { "selx", sh_selx },
+    { "rotw", sh_rotw },
     { "w128", sh_w128 },
     { "vtable", sh_vtable }, { "vtail", sh_vtail },
     { "alchk", sh_alchk_k }, { "alchk1", sh_alchk1_k },
+    { "fsh64", sh_fsh64 }, { "fsh32", sh_fsh32 }, { "fsh16", sh_fsh16 },
+    { "asmchk", sh_asmchk }, { "extch", sh_extch },
 };
 
 static int failures = 0, total = 0;
@@ -167,6 +190,7 @@ typedef struct { char name[32]; int nargs; uint8_t ak[10]; uint8_t rk; } FInfo;
 static uint64_t run_bcase(const FInfo *fi, uint8_t *img, const uint64_t *args) {
     void *base = img;
     if (strcmp(fi->name, "mem") == 0) return (uint64_t)(uint32_t)mem(base + args[0], (int64_t)args[1], (int32_t)args[2]);
+    if (strcmp(fi->name, "stx") == 0) return stx(base + args[0], base + args[1], (int64_t)args[2]);
     if (strcmp(fi->name, "atomic") == 0) return atomic(base + args[0], args[1]);
     if (strcmp(fi->name, "rmw") == 0) return rmw(base + args[0], args[1]);
     if (strcmp(fi->name, "rmw32") == 0) return (uint64_t)(uint32_t)rmw32(base + args[0], (uint32_t)args[1]);

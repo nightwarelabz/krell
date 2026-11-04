@@ -78,6 +78,7 @@ enum {
     OP_FUNCP,                 /* v3: address of a function as a ptr value; callee/callee_extern select it */
     OP_CALLI,                 /* v3: indirect call; a = ptr operand, callee = signature-table index */
     OP_TAILCALLI,             /* v3: indirect tail call (terminator), same fields */
+    OP_FSHL, OP_FSHR,         /* v3: funnel shifts; a = high/left part, b = low/right part, c = shift amount (mod width) */
     OP_COUNT
 };
 /* icmp predicates */

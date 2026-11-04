@@ -20,6 +20,14 @@ typedef struct {
 typedef struct {
     int reg;
     int callee_saved;
+    /* clobber class (backend-defined bit, 0 = the register is never
+     * used as emitter scratch, so any value may live in it subject to
+     * the callee_saved rule alone). A nonzero bit marks a register
+     * the emitter also uses as scratch in specific instruction
+     * sequences; the allocator may place a value there only when the
+     * backend's clobber analysis (Pools callbacks below) proves the
+     * value's interval contains no unblessed clobber of that class. */
+    int clob;
 } PoolReg;
 
 typedef struct BeFunc {
@@ -65,6 +73,22 @@ typedef struct {
      * vector slots are accounted in 16-byte units, so a value of
      * n * vec_bytes bytes consumes n * vec_bytes / 16 units. */
     int vec_bytes;
+    /* Optional clobber analysis for pool registers with clob != 0.
+     * clob_mask: clobber-class bits an instruction's emission may
+     * write (other than through its operands' homes) at any point of
+     * its sequence. clob_bless: at the instruction that is a value's
+     * LAST use, whether that value (an operand) is consumed before /
+     * by the clobber of the given class, so the class does not
+     * forbid it there. clob_defmask: bits the defining instruction
+     * forbids for its own result. clob_entrymask: bits forbidden for
+     * entry-block argument values by prologue sequences that run
+     * outside instruction positions. All NULL/0 when the backend has
+     * no scratch-shared pool registers. */
+    uint8_t (*clob_mask)(void *ctx, const Instr *in);
+    bool (*clob_bless)(void *ctx, const Instr *in, int v, uint8_t bit);
+    uint8_t (*clob_defmask)(void *ctx, const Instr *in);
+    uint8_t (*clob_entrymask)(void *ctx, const Func *f);
+    void *clob_ctx;
 } Pools;
 
 /* position of instruction ii in block bi */

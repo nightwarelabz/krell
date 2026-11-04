@@ -19,16 +19,16 @@ enum { T0 = 5, T1 = 6, T2 = 7 };
 static const int ARG_GP[8] = { 10, 11, 12, 13, 14, 15, 16, 17 };
 
 static const PoolReg POOL_GP[] = {
-    { 12,0 }, { 13,0 }, { 14,0 }, { 15,0 }, { 16,0 }, { 17,0 },
-    { 28,0 }, { 29,0 }, { 30,0 }, { 31,0 },
-    { 9,1 }, { 18,1 }, { 19,1 }, { 20,1 }, { 21,1 }, { 22,1 }, { 23,1 },
-    { 24,1 }, { 25,1 }, { 26,1 }, { 27,1 },
+    { 12, 0, 0 }, { 13, 0, 0 }, { 14, 0, 0 }, { 15, 0, 0 }, { 16, 0, 0 }, { 17, 0, 0 },
+    { 28, 0, 0 }, { 29, 0, 0 }, { 30, 0, 0 }, { 31, 0, 0 },
+    { 9, 1, 0 }, { 18, 1, 0 }, { 19, 1, 0 }, { 20, 1, 0 }, { 21, 1, 0 }, { 22, 1, 0 }, { 23, 1, 0 },
+    { 24, 1, 0 }, { 25, 1, 0 }, { 26, 1, 0 }, { 27, 1, 0 },
 };
 static const PoolReg POOL_FP[] = {
-    { 0,0 }, { 1,0 }, { 2,0 }, { 3,0 }, { 4,0 }, { 5,0 }, { 6,0 }, { 7,0 },
-    { 28,0 }, { 29,0 }, { 30,0 }, { 31,0 },
-    { 8,1 }, { 9,1 }, { 18,1 }, { 19,1 }, { 20,1 }, { 21,1 }, { 22,1 },
-    { 23,1 }, { 24,1 }, { 25,1 }, { 26,1 }, { 27,1 },
+    { 0, 0, 0 }, { 1, 0, 0 }, { 2, 0, 0 }, { 3, 0, 0 }, { 4, 0, 0 }, { 5, 0, 0 }, { 6, 0, 0 }, { 7, 0, 0 },
+    { 28, 0, 0 }, { 29, 0, 0 }, { 30, 0, 0 }, { 31, 0, 0 },
+    { 8, 1, 0 }, { 9, 1, 0 }, { 18, 1, 0 }, { 19, 1, 0 }, { 20, 1, 0 }, { 21, 1, 0 }, { 22, 1, 0 },
+    { 23, 1, 0 }, { 24, 1, 0 }, { 25, 1, 0 }, { 26, 1, 0 }, { 27, 1, 0 },
 };
 
 typedef struct {
@@ -756,6 +756,40 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         store_gp(c, in->result, T0);
         break;
     }
+    case OP_FSHL: case OP_FSHR: {
+        /* Compose from shifts (the Zbb rotate covers only the a == b
+         * case). The (x << 1) << (bits-1-s) / (x >> 1) >> (bits-1-s)
+         * forms keep the s == 0 edge exact: the unwanted part shifts
+         * entirely out instead of wrapping around. */
+        int bits = t.bits;
+        if (in->op == OP_FSHL) {
+            load_gp(c, T0, in->a);
+            load_gp(c, T2, in->c);
+            E(c, "  andi x%d, x%d, %d", T2, T2, bits - 1);
+            E(c, "  sll x%d, x%d, x%d", T0, T0, T2);
+            load_gp(c, T1, in->b);
+            E(c, "  srli x%d, x%d, 1", T1, T1);
+            E(c, "  addi x%d, x%d, %d", T2, T2, -(bits - 1));
+            E(c, "  neg x%d, x%d", T2, T2);
+            E(c, "  srl x%d, x%d, x%d", T1, T1, T2);
+        } else {
+            load_gp(c, T0, in->a);
+            E(c, "  slli x%d, x%d, 1", T0, T0);
+            load_gp(c, T2, in->c);
+            E(c, "  andi x%d, x%d, %d", T2, T2, bits - 1);
+            E(c, "  addi x%d, x%d, %d", T2, T2, -(bits - 1));
+            E(c, "  neg x%d, x%d", T2, T2);
+            E(c, "  sll x%d, x%d, x%d", T0, T0, T2);
+            load_gp(c, T1, in->b);
+            load_gp(c, T2, in->c);
+            E(c, "  andi x%d, x%d, %d", T2, T2, bits - 1);
+            E(c, "  srl x%d, x%d, x%d", T1, T1, T2);
+        }
+        E(c, "  or x%d, x%d, x%d", T0, T0, T1);
+        mask_reg(c, T0, t);
+        store_gp(c, in->result, T0);
+        break;
+    }
     case OP_SDIV: emit_div(c, in, true, false); break;
     case OP_SREM: emit_div(c, in, true, true); break;
     case OP_UDIV: emit_div(c, in, false, false); break;
@@ -817,6 +851,7 @@ static void emit_instr(Ctx *c, int bi, int ii) {
     case OP_TRUNC: case OP_ZEXT: case OP_SEXT: {
         load_gp(c, T0, in->a);
         if (in->op == OP_SEXT) sext_reg(c, T0, f->vtypes[in->a].bits);
+        else if (t.bits == 8) E(c, "  andi x%d, x%d, 255", T0, T0);
         else mask_reg(c, T0, t);
         store_gp(c, in->result, T0);
         break;
@@ -1412,7 +1447,7 @@ static int emit_func(Ctx *c, int fi) {
     Module *m = c->m;
     Func *f = &m->funcs[fi];
     c->f = f; c->fi = fi; c->lbl = 0;
-    Pools pools = { POOL_GP, 21, POOL_FP, 24, 0, 0 };
+    Pools pools = { POOL_GP, 21, POOL_FP, 24, 0, 0, NULL, NULL, NULL, NULL, NULL };
     BeFunc *bf = be_analyze(m, f, &pools);
     if (!bf) return -1;
     c->bf = bf;

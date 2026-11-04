@@ -15,8 +15,8 @@ static const char **gname(int sz) { return sz == 8 ? G64 : sz == 4 ? G32 : sz ==
 static const int ARG_GP[6] = { RDI, RSI, RDX, RCX, R8, R9 };
 
 static const PoolReg POOL_FP[] = {
-    { 0,0 },{ 1,0 },{ 2,0 },{ 3,0 },{ 4,0 },{ 5,0 },{ 6,0 },{ 7,0 },
-    { 8,0 },{ 9,0 },{ 10,0 },{ 11,0 },{ 12,0 },{ 13,0 },{ 14,0 },
+    { 0, 0, 0 },{ 1, 0, 0 },{ 2, 0, 0 },{ 3, 0, 0 },{ 4, 0, 0 },{ 5, 0, 0 },{ 6, 0, 0 },{ 7, 0, 0 },
+    { 8, 0, 0 },{ 9, 0, 0 },{ 10, 0, 0 },{ 11, 0, 0 },{ 12, 0, 0 },{ 13, 0, 0 },{ 14, 0, 0 },
 };
 
 typedef struct {
@@ -222,6 +222,20 @@ static void format_x86_addr(Ctx *c, char *buf, size_t cap, const X86Addr *a) {
 static void load_gp(Ctx *c, int reg, int v) {
     Loc *l = &c->bf->loc[v];
     if (l->is_reg && l->cls == BCLS_GP && l->idx == reg) return;
+    /* Rematerialize a spilled constant instead of reloading its
+     * slot: a constant is free to recompute, and under register
+     * pressure the allocator parks loop-invariant constants (the
+     * decode loops' iconst 64 is the canonical case) in a stack
+     * slot that every use then reloads through the serial chain.
+     * Only for memory homes -- a register home loads as cheaply. */
+    if (!l->is_reg && v >= 0 && v < c->f->nvalues) {
+        int64_t k;
+        if (be_iconst_val(c->f, v, &k) || c->f->isconst[v]) {
+            if (c->f->isconst[v]) k = c->f->cval[v];
+            E(c, "  mov %s, %lld", G64[reg], (long long)k);
+            return;
+        }
+    }
     char b[64]; locstr(c, b, sizeof b, v, 8);
     E(c, "  mov %s, %s", G64[reg], b);
 }
@@ -1282,6 +1296,48 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         if (dreg < 0) store_gp(c, in->result, R11);
         break;
     }
+    case OP_FSHL: case OP_FSHR: {
+        if (in->a == in->b) {
+            /* fshl(x, x, s) is a rotate: one instruction, no second
+             * operand copy -- the bitstream peek shape */
+            const char *rn = t.bits == 64 ? G64[R11] : t.bits == 32 ? G32[R11] :
+                             t.bits == 16 ? G16[R11] : G8[R11];
+            load_gp(c, R11, in->a);
+            load_gp(c, RCX, in->c);
+            E(c, "  %s %s, cl", in->op == OP_FSHL ? "rol" : "ror", rn);
+            mask_r11(c, t);
+            store_gp(c, in->result, R11);
+            break;
+        }
+        /* scratch-only computation (R11/RAX/RCX are never allocated):
+         * 32/64-bit lower to the native double-shift, whose hardware
+         * count masking is exactly the IR's amount-mod-width rule;
+         * 8/16-bit go through the doubled-width composition. */
+        if (t.bits == 64 || t.bits == 32) {
+            const char *d = in->op == OP_FSHL ? "shld" : "shrd";
+            if (in->op == OP_FSHL) { load_gp(c, R11, in->a); load_gp(c, RAX, in->b); }
+            else                   { load_gp(c, R11, in->b); load_gp(c, RAX, in->a); }
+            load_gp(c, RCX, in->c);
+            if (t.bits == 64) E(c, "  %s r11, rax, cl", d);
+            else              E(c, "  %s r11d, eax, cl", d);
+        } else {
+            load_gp(c, R11, in->a);
+            E(c, "  shl r11, %d", t.bits);
+            load_gp(c, RAX, in->b);
+            E(c, "  or r11, rax");
+            load_gp(c, RCX, in->c);
+            E(c, "  and ecx, %d", t.bits - 1);
+            if (in->op == OP_FSHL) {
+                E(c, "  shl r11, cl");
+                E(c, "  shr r11, %d", t.bits);
+            } else {
+                E(c, "  shr r11, cl");
+            }
+        }
+        mask_r11(c, t);
+        store_gp(c, in->result, R11);
+        break;
+    }
     case OP_UDIV: emit_div(c, in, false, false); break;
     case OP_SDIV: emit_div(c, in, true, false); break;
     case OP_UREM: emit_div(c, in, false, true); break;
@@ -1352,11 +1408,36 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         else E(c, "  bswap r11");
         store_gp(c, in->result, R11);
         break;
-    case OP_TRUNC:
-        load_gp(c, R11, in->a);
-        mask_r11(c, t);
-        store_gp(c, in->result, R11);
+    case OP_TRUNC: {
+        /* Field extraction to 8/16 bits is a single movzx from the
+         * source home (byte/word register or memory) -- the load +
+         * shift-pair mask it replaces cost two extra instructions on
+         * every table-field extract. 32-from-64 is a plain 32-bit
+         * move (the write zero-extends). Wider/equal falls back to
+         * load + mask. */
+        Loc *al = &c->bf->loc[in->a];
+        if ((t.bits == 8 || t.bits == 16) && al->cls == BCLS_GP) {
+            char ab[64];
+            if (al->is_reg) {
+                locstr(c, ab, sizeof ab, in->a, t.bits / 8);
+                E(c, "  movzx r11d, %s", ab);
+            } else {
+                locstr(c, ab, sizeof ab, in->a, 8);
+                E(c, "  movzx r11d, %s PTR %s", t.bits == 8 ? "BYTE" : "WORD", ab);
+            }
+            store_gp(c, in->result, R11);
+        } else if (t.bits == 32 && al->cls == BCLS_GP) {
+            char ab[64];
+            locstr(c, ab, sizeof ab, in->a, 4);
+            E(c, "  mov r11d, %s", ab);
+            store_gp(c, in->result, R11);
+        } else {
+            load_gp(c, R11, in->a);
+            mask_r11(c, t);
+            store_gp(c, in->result, R11);
+        }
         break;
+    }
     case OP_ZEXT: copy_value(c, in->result, in->a); break;
     case OP_SEXT: {
         Loc *dl = &c->bf->loc[in->result];
@@ -1567,12 +1648,19 @@ static void emit_instr(Ctx *c, int bi, int ii) {
             E(c, "  %s %s, xmm15", vt.bits == 32 ? "movss" : "movsd", mstr);
         } else {
             Loc *bl = &c->bf->loc[in->b];
-            const char *src_str = "r11";
+            const char *src_str = "rdx";
             if (bl->is_reg && bl->cls == BCLS_GP) {
                 src_str = vt.bits == 8 ? G8[bl->idx] : vt.bits == 16 ? G16[bl->idx] : vt.bits == 32 ? G32[bl->idx] : G64[bl->idx];
             } else {
-                load_gp(c, R11, in->b);
-                src_str = vt.bits == 8 ? "r11b" : vt.bits == 16 ? "r11w" : vt.bits == 32 ? "r11d" : "r11";
+                /* stage in RDX, never R11: format_x86_addr above may
+                 * have materialized a spilled folded-GEP index into
+                 * R11 (and a spilled base into RAX), and the address
+                 * string is only consumed by the store emitted below --
+                 * staging the value into R11 would clobber the index
+                 * before the store reads it. RDX is scratch here and
+                 * is not used by the address materialization. */
+                load_gp(c, RDX, in->b);
+                src_str = vt.bits == 8 ? G8[RDX] : vt.bits == 16 ? G16[RDX] : vt.bits == 32 ? G32[RDX] : G64[RDX];
             }
             E(c, "  mov %s, %s", mstr, src_str);
         }
@@ -2366,15 +2454,41 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         break;
     }
     case OP_SELECT: {
-        int L = ++c->lbl;
-        /* false arm first: copy_value routes through r11, so the condition
-         * is loaded only after it (movs do not clobber the test flags) */
-        copy_value(c, in->result, in->c);
-        load_gp(c, R11, in->a);
-        E(c, "  test r11, r11");
-        E(c, "  je .Lx%d_%d", c->fi, L);
-        copy_value(c, in->result, in->b);
-        E(c, ".Lx%d_%d:", c->fi, L);
+        Loc *rl = &c->bf->loc[in->result];
+        Loc *al = &c->bf->loc[in->a];
+        Loc *bl = &c->bf->loc[in->b];
+        /* The copy ordering below (false arm into the result, then the
+         * true arm over it) is only sound when the result's home is
+         * disjoint from the condition's and the true arm's homes:
+         * writing the false arm first would destroy a true arm (or
+         * condition) that shares the result's register or stack slot,
+         * and the later copy would read the corpse. When they alias,
+         * evaluate the condition first and copy exactly one arm. */
+        bool alias = rl->cls == al->cls && rl->is_reg == al->is_reg &&
+                     (rl->is_reg ? rl->idx == al->idx : rl->off == al->off);
+        alias = alias || (rl->cls == bl->cls && rl->is_reg == bl->is_reg &&
+                     (rl->is_reg ? rl->idx == bl->idx : rl->off == bl->off));
+        if (alias) {
+            int L1 = ++c->lbl, L2 = ++c->lbl;
+            load_gp(c, R11, in->a);
+            E(c, "  test r11, r11");
+            E(c, "  je .Lx%d_%d", c->fi, L1);
+            copy_value(c, in->result, in->b);
+            E(c, "  jmp .Lx%d_%d", c->fi, L2);
+            E(c, ".Lx%d_%d:", c->fi, L1);
+            copy_value(c, in->result, in->c);
+            E(c, ".Lx%d_%d:", c->fi, L2);
+        } else {
+            int L = ++c->lbl;
+            /* false arm first: copy_value routes through r11, so the condition
+             * is loaded only after it (movs do not clobber the test flags) */
+            copy_value(c, in->result, in->c);
+            load_gp(c, R11, in->a);
+            E(c, "  test r11, r11");
+            E(c, "  je .Lx%d_%d", c->fi, L);
+            copy_value(c, in->result, in->b);
+            E(c, ".Lx%d_%d:", c->fi, L);
+        }
         break;
     }
     case OP_ASSUME: break;
@@ -2699,6 +2813,186 @@ static bool emit_binary_recursion_specialization(Ctx *c, int fi) {
     return true;
 }
 
+/* ---------- clobber analysis for the scratch-shared pool registers --
+ * RAX/RCX/RDX are offered to the allocator (PoolReg.clob bits below),
+ * but this emitter also uses them as scratch in specific instruction
+ * sequences, so a value may live in one only when its interval
+ * provably contains no unblessed clobber of it. The tables here are
+ * an audit of emit_instr's sequences (scalar path; the i128 path is
+ * covered by the MEM128 rule):
+ *   shifts (variable count) load the count into RCX;
+ *   funnel shifts compute through RAX (general form) and RCX;
+ *   division loads RAX/RCX and produces RDX (cqo);
+ *   GEP (variable index) scales the index in RAX;
+ *   address formation may materialize a spilled base into RAX;
+ *   scalar stores stage a spilled value in RDX;
+ *   atomics load the pointer into RAX (cmpxchg family: RCX + RAX/RDX);
+ *   calls, libcall-lowered ops and i128/vector sequences may write
+ *   all three. Everything else computes through R11/xmm15 or through
+ *   the operands' own homes and never touches these registers.
+ * Blessings encode the emission order at a value's last use: an
+ * operand loaded into (or read through) a register before that
+ * register is written for another purpose is consumed safely. */
+enum { XB_RAX = 1, XB_RCX = 2, XB_RDX = 4 };
+
+static bool x86_op_is_const(Ctx *c, int v) {
+    int64_t k;
+    return be_iconst_val(c->f, v, &k) || (v >= 0 && c->f->isconst[v]);
+}
+static bool x86_instr_touches(Ctx *c, const Instr *in, int cls_want, bool vec_want) {
+    if (be_class_of(in->ty) == cls_want) return true;
+    if (vec_want && in->ty.kind == TY_VEC) return true;
+    const int ops[3] = { in->a, in->b, in->op == OP_ALLOCA ? -1 : in->c };
+    for (int k = 0; k < 3; k++) {
+        int v = ops[k];
+        if (v < 0 || v >= c->f->nvalues) continue;
+        if (be_class_of(c->f->vtypes[v]) == cls_want) return true;
+        if (vec_want && c->f->vtypes[v].kind == TY_VEC) return true;
+    }
+    return false;
+}
+static uint8_t x86_clob_mask(void *ctx, const Instr *in) {
+    Ctx *c = ctx;
+    /* i128 instructions dispatch to emit_i128, whose sequences use
+     * RAX/RCX/RDX throughout -- this dominates the per-op table,
+     * which describes the scalar emission only */
+    if (x86_instr_touches(c, in, BCLS_MEM128, false)) return XB_RAX | XB_RCX | XB_RDX;
+    switch (in->op) {
+    case OP_SHL: case OP_LSHR: case OP_ASHR:
+        return x86_op_is_const(c, in->b) ? 0 : XB_RCX;
+    case OP_FSHL: case OP_FSHR:
+        return in->a == in->b ? XB_RCX : (XB_RAX | XB_RCX);
+    case OP_SDIV: case OP_UDIV: case OP_SREM: case OP_UREM:
+        return XB_RAX | XB_RCX | XB_RDX;
+    case OP_CALL: case OP_CALLI: case OP_TAILCALL: case OP_TAILCALLI:
+    case OP_FMA: case OP_MEMCPY: case OP_MEMSET:
+        return XB_RAX | XB_RCX | XB_RDX;
+    case OP_LOAD: case OP_LOADV: case OP_VLOAD:
+        return XB_RAX;
+    case OP_STORE: case OP_STOREV:
+        return XB_RAX | XB_RDX;
+    case OP_VSTORE:
+        return XB_RAX;
+    case OP_ADD:
+        /* WP20 chain folding, audited for WP24: a chain-skipped b
+         * operand is materialized from its root into a scratch
+         * register before the op -- RAX when the result is
+         * stack-homed (the b_scr choice in the binop emitter), R11
+         * otherwise. The result's home is decided by this very
+         * allocation, so model the RAX write whenever b is
+         * chain-skipped. Only OP_ADD can have skipped operands:
+         * the chain pass marks any add used by a different op as
+         * non-skippable. No blessing: the materialization runs
+         * before operand a is loaded. */
+        return (in->b >= 0 && c->chain_skip && in->b < c->f->nvalues &&
+                c->chain_skip[in->b]) ? XB_RAX : 0;
+    case OP_GEP:
+        return x86_op_is_const(c, in->b) ? 0 : XB_RAX;
+    case OP_ALOAD: case OP_ASTORE: case OP_AADD: case OP_AXCHG:
+        return XB_RAX;
+    case OP_ACMPXCHG:
+        return XB_RAX | XB_RCX;
+    case OP_ASUB: case OP_AAND: case OP_AOR: case OP_AXOR:
+    case OP_AMINS: case OP_AMAXS: case OP_AMINU: case OP_AMAXU:
+        return XB_RAX | XB_RCX | XB_RDX;
+    case OP_FPTOSI: case OP_FPTOUI: case OP_UITOFP:
+        return XB_RAX;
+    case OP_ICMP: case OP_FCMP: case OP_FCONST: case OP_CLZ:
+        return XB_RAX;   /* result staged in RAX / b fallback / bsr dest */
+    case OP_BITCAST:
+        return be_class_of(in->ty) != be_class_of(c->f->vtypes[in->a]) ? XB_RAX : 0;
+    case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FDIV:
+        return in->ty.bits == 32 ? XB_RAX : 0;   /* movd eax, xmm15 round-trip */
+    default:
+        if (x86_instr_touches(c, in, -1, true)) return XB_RAX | XB_RCX | XB_RDX;
+        return 0;
+    }
+}
+/* is v the base value an address reads through (the operand itself,
+ * or the base of its folded GEP chain, which format_x86_addr reads
+ * directly as the address register)? */
+static bool x86_addr_base(Ctx *c, const Instr *in, int v) {
+    if (v == in->a) return true;
+    if (in->a >= 0 && c->folded_ins && c->folded_ins[in->a]) {
+        Instr *d = c->defins[in->a];
+        if (d && d->op == OP_GEP) {
+            if (v == d->a) return true;
+            Instr *d2 = d->a >= 0 ? c->defins[d->a] : NULL;
+            if (d2 && d2->op == OP_GEP && v == d2->a) return true;
+        }
+    }
+    return false;
+}
+static bool x86_clob_bless(void *ctx, const Instr *in, int v, uint8_t bit) {
+    Ctx *c = ctx;
+    if (x86_instr_touches(c, in, BCLS_MEM128, false)) return false;  /* emit_i128: no blessings */
+    switch (in->op) {
+    case OP_SHL: case OP_LSHR: case OP_ASHR:
+        return v == in->a || v == in->b;              /* RCX: a is read out first, b is the count itself */
+    case OP_FSHL: case OP_FSHR:
+        if (bit == XB_RCX) return v == in->a || v == in->b || v == in->c;
+        if (bit == XB_RAX) return v == in->a || v == in->b;  /* c is loaded into RCX only after RAX is written */
+        return false;
+    case OP_SDIV: case OP_UDIV: case OP_SREM: case OP_UREM:
+        if (v == in->a) return true;                  /* dividend is loaded into RAX first */
+        if (v == in->b) return bit == XB_RCX || bit == XB_RDX;  /* divisor sits in RCX; RDX is written after */
+        return false;
+    case OP_GEP:
+        return v == in->a || v == in->b;              /* RAX: b is the value loaded there; a goes to R11 */
+    case OP_LOAD: case OP_LOADV: case OP_VLOAD: case OP_VSTORE:
+        return bit == XB_RAX && x86_addr_base(c, in, v);
+    case OP_STORE: case OP_STOREV:
+        if (bit == XB_RDX) return v == in->b;         /* a register-resident value is stored directly */
+        if (bit == XB_RAX) return x86_addr_base(c, in, v);
+        return false;
+    case OP_ALOAD: case OP_ASTORE: case OP_AADD: case OP_AXCHG:
+        return bit == XB_RAX && v == in->a;           /* the pointer is loaded into RAX itself */
+    case OP_ACMPXCHG:
+        return (bit == XB_RCX && v == in->a) || (bit == XB_RAX && v == in->b);
+    case OP_ASUB: case OP_AAND: case OP_AOR: case OP_AXOR:
+    case OP_AMINS: case OP_AMAXS: case OP_AMINU: case OP_AMAXU:
+        return (bit == XB_RCX && v == in->a) || (bit == XB_RDX && v == in->b);
+    case OP_MEMCPY: case OP_MEMSET:
+        return v == in->a || v == in->b || v == in->c;  /* parallel moves consume all three safely */
+    case OP_FPTOSI: case OP_FPTOUI: case OP_UITOFP:
+        return v == in->a;                            /* RAX: the operand is staged through R11 first */
+    case OP_ICMP:
+        /* RAX: b is staged there only when it has no register of its
+         * own, so a is safe only when b is an immediate; b itself is
+         * always consumed by the cmp before RAX is rewritten */
+        if (v == in->b) return true;
+        if (v == in->a) { int64_t k; return be_iconst_val(c->f, in->b, &k); }
+        return false;
+    case OP_CLZ:
+        return v == in->a;                            /* a is staged through R11 before bsr writes RAX */
+    case OP_BITCAST:
+        return v == in->a;                            /* GP->FP stages a through RAX itself */
+    case OP_VADD: case OP_VSUB: case OP_VMUL: case OP_VAND: case OP_VOR:
+    case OP_VXOR: case OP_VUDIV: case OP_VLSHR:
+        return v == in->a || v == in->b;              /* lanes stage a via R11, b via RAX, before RCX/RDX writes */
+    default:
+        return false;
+    }
+}
+static uint8_t x86_clob_defmask(void *ctx, const Instr *in) {
+    Ctx *c = ctx;
+    /* a shift result may not sit in RCX: the emission loads operand a
+     * into the result register, then overwrites RCX with the count */
+    if ((in->op == OP_SHL || in->op == OP_LSHR || in->op == OP_ASHR) &&
+        !x86_op_is_const(c, in->b)) return XB_RCX;
+    return 0;
+}
+static uint8_t x86_clob_entrymask(void *ctx, const Func *f) {
+    (void)ctx;
+    /* the prologue copies i128 stack parameters home through RAX
+     * after the entry parallel moves: no entry argument may live in
+     * RAX in a function that takes an i128 parameter */
+    if (f->nblocks > 0)
+        for (int i = 0; i < f->blocks[0].nargs; i++)
+            if (be_class_of(f->blocks[0].arg_types[i]) == BCLS_MEM128) return XB_RAX;
+    return 0;
+}
+
 static int emit_func(Ctx *c, int fi) {
     Module *m = c->m;
     Func *f = &m->funcs[fi];
@@ -2867,16 +3161,28 @@ static int emit_func(Ctx *c, int fi) {
     }
     free(uses);
 
-    /* GP pool: RAX/RCX/RDX/R11 stay scratch. The emitter loads RCX for
-     * every non-constant shift and for div/rem, takes RDX for div/rem
-     * (cqo) and for memcpy/memset argument setup, whatever op classes
-     * the function happens to contain -- so neither register may ever
-     * be allocated. (A conditional pool that admitted them broke the
-     * krellproof chart's glyph rendering: live values in RCX/RDX were
-     * clobbered by unrelated shift and copy sequences.) */
+    /* GP pool: R11 stays pure scratch. RAX/RCX/RDX are admitted as
+     * clobber-class registers: the emitter loads RCX for every
+     * non-constant shift, takes RAX/RDX for div/rem and address
+     * materialization, and stages spilled store values in RDX -- so
+     * they may hold only values whose intervals the clobber analysis
+     * above proves clear of those sequences (an earlier conditional
+     * pool that admitted them without the proof broke the krellproof
+     * chart's glyph rendering: live values in RCX/RDX were clobbered
+     * by unrelated shift and copy sequences). The clobber registers
+     * are offered first: they are the most constrained homes, so
+     * first-fit should try them before the unrestricted ones. */
     static const PoolReg POOL_GP[] = {
-        { RSI, 0 }, { RDI, 0 }, { R8, 0 }, { R9, 0 }, { R10, 0 },
-        { RBX, 1 }, { R12, 1 }, { R13, 1 }, { R14, 1 }, { R15, 1 },
+        /* the round-1 order first (long-lived values keep the homes
+         * they had); the scratch trio is appended as pressure relief,
+         * gated per-value by the clobber masks: first-fit reaches it
+         * only when every earlier register is taken or forbidden, so
+         * loop-carried state does not migrate into the registers the
+         * emitter also uses as scratch (which cost sumsq 25% in copy
+         * rotations when the trio led the pool). */
+        { RSI, 0, 0 }, { RDI, 0, 0 }, { R8, 0, 0 }, { R9, 0, 0 }, { R10, 0, 0 },
+        { RBX, 1, 0 }, { R12, 1, 0 }, { R13, 1, 0 }, { R14, 1, 0 }, { R15, 1, 0 },
+        { RCX, 0, XB_RCX }, { RDX, 0, XB_RDX }, { RAX, 0, XB_RAX },
     };
     /* WP20: mark i64 adds that sit on an unroller-style index
      * chain and have no use other than feeding geps or other
@@ -2934,7 +3240,12 @@ static int emit_func(Ctx *c, int fi) {
             merged_folded = true;
         }
     }
-    Pools pools = { POOL_GP, 10, POOL_FP, 15, 1, vwide(c) ? 32 : 16 };
+    Pools pools = { POOL_GP, 13, POOL_FP, 15, 1, vwide(c) ? 32 : 16, NULL, NULL, NULL, NULL, NULL };
+    pools.clob_mask = x86_clob_mask;
+    pools.clob_bless = x86_clob_bless;
+    pools.clob_defmask = x86_clob_defmask;
+    pools.clob_entrymask = x86_clob_entrymask;
+    pools.clob_ctx = c;
     /* WP21-B: vzeroupper duty is per function — set when the function
      * holds any vector value under the wide target. */
     c->vzero = 0;

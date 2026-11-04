@@ -30,6 +30,7 @@ typedef struct {
     int ntr;
     /* intrinsic declaration needs */
     bool need_ctpop[65], need_ctlz[65], need_cttz[65], need_bswap[65];
+    bool need_fshl[129], need_fshr[129];
     bool need_fma32, need_fma64, need_fabs32, need_fabs64;
     bool need_memcpy, need_memset;
     const bool *addrtaken;   /* internal funcs whose address escapes (funcptr) */
@@ -286,6 +287,12 @@ static void emit_instr(Ctx *c, Instr *in) {
     case OP_FMA: {
         if (t.bits == 32) c->need_fma32 = true; else c->need_fma64 = true;
         E(c, "  %s = call %s @llvm.fma.f%d(%s %s, %s %s, %s %s)", R, tb, t.bits, tb, ab, tb, bb, tb, cb);
+        break;
+    }
+    case OP_FSHL: case OP_FSHR: {
+        const char *nm = in->op == OP_FSHL ? "fshl" : "fshr";
+        if (in->op == OP_FSHL) c->need_fshl[t.bits] = true; else c->need_fshr[t.bits] = true;
+        E(c, "  %s = call %s @llvm.%s.i%d(%s %s, %s %s, %s %s)", R, tb, nm, t.bits, tb, ab, tb, bb, tb, cb);
         break;
     }
     case OP_FCMP: {
@@ -765,6 +772,8 @@ int be_llvm(Module *m, const Cost *cost, FILE *out, char *err, size_t errcap) {
         if (c.need_ctlz[w]) E(&c, "declare i%d @llvm.ctlz.i%d(i%d, i1 immarg)", w, w, w);
         if (c.need_cttz[w]) E(&c, "declare i%d @llvm.cttz.i%d(i%d, i1 immarg)", w, w, w);
         if (c.need_bswap[w]) E(&c, "declare i%d @llvm.bswap.i%d(i%d)", w, w, w);
+        if (w < 129 && c.need_fshl[w]) E(&c, "declare i%d @llvm.fshl.i%d(i%d, i%d, i%d)", w, w, w, w, w);
+        if (w < 129 && c.need_fshr[w]) E(&c, "declare i%d @llvm.fshr.i%d(i%d, i%d, i%d)", w, w, w, w, w);
     }
     if (c.need_fma32) E(&c, "declare float @llvm.fma.f32(float, float, float)");
     if (c.need_fma64) E(&c, "declare double @llvm.fma.f64(double, double, double)");
