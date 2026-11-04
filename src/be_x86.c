@@ -104,14 +104,23 @@ static bool peel_chain(Ctx *c, int v, int *root_out, int64_t *off_out) {
 }
 
 static int peeled_idx(Ctx *c, int v, int esz, int64_t *disp_out) {
-    int r;
-    int64_t o;
     *disp_out = 0;
     if (esz < 1) return v;
-    if (!peel_chain(c, v, &r, &o)) return v;
+    /* Peel only through chain-SKIPPED adds, using the root/offset the
+     * pre-pass recorded for them -- the same model the operand
+     * materialization paths (OP_ADD, OP_GEP) use. A structural peel
+     * walks every i64 add, including adds that execute because they
+     * have real uses (an unrolled index feeding a shift count). An
+     * executing add may reuse its root's register (the allocator's
+     * 2-address preference), after which the root's home no longer
+     * holds the root value and a fully peeled address silently reads
+     * the wrong index. A non-skipped index is used as-is: its home
+     * is authoritative. */
+    if (!c->chain_skip || v < 0 || v >= c->f->nvalues || !c->chain_skip[v]) return v;
+    int64_t o = c->chain_off[v];
     if (o > INT32_MAX / esz || o < INT32_MIN / esz) return v;
     *disp_out = o * (int64_t)esz;
-    return r;
+    return c->chain_root[v];
 }
 
 static void resolve_x86_addr(Ctx *c, int ptr_v, X86Addr *out) {
