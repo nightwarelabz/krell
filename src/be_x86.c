@@ -38,7 +38,15 @@ typedef struct {
     int fi;
     int lbl;
     int vl;
+    int vzero;   /* WP21-B: this function uses ymm state (vl >= 8) and
+                  * must vzeroupper on every exit path */
 } Ctx;
+
+/* WP21-B: the AVX2 target (vl >= 8) widens every vector value to a
+ * 256-bit ymm home. The vl-4 SSE2 paths below are untouched: every
+ * widening branches on vwide() and the vl-4 emission is byte-for-byte
+ * what it was. */
+static int vwide(Ctx *c) { return c->vl >= 8; }
 
 static void E(Ctx *c, const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
@@ -231,11 +239,15 @@ static void load_fp(Ctx *c, int xmm, int v) {
     const char *op = t.kind == TY_VEC ? "movups" : t.bits == 32 ? "movss" : "movsd";
     if (l->is_reg && l->cls == BCLS_FP && l->idx == xmm) return;
     if (l->is_reg && l->cls == BCLS_FP) {
-        if (t.kind == TY_VEC) E(c, "  movaps xmm%d, xmm%d", xmm, l->idx);
+        if (t.kind == TY_VEC) {
+            if (vwide(c)) E(c, "  vmovaps ymm%d, ymm%d", xmm, l->idx);
+            else E(c, "  movaps xmm%d, xmm%d", xmm, l->idx);
+        }
         else E(c, "  %s xmm%d, xmm%d", op, xmm, l->idx);
         return;
     }
     char b[64]; locstr(c, b, sizeof b, v, 8);
+    if (t.kind == TY_VEC && vwide(c)) { E(c, "  vmovups ymm%d, %s", xmm, b); return; }
     E(c, "  %s xmm%d, %s", op, xmm, b);
 }
 static void store_fp(Ctx *c, int v, int xmm) {
@@ -245,12 +257,16 @@ static void store_fp(Ctx *c, int v, int xmm) {
     const char *op = t.kind == TY_VEC ? "movups" : t.bits == 32 ? "movss" : "movsd";
     if (l->is_reg && l->cls == BCLS_FP && l->idx == xmm) return;
     if (l->is_reg && l->cls == BCLS_FP) {
-        if (t.kind == TY_VEC) E(c, "  movaps xmm%d, xmm%d", l->idx, xmm);
+        if (t.kind == TY_VEC) {
+            if (vwide(c)) E(c, "  vmovaps ymm%d, ymm%d", l->idx, xmm);
+            else E(c, "  movaps xmm%d, xmm%d", l->idx, xmm);
+        }
         else E(c, "  %s xmm%d, xmm%d", op, l->idx, xmm);
         return;
     }
     if (!l->is_reg && l->idx < 0) return;
     char b[64]; locstr(c, b, sizeof b, v, 8);
+    if (t.kind == TY_VEC && vwide(c)) { E(c, "  vmovups %s, ymm%d", b, xmm); return; }
     E(c, "  %s %s, xmm%d", op, b, xmm);
 }
 /* copy a scalar value (any class) to another value's home, via scratch */
@@ -270,7 +286,8 @@ static void copy_value(Ctx *c, int dst, int src) {
     else if (cls == BCLS_FP) {
         Loc *dl = &c->bf->loc[dst], *sl = &c->bf->loc[src];
         if (dl->is_reg && sl->is_reg) {
-            E(c, "  movaps xmm%d, xmm%d", dl->idx, sl->idx);
+            if (t.kind == TY_VEC && vwide(c)) E(c, "  vmovaps ymm%d, ymm%d", dl->idx, sl->idx);
+            else E(c, "  movaps xmm%d, xmm%d", dl->idx, sl->idx);
         } else {
             load_fp(c, 15, src); store_fp(c, dst, 15);
         }
@@ -291,12 +308,18 @@ static void copy_value(Ctx *c, int dst, int src) {
             }
         }
     }
-    else { /* vector: chunk copy through xmm15 */
+    else { /* vector: chunk copy through xmm15/ymm15 */
         Loc *dl = &c->bf->loc[dst], *sl = &c->bf->loc[src];
-        int bytes = 16 * t.n;
-        for (int off = 0; off < bytes; off += 16) {
-            E(c, "  movups xmm15, [rbp - %d]", sl->off - off);
-            E(c, "  movups [rbp - %d], xmm15", dl->off - off);
+        int bytes = mem_size_of(t, c->vl);
+        int step = vwide(c) ? 32 : 16;
+        for (int off = 0; off < bytes; off += step) {
+            if (vwide(c)) {
+                E(c, "  vmovups ymm15, [rbp - %d]", sl->off - off);
+                E(c, "  vmovups [rbp - %d], ymm15", dl->off - off);
+            } else {
+                E(c, "  movups xmm15, [rbp - %d]", sl->off - off);
+                E(c, "  movups [rbp - %d], xmm15", dl->off - off);
+            }
         }
     }
 }
@@ -306,6 +329,24 @@ typedef struct { Ctx *c; } MvCtx;
 static void x86_mv(void *p, Loc dst, Loc src) {
     MvCtx *mc = p; Ctx *c = mc->c;
     char db[64], sb[64];
+    if (dst.cls == BCLS_VEC && vwide(c)) {
+        /* WP21-B: a wide vector move is one 32-byte chunk (n == 1 is
+         * enforced by the avx2 target guard). Register names are
+         * ymm; the parallel-move scratch for this class is ymm15. */
+        char dr[16], sr[16];
+        if (dst.is_reg) snprintf(dr, sizeof dr, "ymm%d", dst.idx);
+        else snprintf(dr, sizeof dr, "[rbp - %d]", dst.off);
+        if (src.is_reg) snprintf(sr, sizeof sr, "ymm%d", src.idx);
+        else snprintf(sr, sizeof sr, "[rbp - %d]", src.off);
+        if (dst.is_reg && src.is_reg) E(c, "  vmovaps %s, %s", dr, sr);
+        else if (dst.is_reg) E(c, "  vmovups %s, %s", dr, sr);
+        else if (src.is_reg) E(c, "  vmovups %s, %s", dr, sr);
+        else {
+            E(c, "  vmovups ymm15, %s", sr);
+            E(c, "  vmovups %s, ymm15", dr);
+        }
+        return;
+    }
     if (dst.cls == BCLS_GP) {
         locstr_off(db, sizeof db, &dst, 8);
         locstr_off(sb, sizeof sb, &src, 8);
@@ -442,6 +483,7 @@ static int emit_call_args(Ctx *c, Instr *in, const Type *params, bool tail) {
 }
 
 static void emit_epilogue(Ctx *c) {
+    if (c->vzero) E(c, "  vzeroupper");
     restore_regs(c);
     E(c, "  leave");
 }
@@ -454,18 +496,30 @@ static void emit_branch(Ctx *c, int tgt, const int32_t *args, int nargs) {
     Loc *gd = malloc(sizeof(Loc) * (size_t)(nargs ? nargs : 1));
     Loc *fs = malloc(sizeof(Loc) * (size_t)(nargs ? nargs : 1));
     Loc *fd = malloc(sizeof(Loc) * (size_t)(nargs ? nargs : 1));
-    int ng = 0, nf = 0;
+    Loc *vs = malloc(sizeof(Loc) * (size_t)(nargs ? nargs : 1));
+    Loc *vd = malloc(sizeof(Loc) * (size_t)(nargs ? nargs : 1));
+    int ng = 0, nf = 0, nv = 0;
     for (int i = 0; i < nargs; i++) {
         int sv = args[i], dv = tb->arg_vals[i];
         if (c->bf->defpos[dv] == c->bf->endpos[dv]) continue;
         int cls = be_class_of(f->vtypes[sv]);
-        if (cls == BCLS_GP) { gs[ng] = c->bf->loc[sv]; gd[ng] = c->bf->loc[dv]; ng++; }
+        if (vwide(c) && f->vtypes[sv].kind == TY_VEC) {
+            /* WP21-B: wide vectors move as their own parallel-move
+             * class so a spilled (slot) vector is chunk-copied, not
+             * truncated to a scalar FP move. Loc cls is normalized
+             * so the move engine's identity checks see one class. */
+            vs[nv] = c->bf->loc[sv]; vs[nv].cls = BCLS_VEC;
+            vd[nv] = c->bf->loc[dv]; vd[nv].cls = BCLS_VEC;
+            nv++;
+        }
+        else if (cls == BCLS_GP) { gs[ng] = c->bf->loc[sv]; gd[ng] = c->bf->loc[dv]; ng++; }
         else if (cls == BCLS_FP) { fs[nf] = c->bf->loc[sv]; fd[nf] = c->bf->loc[dv]; nf++; }
         else copy_value(c, dv, sv);
     }
     parallel_moves(c, gs, gd, ng, BCLS_GP);
     parallel_moves(c, fs, fd, nf, BCLS_FP);
-    free(gs); free(gd); free(fs); free(fd);
+    parallel_moves(c, vs, vd, nv, BCLS_VEC);
+    free(gs); free(gd); free(fs); free(fd); free(vs); free(vd);
     E(c, "  jmp .Lb%d_%d", c->fi, tgt);
 }
 
@@ -654,8 +708,18 @@ static bool is_span_blend(Ctx *c, Instr *in, int *out_px, int *out_light,
  * live value. (The shared vector path once read slot offsets
  * unconditionally; a register-resident operand's offset is 0 and
  * the accesses corrupted the saved frame.) */
-static void vec_lane_gp(Ctx *c, Loc *l, int i, Type et, const char *d64, const char *d32) {
+static void vec_lane_gp(Ctx *c, Loc *lp, int i, Type et, const char *d64, const char *d32) {
     int eb = et.bits / 8;
+    Loc ll = *lp; Loc *l = &ll;
+    if (vwide(c) && l->is_reg && i >= 128 / (int)et.bits) {
+        /* WP21-B: high-half lane — pull the top 128 bits into the
+         * xmm15 scratch, then extract from there. The result lands
+         * in a GP register, so reusing xmm15 inside the extraction
+         * patterns below is safe. */
+        E(c, "  vextracti128 xmm15, ymm%d, 1", l->idx);
+        l->idx = 15;
+        i -= 128 / (int)et.bits;
+    }
     if (l->is_reg) {
         if (et.bits == 64) {
             if (i == 0) E(c, "  movq %s, xmm%d", d64, l->idx);
@@ -676,8 +740,17 @@ static void vec_lane_gp(Ctx *c, Loc *l, int i, Type et, const char *d64, const c
 
 /* Extract lane i of a float vector operand into the low lane of
  * xmm register `reg`, from wherever the operand lives. */
-static void vec_lane_fp(Ctx *c, Loc *l, int i, Type et, int reg) {
+static void vec_lane_fp(Ctx *c, Loc *lp, int i, Type et, int reg) {
     int eb = et.bits / 8;
+    Loc ll = *lp; Loc *l = &ll;
+    if (vwide(c) && l->is_reg && i >= 128 / (int)et.bits) {
+        /* WP21-B: high-half lane via xmm15 scratch (see vec_lane_gp).
+         * Callers extracting two operands must take the xmm14-side
+         * operand first — its extraction may occupy xmm15. */
+        E(c, "  vextractf128 xmm15, ymm%d, 1", l->idx);
+        l->idx = 15;
+        i -= 128 / (int)et.bits;
+    }
     if (l->is_reg) {
         if (et.bits == 32) {
             if (i == 0) E(c, "  movss xmm%d, xmm%d", reg, l->idx);
@@ -1521,19 +1594,32 @@ static void emit_instr(Ctx *c, int bi, int ii) {
             const char *env_al = getenv("KRELL_VECTOR_ALIGN");
             if (env_al && strcmp(env_al, "aligned") == 0) vop = "movaps";
             else if (env_al && strcmp(env_al, "streaming") == 0) vop = in->op == OP_VSTORE ? "movntdq" : "movaps";
-            if (in->op == OP_VLOAD) E(c, "  %s xmm%d, %s", vop, l->idx, mstr);
+            if (vwide(c)) {
+                const char *vvop = strcmp(vop, "movntdq") == 0 ? "vmovntdq" : strcmp(vop, "movaps") == 0 ? "vmovaps" : "vmovups";
+                if (in->op == OP_VLOAD) E(c, "  %s ymm%d, %s", vvop, l->idx, mstr);
+                else E(c, "  %s %s, ymm%d", vvop, mstr, l->idx);
+            }
+            else if (in->op == OP_VLOAD) E(c, "  %s xmm%d, %s", vop, l->idx, mstr);
             else E(c, "  %s %s, xmm%d", vop, mstr, l->idx);
             break;
         }
-        int bytes = 16 * t.n;
-        if (in->op == OP_VLOAD) bytes = 16 * t.n;
-        else bytes = 16 * f->vtypes[in->b].n;
-        for (int off = 0; off < bytes; off += 16) {
+        int bytes = mem_size_of(t, c->vl);
+        if (in->op != OP_VLOAD) bytes = mem_size_of(f->vtypes[in->b], c->vl);
+        int step = vwide(c) ? 32 : 16;
+        for (int off = 0; off < bytes; off += step) {
             char chunk_mstr[64];
             X86Addr chunk_addr = addr;
             chunk_addr.disp += off;
             format_x86_addr(c, chunk_mstr, sizeof chunk_mstr, &chunk_addr);
-            if (in->op == OP_VLOAD) {
+            if (vwide(c)) {
+                if (in->op == OP_VLOAD) {
+                    E(c, "  vmovups ymm15, %s", chunk_mstr);
+                    E(c, "  vmovups [rbp - %d], ymm15", l->off - off);
+                } else {
+                    E(c, "  vmovups ymm15, [rbp - %d]", l->off - off);
+                    E(c, "  vmovups %s, ymm15", chunk_mstr);
+                }
+            } else if (in->op == OP_VLOAD) {
                 E(c, "  movups xmm15, %s", chunk_mstr);
                 E(c, "  movups [rbp - %d], xmm15", l->off - off);
             } else {
@@ -1548,6 +1634,32 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         Loc *l = &c->bf->loc[in->result];
         int eb = et.bits / 8;
         if (l->is_reg) {
+            if (vwide(c)) {
+                /* WP21-B: one broadcast per element class (AVX2). The
+                 * scalar source is staged in the low lane of the
+                 * destination's xmm half, then broadcast to ymm. */
+                if (et.kind == TY_FLOAT) {
+                    load_fp(c, l->idx, in->a);
+                    if (et.bits == 32) E(c, "  vbroadcastss ymm%d, xmm%d", l->idx, l->idx);
+                    else E(c, "  vbroadcastsd ymm%d, xmm%d", l->idx, l->idx);
+                } else {
+                    load_gp(c, R11, in->a);
+                    if (eb == 8) {
+                        E(c, "  vmovq xmm%d, r11", l->idx);
+                        E(c, "  vpbroadcastq ymm%d, xmm%d", l->idx, l->idx);
+                    } else if (eb == 4) {
+                        E(c, "  vmovd xmm%d, r11d", l->idx);
+                        E(c, "  vpbroadcastd ymm%d, xmm%d", l->idx, l->idx);
+                    } else if (eb == 2) {
+                        E(c, "  vmovd xmm%d, r11d", l->idx);
+                        E(c, "  vpbroadcastw ymm%d, xmm%d", l->idx, l->idx);
+                    } else {
+                        E(c, "  vmovd xmm%d, r11d", l->idx);
+                        E(c, "  vpbroadcastb ymm%d, xmm%d", l->idx, l->idx);
+                    }
+                }
+                break;
+            }
             if (et.kind == TY_FLOAT) {
                 load_fp(c, l->idx, in->a);
                 if (et.bits == 32) E(c, "  shufps xmm%d, xmm%d, 0", l->idx, l->idx);
@@ -1597,9 +1709,11 @@ static void emit_instr(Ctx *c, int bi, int ii) {
             if (al->is_reg && al->idx == dreg) {
                 /* already in dreg */
             } else if (al->is_reg) {
-                E(c, "  movaps xmm%d, xmm%d", dreg, al->idx);
+                if (vwide(c)) E(c, "  vmovaps ymm%d, ymm%d", dreg, al->idx);
+                else E(c, "  movaps xmm%d, xmm%d", dreg, al->idx);
             } else {
-                E(c, "  movups xmm%d, [rbp - %d]", dreg, al->off);
+                if (vwide(c)) E(c, "  vmovups ymm%d, [rbp - %d]", dreg, al->off);
+                else E(c, "  movups xmm%d, [rbp - %d]", dreg, al->off);
             }
             if (in->op == OP_VADD && et.kind == TY_INT && et.bits == 64 && in->b >= 0 && c->defins[in->b]) {
                 Instr *db = c->defins[in->b];
@@ -1608,17 +1722,52 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                     Loc *sl = &c->bf->loc[db->a];
                     if (sl->is_reg) sreg = sl->idx;
                     else load_fp(c, 14, db->a);
-                    E(c, "  movdqa xmm15, xmm%d", sreg);
-                    E(c, "  psrlq xmm15, 32");
-                    E(c, "  pmuludq xmm15, xmm%d", sreg);
-                    E(c, "  psllq xmm15, 33");
-                    E(c, "  pmuludq xmm%d, xmm%d", sreg, sreg);
-                    E(c, "  paddq xmm%d, xmm%d", dreg, sreg);
-                    E(c, "  paddq xmm%d, xmm15", dreg);
+                    if (vwide(c)) {
+                        /* per-64-bit-lane decomposition, ymm forms */
+                        E(c, "  vmovdqa ymm15, ymm%d", sreg);
+                        E(c, "  vpsrlq ymm15, ymm15, 32");
+                        E(c, "  vpmuludq ymm15, ymm15, ymm%d", sreg);
+                        E(c, "  vpsllq ymm15, ymm15, 33");
+                        E(c, "  vpmuludq ymm%d, ymm%d, ymm%d", sreg, sreg, sreg);
+                        E(c, "  vpaddq ymm%d, ymm%d, ymm%d", dreg, dreg, sreg);
+                        E(c, "  vpaddq ymm%d, ymm%d, ymm15", dreg, dreg);
+                    } else {
+                        E(c, "  movdqa xmm15, xmm%d", sreg);
+                        E(c, "  psrlq xmm15, 32");
+                        E(c, "  pmuludq xmm15, xmm%d", sreg);
+                        E(c, "  psllq xmm15, 33");
+                        E(c, "  pmuludq xmm%d, xmm%d", sreg, sreg);
+                        E(c, "  paddq xmm%d, xmm%d", dreg, sreg);
+                        E(c, "  paddq xmm%d, xmm15", dreg);
+                    }
                     break;
                 }
             }
             if (in->op == OP_VMUL && et.kind == TY_INT && et.bits == 64) {
+                if (vwide(c)) {
+                    if (in->a == in->b) {
+                        E(c, "  vmovdqa ymm15, ymm%d", dreg);
+                        E(c, "  vpsrlq ymm15, ymm15, 32");
+                        E(c, "  vpmuludq ymm15, ymm15, ymm%d", dreg);
+                        E(c, "  vpsllq ymm15, ymm15, 33");
+                        E(c, "  vpmuludq ymm%d, ymm%d, ymm%d", dreg, dreg, dreg);
+                        E(c, "  vpaddq ymm%d, ymm%d, ymm15", dreg, dreg);
+                    } else {
+                        int breg = bl->is_reg ? bl->idx : 14;
+                        if (!bl->is_reg) E(c, "  vmovups ymm14, [rbp - %d]", bl->off);
+                        E(c, "  vmovdqa ymm15, ymm%d", dreg);
+                        E(c, "  vpsrlq ymm15, ymm15, 32");
+                        E(c, "  vpmuludq ymm15, ymm15, ymm%d", breg);
+                        E(c, "  vmovdqa ymm13, ymm%d", breg);
+                        E(c, "  vpsrlq ymm13, ymm13, 32");
+                        E(c, "  vpmuludq ymm13, ymm13, ymm%d", dreg);
+                        E(c, "  vpaddq ymm15, ymm15, ymm13");
+                        E(c, "  vpsllq ymm15, ymm15, 32");
+                        E(c, "  vpmuludq ymm%d, ymm%d, ymm%d", dreg, dreg, breg);
+                        E(c, "  vpaddq ymm%d, ymm%d, ymm15", dreg, dreg);
+                    }
+                    break;
+                }
                 if (in->a == in->b) {
                     E(c, "  movdqa xmm15, xmm%d", dreg);
                     E(c, "  psrlq xmm15, 32");
@@ -1661,7 +1810,11 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                  * through to the scalarized lane loop instead. */
             }
             if (nm) {
-                if (bl->is_reg) E(c, "  %s xmm%d, xmm%d", nm, dreg, bl->idx);
+                if (vwide(c)) {
+                    if (bl->is_reg) E(c, "  v%s ymm%d, ymm%d, ymm%d", nm, dreg, dreg, bl->idx);
+                    else E(c, "  v%s ymm%d, ymm%d, [rbp - %d]", nm, dreg, dreg, bl->off);
+                }
+                else if (bl->is_reg) E(c, "  %s xmm%d, xmm%d", nm, dreg, bl->idx);
                 else E(c, "  %s xmm%d, [rbp - %d]", nm, dreg, bl->off);
                 break;
             }
@@ -1691,20 +1844,34 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                 if (in->op == OP_VMUL && et.bits == 64) nm = NULL;
                 else nm = tmp;
                 if (nm) {
-                    for (int off = 0; off < 16 * t.n; off += 16) {
-                        E(c, "  movups xmm15, [rbp - %d]", al->off - off);
-                        E(c, "  %s xmm15, [rbp - %d]", nm, bl->off - off);
-                        E(c, "  movups [rbp - %d], xmm15", dl->off - off);
+                    int bytes = mem_size_of(t, c->vl), step = vwide(c) ? 32 : 16;
+                    for (int off = 0; off < bytes; off += step) {
+                        if (vwide(c)) {
+                            E(c, "  vmovups ymm15, [rbp - %d]", al->off - off);
+                            E(c, "  v%s ymm15, ymm15, [rbp - %d]", nm, bl->off - off);
+                            E(c, "  vmovups [rbp - %d], ymm15", dl->off - off);
+                        } else {
+                            E(c, "  movups xmm15, [rbp - %d]", al->off - off);
+                            E(c, "  %s xmm15, [rbp - %d]", nm, bl->off - off);
+                            E(c, "  movups [rbp - %d], xmm15", dl->off - off);
+                        }
                     }
                     break;
                 }
                 scalarize = true;
             }
             if (nm) {
-                for (int off = 0; off < 16 * t.n; off += 16) {
-                    E(c, "  movups xmm15, [rbp - %d]", al->off - off);
-                    E(c, "  %s xmm15, [rbp - %d]", nm, bl->off - off);
-                    E(c, "  movups [rbp - %d], xmm15", dl->off - off);
+                int bytes = mem_size_of(t, c->vl), step = vwide(c) ? 32 : 16;
+                for (int off = 0; off < bytes; off += step) {
+                    if (vwide(c)) {
+                        E(c, "  vmovups ymm15, [rbp - %d]", al->off - off);
+                        E(c, "  v%s ymm15, ymm15, [rbp - %d]", nm, bl->off - off);
+                        E(c, "  vmovups [rbp - %d], ymm15", dl->off - off);
+                    } else {
+                        E(c, "  movups xmm15, [rbp - %d]", al->off - off);
+                        E(c, "  %s xmm15, [rbp - %d]", nm, bl->off - off);
+                        E(c, "  movups [rbp - %d], xmm15", dl->off - off);
+                    }
                 }
                 break;
             }
@@ -1714,14 +1881,30 @@ static void emit_instr(Ctx *c, int bi, int ii) {
          * wherever the result lives */
         int lanes = ty_lanes(t, c->vl);
         int eb = et.bits / 8;
+        int half = 128 / (int)et.bits;
         for (int i = 0; i < lanes; i++) {
             if (et.kind == TY_FLOAT) {
                 const char *nm = in->op == OP_VFADD ? "add" : in->op == OP_VFSUB ? "sub" : in->op == OP_VFMUL ? "mul" : "div";
-                vec_lane_fp(c, al, i, et, 15);
-                vec_lane_fp(c, bl, i, et, 14);
+                if (vwide(c)) {
+                    /* WP21-B: the xmm14-side operand extracts first —
+                     * a high-half extraction occupies xmm15, which is
+                     * where the xmm15-side lane must survive. */
+                    vec_lane_fp(c, bl, i, et, 14);
+                    vec_lane_fp(c, al, i, et, 15);
+                } else {
+                    vec_lane_fp(c, al, i, et, 15);
+                    vec_lane_fp(c, bl, i, et, 14);
+                }
                 E(c, "  %s%s xmm15, xmm14", nm, et.bits == 32 ? "ss" : "sd");
                 if (dl->is_reg) {
-                    if (et.bits == 32) { E(c, "  movd r11d, xmm15"); E(c, "  pinsrd xmm%d, r11d, %d", dl->idx, i); }
+                    if (vwide(c) && i >= half) {
+                        /* insert into the high half, staged in xmm13 */
+                        if (i == half) E(c, "  vextractf128 xmm13, ymm%d, 1", dl->idx);
+                        if (et.bits == 32) { E(c, "  movd r11d, xmm15"); E(c, "  pinsrd xmm13, r11d, %d", i - half); }
+                        else { E(c, "  movq r11, xmm15"); E(c, "  pinsrq xmm13, r11, %d", i - half); }
+                        if (i == lanes - 1) E(c, "  vinsertf128 ymm%d, ymm%d, xmm13, 1", dl->idx, dl->idx);
+                    }
+                    else if (et.bits == 32) { E(c, "  movd r11d, xmm15"); E(c, "  pinsrd xmm%d, r11d, %d", dl->idx, i); }
                     else { E(c, "  movq r11, xmm15"); E(c, "  pinsrq xmm%d, r11, %d", dl->idx, i); }
                 } else {
                     E(c, "  %s [rbp - %d], xmm15", et.bits == 32 ? "movss" : "movsd", dl->off - i * eb);
@@ -1751,7 +1934,17 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                 }
                 mask_r11(c, et);
                 if (dl->is_reg) {
-                    if (eb == 1) E(c, "  pinsrb xmm%d, r11d, %d", dl->idx, i);
+                    if (vwide(c) && i >= half) {
+                        /* insert into the high half, staged in xmm14
+                         * (vec_lane_gp's scratch is xmm15) */
+                        if (i == half) E(c, "  vextracti128 xmm14, ymm%d, 1", dl->idx);
+                        if (eb == 1) E(c, "  pinsrb xmm14, r11d, %d", i - half);
+                        else if (eb == 2) E(c, "  pinsrw xmm14, r11d, %d", i - half);
+                        else if (eb == 4) E(c, "  pinsrd xmm14, r11d, %d", i - half);
+                        else E(c, "  pinsrq xmm14, r11, %d", i - half);
+                        if (i == lanes - 1) E(c, "  vinserti128 ymm%d, ymm%d, xmm14, 1", dl->idx, dl->idx);
+                    }
+                    else if (eb == 1) E(c, "  pinsrb xmm%d, r11d, %d", dl->idx, i);
                     else if (eb == 2) E(c, "  pinsrw xmm%d, r11d, %d", dl->idx, i);
                     else if (eb == 4) E(c, "  pinsrd xmm%d, r11d, %d", dl->idx, i);
                     else E(c, "  pinsrq xmm%d, r11, %d", dl->idx, i);
@@ -1771,6 +1964,14 @@ static void emit_instr(Ctx *c, int bi, int ii) {
              * operand, which for 64-bit lanes is exactly the lane's
              * own shift amount: the packed form is lane-exact. */
             int dreg = dl->idx;
+            if (vwide(c)) {
+                if (al->is_reg && al->idx == dreg) { /* already in place */ }
+                else if (al->is_reg) E(c, "  vmovaps ymm%d, ymm%d", dreg, al->idx);
+                else E(c, "  vmovups ymm%d, [rbp - %d]", dreg, al->off);
+                if (bl->is_reg) E(c, "  vpsrlq ymm%d, ymm%d, xmm%d", dreg, dreg, bl->idx);
+                else E(c, "  vpsrlq ymm%d, ymm%d, [rbp - %d]", dreg, dreg, bl->off);
+                break;
+            }
             if (al->is_reg && al->idx == dreg) { /* already in place */ }
             else if (al->is_reg) E(c, "  movaps xmm%d, xmm%d", dreg, al->idx);
             else E(c, "  movups xmm%d, [rbp - %d]", dreg, al->off);
@@ -1785,32 +1986,47 @@ static void emit_instr(Ctx *c, int bi, int ii) {
          * operands -- do not copy that shortcut). */
         int lanes = ty_lanes(t, c->vl);
         int eb = et.bits / 8;
+        int half = 128 / (int)et.bits;
         for (int i = 0; i < lanes; i++) {
             const char *szp = eb == 1 ? "BYTE PTR" : eb == 2 ? "WORD PTR" : eb == 4 ? "DWORD PTR" : "QWORD PTR";
+            /* WP21-B: a high-half register operand is staged through
+             * xmm15 first; ai/asrc (bi/bsrc) then name the xmm half
+             * and lane within it. The extracted lane lands in a GP
+             * register before the other operand is touched. */
+            int asrc = al->is_reg ? al->idx : -1, ai = i;
+            int bsrc = bl->is_reg ? bl->idx : -1, bi = i;
+            if (vwide(c) && al->is_reg && i >= half) {
+                E(c, "  vextracti128 xmm15, ymm%d, 1", asrc);
+                asrc = 15; ai = i - half;
+            }
             if (al->is_reg) {
                 if (et.bits == 64) {
-                    if (i == 0) E(c, "  movq r11, xmm%d", al->idx);
-                    else { E(c, "  movhlps xmm15, xmm%d", al->idx); E(c, "  movq r11, xmm15"); }
+                    if (ai == 0) E(c, "  movq r11, xmm%d", asrc);
+                    else { E(c, "  movhlps xmm15, xmm%d", asrc); E(c, "  movq r11, xmm15"); }
                 } else if (et.bits == 32) {
-                    if (i == 0) E(c, "  movd r11d, xmm%d", al->idx);
-                    else { E(c, "  pshufd xmm15, xmm%d, %d", al->idx, i); E(c, "  movd r11d, xmm15"); }
+                    if (ai == 0) E(c, "  movd r11d, xmm%d", asrc);
+                    else { E(c, "  pshufd xmm15, xmm%d, %d", asrc, ai); E(c, "  movd r11d, xmm15"); }
                 } else {
-                    E(c, "  pextr%c r11d, xmm%d, %d", et.bits == 16 ? 'w' : 'b', al->idx, i);
+                    E(c, "  pextr%c r11d, xmm%d, %d", et.bits == 16 ? 'w' : 'b', asrc, ai);
                 }
             } else {
                 if (eb <= 2) E(c, "  movzx r11d, %s [rbp - %d]", szp, al->off - i * eb);
                 else if (eb == 4) E(c, "  mov r11d, DWORD PTR [rbp - %d]", al->off - i * eb);
                 else E(c, "  mov r11, QWORD PTR [rbp - %d]", al->off - i * eb);
             }
+            if (vwide(c) && bl->is_reg && i >= half) {
+                E(c, "  vextracti128 xmm15, ymm%d, 1", bsrc);
+                bsrc = 15; bi = i - half;
+            }
             if (bl->is_reg) {
                 if (et.bits == 64) {
-                    if (i == 0) E(c, "  movq rax, xmm%d", bl->idx);
-                    else { E(c, "  movhlps xmm15, xmm%d", bl->idx); E(c, "  movq rax, xmm15"); }
+                    if (bi == 0) E(c, "  movq rax, xmm%d", bsrc);
+                    else { E(c, "  movhlps xmm15, xmm%d", bsrc); E(c, "  movq rax, xmm15"); }
                 } else if (et.bits == 32) {
-                    if (i == 0) E(c, "  movd eax, xmm%d", bl->idx);
-                    else { E(c, "  pshufd xmm15, xmm%d, %d", bl->idx, i); E(c, "  movd eax, xmm15"); }
+                    if (bi == 0) E(c, "  movd eax, xmm%d", bsrc);
+                    else { E(c, "  pshufd xmm15, xmm%d, %d", bsrc, bi); E(c, "  movd eax, xmm15"); }
                 } else {
-                    E(c, "  pextr%c eax, xmm%d, %d", et.bits == 16 ? 'w' : 'b', bl->idx, i);
+                    E(c, "  pextr%c eax, xmm%d, %d", et.bits == 16 ? 'w' : 'b', bsrc, bi);
                 }
             } else {
                 if (eb <= 2) E(c, "  movzx eax, %s [rbp - %d]", szp, bl->off - i * eb);
@@ -1822,7 +2038,15 @@ static void emit_instr(Ctx *c, int bi, int ii) {
             E(c, "  shr r11, cl");
             mask_r11(c, et);
             if (dl->is_reg) {
-                if (eb == 1) E(c, "  pinsrb xmm%d, r11d, %d", dl->idx, i);
+                if (vwide(c) && i >= half) {
+                    if (i == half) E(c, "  vextracti128 xmm14, ymm%d, 1", dl->idx);
+                    if (eb == 1) E(c, "  pinsrb xmm14, r11d, %d", i - half);
+                    else if (eb == 2) E(c, "  pinsrw xmm14, r11d, %d", i - half);
+                    else if (eb == 4) E(c, "  pinsrd xmm14, r11d, %d", i - half);
+                    else E(c, "  pinsrq xmm14, r11, %d", i - half);
+                    if (i == lanes - 1) E(c, "  vinserti128 ymm%d, ymm%d, xmm14, 1", dl->idx, dl->idx);
+                }
+                else if (eb == 1) E(c, "  pinsrb xmm%d, r11d, %d", dl->idx, i);
                 else if (eb == 2) E(c, "  pinsrw xmm%d, r11d, %d", dl->idx, i);
                 else if (eb == 4) E(c, "  pinsrd xmm%d, r11d, %d", dl->idx, i);
                 else E(c, "  pinsrq xmm%d, r11, %d", dl->idx, i);
@@ -1837,6 +2061,18 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         Type et = ty_elem(f->vtypes[in->a]);
         Loc *al = &c->bf->loc[in->a];
         int imm = (int)in->imm;
+        if (al->is_reg && vwide(c)) {
+            /* WP21-B: the lane helpers already stage high-half lanes
+             * through xmm15 (and never write the ymm source). */
+            if (et.kind == TY_FLOAT) {
+                vec_lane_fp(c, al, imm, et, 15);
+                store_fp(c, in->result, 15);
+            } else {
+                vec_lane_gp(c, al, imm, et, "r11", "r11d");
+                store_gp(c, in->result, R11);
+            }
+            break;
+        }
         if (al->is_reg) {
             if (et.kind == TY_FLOAT) {
                 if (imm == 0) store_fp(c, in->result, al->idx);
@@ -1894,6 +2130,32 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         Type et = ty_elem(t);
         Loc *dl = &c->bf->loc[in->result];
         int imm = (int)in->imm;
+        if (dl->is_reg && vwide(c)) {
+            /* WP21-B: a 128-bit insert into a ymm home would zero the
+             * other half (VEX-128 dest semantics), so the target half
+             * is extracted to xmm15, inserted there, and put back. */
+            int half = 128 / (int)et.bits;
+            int hi = imm >= half ? 1 : 0;
+            int j = hi ? imm - half : imm;
+            if (et.kind == TY_FLOAT) {
+                load_fp(c, 14, in->b);
+                E(c, "  vextractf128 xmm15, ymm%d, %d", dl->idx, hi);
+                if (et.bits == 32) E(c, "  insertps xmm15, xmm14, %d", j << 4);
+                else if (j == 0) E(c, "  movsd xmm15, xmm14");
+                else E(c, "  movlhps xmm15, xmm14");
+                E(c, "  vinsertf128 ymm%d, ymm%d, xmm15, %d", dl->idx, dl->idx, hi);
+            } else {
+                load_gp(c, R11, in->b);
+                int eb = et.bits / 8;
+                E(c, "  vextracti128 xmm15, ymm%d, %d", dl->idx, hi);
+                if (eb == 1) E(c, "  pinsrb xmm15, r11d, %d", j);
+                else if (eb == 2) E(c, "  pinsrw xmm15, r11d, %d", j);
+                else if (eb == 4) E(c, "  pinsrd xmm15, r11d, %d", j);
+                else E(c, "  pinsrq xmm15, r11, %d", j);
+                E(c, "  vinserti128 ymm%d, ymm%d, xmm15, %d", dl->idx, dl->idx, hi);
+            }
+            break;
+        }
         if (dl->is_reg) {
             if (et.kind == TY_FLOAT) {
                 load_fp(c, 15, in->b);
@@ -2672,7 +2934,14 @@ static int emit_func(Ctx *c, int fi) {
             merged_folded = true;
         }
     }
-    Pools pools = { POOL_GP, 10, POOL_FP, 15, 1 };
+    Pools pools = { POOL_GP, 10, POOL_FP, 15, 1, vwide(c) ? 32 : 16 };
+    /* WP21-B: vzeroupper duty is per function — set when the function
+     * holds any vector value under the wide target. */
+    c->vzero = 0;
+    if (vwide(c)) {
+        for (int v = 0; v < f->nvalues; v++)
+            if (f->vtypes[v].kind == TY_VEC) { c->vzero = 1; break; }
+    }
     BeFunc *bf = be_analyze_ext(m, f, &pools, alloc_folded);
     if (merged_folded) free(alloc_folded);
     if (!bf) { free(c->defins); c->defins = NULL; free(c->folded_ins); c->folded_ins = NULL; free(c->cmp_fuse); c->cmp_fuse = NULL; return -1; }
@@ -2823,6 +3092,7 @@ static int emit_func(Ctx *c, int fi) {
         emit_branch(c, er.other_blk, er.other_args, er.other_nargs);
         E(c, ".Lx%d_%d:", fi, early_lbl);
         if (er.ret_is_void) {
+            if (c->vzero) E(c, "  vzeroupper");
             E(c, "  ret");
         } else if (er.ret_arg_idx >= 0) {
             if (ARG_GP[er.ret_arg_idx] != RAX) E(c, "  mov rax, %s", G64[ARG_GP[er.ret_arg_idx]]);
@@ -2834,9 +3104,11 @@ static int emit_func(Ctx *c, int fi) {
                 E(c, "  shl rax, %d", k);
                 E(c, "  shr rax, %d", k);
             }
+            if (c->vzero) E(c, "  vzeroupper");
             E(c, "  ret");
         } else {
             E(c, "  mov rax, %lld", (long long)er.ret_const);
+            if (c->vzero) E(c, "  vzeroupper");
             E(c, "  ret");
         }
     }
@@ -2904,6 +3176,47 @@ int be_x86_64(Module *m, const Cost *cost, FILE *out, char *err, size_t errcap) 
     const char *ve = mod_verify(m);
     if (ve) { be_err(err, errcap, ve); return -1; }
     Ctx c = { .out = out, .m = m, .vl = cost_vl_i32(cost) };
+    if (vwide(&c)) {
+        /* WP21-B wide-target contract: the ymm model covers exactly
+         * one shape — internal TY_VEC values with n == 1 (one ymm at
+         * vl 8). Vectors crossing the ABI (entry params, call args
+         * or results) and multi-part vectors are rejected with a
+         * clean backend error rather than miscompiled. */
+        for (int i = 0; i < m->nfuncs; i++) {
+            Func *f = &m->funcs[i];
+            for (int v = 0; v < f->nvalues; v++) {
+                Type t = f->vtypes[v];
+                if (t.kind == TY_VEC && t.n != 1) {
+                    be_err(err, errcap, "x86_64_avx2: vector with n != 1 is not supported");
+                    return -1;
+                }
+            }
+            if (f->nblocks > 0) {
+                Block *b0 = &f->blocks[0];
+                for (int a = 0; a < b0->nargs; a++)
+                    if (b0->arg_types[a].kind == TY_VEC) {
+                        be_err(err, errcap, "x86_64_avx2: vector entry parameter is not supported");
+                        return -1;
+                    }
+            }
+            for (int b = 0; b < f->nblocks; b++)
+                for (int j = 0; j < f->blocks[b].nins; j++) {
+                    Instr *in = &f->blocks[b].ins[j];
+                    if (in->op == OP_CALL || in->op == OP_TAILCALL || in->op == OP_CALLI || in->op == OP_TAILCALLI) {
+                        Type rt = f->vtypes[in->result];
+                        if (in->result >= 0 && rt.kind == TY_VEC) {
+                            be_err(err, errcap, "x86_64_avx2: vector call result is not supported");
+                            return -1;
+                        }
+                        for (int a = 0; a < in->nargs; a++)
+                            if (in->args[a] >= 0 && f->vtypes[in->args[a]].kind == TY_VEC) {
+                                be_err(err, errcap, "x86_64_avx2: vector call argument is not supported");
+                                return -1;
+                            }
+                    }
+                }
+        }
+    }
     E(&c, ".intel_syntax noprefix");
     E(&c, ".text");
     for (int i = 0; i < m->nfuncs; i++)

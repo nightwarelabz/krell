@@ -60,6 +60,11 @@ typedef struct {
      * registers). With vec_regs == 0 the allocator classes every
      * vector value BCLS_VEC and gives it a real slot. */
     int vec_regs;
+    /* bytes occupied by a TY_VEC value with n == 1 on this target
+     * (16 at vl 4, 32 at vl 8). 0 = legacy default 16. Memory-resident
+     * vector slots are accounted in 16-byte units, so a value of
+     * n * vec_bytes bytes consumes n * vec_bytes / 16 units. */
+    int vec_bytes;
 } Pools;
 
 /* position of instruction ii in block bi */
