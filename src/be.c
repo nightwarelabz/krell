@@ -606,6 +606,24 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
                     int nu = nu_next_use(usepos, useoff[act[j].v], useoff[act[j].v + 1],
                                          iv->start, act[j].start, act[j].end,
                                          be_hp, be_lp, nbe);
+                    /* Rematerializable values (constants) are the
+                     * cheapest possible victims: most emitter sites
+                     * fold them back into immediates via
+                     * be_iconst_val/be_fconst_val and never read the
+                     * slot, and the rest pay one load. The wrap-aware
+                     * next-use otherwise ranks a loop body's hot
+                     * pointer -- whose next use is next iteration's,
+                     * wrapped -- as "farther" than a constant used
+                     * once this iteration, and a one-instruction
+                     * temp's pressure point would spill the pointer
+                     * for its whole interval (the parse case: the
+                     * input pointer reloaded from its slot on every
+                     * byte). Prefer a constant victim over any
+                     * non-constant one; among constants, the first
+                     * eligible wins. */
+                    Instr *ad = defins[act[j].v];
+                    if (ad && (ad->op == OP_ICONST || ad->op == OP_FCONST))
+                        nu = nu < 0 ? nu : INT_MAX - 1;
                     if (nu > best_next) {
                         best_next = nu;
                         furthest = j;
