@@ -115,19 +115,22 @@ EPYC 9D25; the LLVM lane of that run was built with clang 18).
 
 | lane | S, all twelve kernels | S, excluding fib |
 |---|---|---|
-| x86_64 native | 4.20× — 320% faster than C | 1.58× — 58% faster than C |
-| LLVM | 4.56× — 356% faster than C | 1.59× — 59% faster than C |
+| x86_64 native | 4.21× — 321% faster than C | 1.66× — 66% faster than C |
+| LLVM | 4.59× — 359% faster than C | 1.58× — 58% faster than C |
 
 fib is quoted both ways because it dominates any mean it joins:
 the optimizer lowers its two-term recurrence to an O(n) loop —
-25.3 ns native and 10.0 ns through the LLVM lane, against
-4,901,152 ns for C -O2.
+53.4 ns native and 11.3 ns through the LLVM lane in this run,
+against 6,452,910 ns for C -O2 (the native fib row varies with
+bench-binary layout; the kernel's emitted code is unchanged
+since the WP15 record's 24.7 ns).
 
-Per-kernel speedups (native / LLVM): fill32 3.20× / 3.11×,
-copy 3.03× / 3.08×, saxpy 2.71× / 2.50×, bytesum 2.64× / 3.73×,
-sumsq 1.55× / 1.36×, span 1.38× / 1.30×, dot 1.05× / 1.09×,
-histo 1.01× / 1.02×, parse 1.00× / 1.07×, fnv1a 0.99× / 1.00×,
-mix 0.99× / 0.87×.
+Per-kernel speedups (native / LLVM): saxpy 3.15× / 2.32×,
+copy 3.06× / 3.19×, bytesum 2.89× / 3.15×, fill32 2.01× / 1.94×,
+sumsq 2.01× / 1.79×, span 1.76× / 1.53×, histo 1.21× / 1.22×,
+parse 1.11× / 0.97×, mix 1.07× / 1.18×, fnv1a 1.00× / 0.99×,
+dot 0.91× / 0.91× (dot's ratio varies by bench process on the
+bench host; isolated fixed-layout runs measure it ahead of C).
 
 The full record — kernels, C references, methodology, per-run
 results and charts — lives in the
