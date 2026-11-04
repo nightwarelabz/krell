@@ -405,6 +405,37 @@ static void emit_instr(Ctx *c, Instr *in) {
     case OP_VOR:  E(c, "  %s = or %s %s, %s", R, tb, ab, bb); break;
     case OP_VXOR: E(c, "  %s = xor %s %s, %s", R, tb, ab, bb); break;
     case OP_VLSHR: E(c, "  %s = lshr %s %s, %s", R, tb, ab, bb); break;
+    case OP_VWIDEN: {
+        /* zext the operand to the result element width, fold each
+         * group of consecutive lanes with a shuffle/add butterfly
+         * (after steps 1,2,4,... every lane holds its aligned
+         * group's sum), then gather the group-leading lanes */
+        Type at = f->vtypes[in->a];
+        Type oet = ty_elem(t);
+        char atb[48]; ty_str(c, at, atb, sizeof atb);
+        int iln = ty_lanes(at, c->vl), oln = ty_lanes(t, c->vl);
+        int grp = iln / oln;
+        char wtb[64]; snprintf(wtb, sizeof wtb, "<%d x i%d>", iln, (int)oet.bits);
+        int cur = emit_tmp(c, "zext %s %s to %s", atb, ab, wtb);
+        for (int s = 1; s < grp; s *= 2) {
+            char mask[1024]; int pos = 0;
+            pos += snprintf(mask + pos, sizeof mask - (size_t)pos, "<");
+            for (int i = 0; i < iln; i++)
+                pos += snprintf(mask + pos, sizeof mask - (size_t)pos, "%si32 %d", i ? ", " : "", i ^ s);
+            snprintf(mask + pos, sizeof mask - (size_t)pos, ">");
+            char mtb[64]; snprintf(mtb, sizeof mtb, "<%d x i32>", iln);
+            int sh = emit_tmp(c, "shufflevector %s %%t%d, %s poison, %s %s", wtb, cur, wtb, mtb, mask);
+            cur = emit_tmp(c, "add %s %%t%d, %%t%d", wtb, cur, sh);
+        }
+        char gmask[256]; int gpos = 0;
+        gpos += snprintf(gmask + gpos, sizeof gmask - (size_t)gpos, "<");
+        for (int j = 0; j < oln; j++)
+            gpos += snprintf(gmask + gpos, sizeof gmask - (size_t)gpos, "%si32 %d", j ? ", " : "", j * grp);
+        snprintf(gmask + gpos, sizeof gmask - (size_t)gpos, ">");
+        char gmtb[64]; snprintf(gmtb, sizeof gmtb, "<%d x i32>", oln);
+        E(c, "  %s = shufflevector %s %%t%d, %s poison, %s %s", R, wtb, cur, wtb, gmtb, gmask);
+        break;
+    }
     case OP_VEXTRACT: {
         char vb[48]; ty_str(c, f->vtypes[in->a], vb, sizeof vb);
         E(c, "  %s = extractelement %s %s, i64 %lld", R, vb, ab, (long long)in->imm);

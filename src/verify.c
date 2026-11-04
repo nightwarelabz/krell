@@ -119,6 +119,16 @@ static const char *check_instr(Module *m, Func *f, Block *b, Instr *in, int idx)
         NEED(ty_is_vec(in->ty) && same_ty(VT(in->a), in->ty) && same_ty(VT(in->b), in->ty), "vec binop mismatch");
         NEED(ty_elem(in->ty).kind == TY_FLOAT, "float vec op needs float elements");
         break;
+    case OP_VWIDEN: {
+        NEED(ty_is_vec(in->ty) && ty_is_vec(VT(in->a)), "vwiden needs a vector operand and result");
+        Type ie = ty_elem(VT(in->a)), oe = ty_elem(in->ty);
+        NEED(ie.kind == TY_INT && oe.kind == TY_INT, "vwiden is integer-only");
+        NEED(VT(in->a).n == in->ty.n, "vwiden preserves the vscale count");
+        int ratio = (ie.bits > 0) ? oe.bits / ie.bits : 0;
+        NEED(ie.bits > 0 && oe.bits % ie.bits == 0 && ratio >= 2 &&
+             (ratio & (ratio - 1)) == 0, "vwiden group ratio must be a power of two >= 2");
+        break;
+    }
     case OP_VEXTRACT:
         NEED(ty_is_vec(VT(in->a)) && same_ty(in->ty, ty_elem(VT(in->a))), "vextract mismatch");
         NEED(in->imm >= 0, "vextract lane negative");

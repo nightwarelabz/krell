@@ -1096,6 +1096,29 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         }
         break;
     }
+    case OP_VWIDEN: {
+        /* no vector unit on this backend: scalarized group-sum lane
+         * loop over slots (the target gate prices the op as a cliff,
+         * so this is a correctness fallback, not the expected path) */
+        Type iet = ty_elem(f->vtypes[in->a]);
+        Type oet = ty_elem(t);
+        Loc *dl = &c->bf->loc[in->result], *al = &c->bf->loc[in->a];
+        int iln = ty_lanes(f->vtypes[in->a], c->vl), oln = ty_lanes(t, c->vl);
+        int grp = iln / oln, ieb = iet.bits / 8, oeb = oet.bits / 8;
+        for (int j = 0; j < oln; j++) {
+            addr_of(c, T0, al->off - j * grp * ieb);
+            lane_load_into(c, T0, T0, ieb);
+            for (int t2 = 1; t2 < grp; t2++) {
+                addr_of(c, T1, al->off - (j * grp + t2) * ieb);
+                lane_load_into(c, T1, T1, ieb);
+                E(c, "  add x%d, x%d, x%d", T0, T0, T1);
+            }
+            mask_reg(c, T0, oet);
+            addr_of(c, T1, dl->off - j * oeb);
+            lane_store_from(c, T0, T1, oeb);
+        }
+        break;
+    }
     case OP_VEXTRACT: {
         Type et = in->ty;
         Loc *al = &c->bf->loc[in->a];

@@ -1886,23 +1886,44 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
         if (!is_fill && !is_reduce && !is_histo && !is_fnv && !is_map && !is_copy) continue;
 
         Type elem_ty = gep_in->ety;
-        bool use_scalar_unroll = (is_reduce && elem_ty.kind == TY_INT && elem_ty.bits == 64) || is_histo || is_fnv || is_widen;
-        bool use_scalar_reduce = is_reduce && ((elem_ty.kind == TY_INT && elem_ty.bits == 64) || is_widen);
+        /* WP25: widening-reduce via OP_VWIDEN. For the i8 -> i64
+         * shape the target may price a widening horizontal sum
+         * (x86 psadbw, NEON uaddlp chain); when it does, the reduce
+         * rides the vector machinery with accumulators of the
+         * widened element type instead of the scalar SWAR form.
+         * Restricted to the one shape the backends lower natively;
+         * every other widening shape keeps the SWAR / scalar forms
+         * below. The extra price checks mirror the vector-path
+         * pre-checks, so a target that cannot carry the vector form
+         * falls back to SWAR rather than losing the rewrite. */
+        bool is_vwiden = false;
+        if (is_widen && elem_ty.kind == TY_INT && elem_ty.bits == 8 &&
+            widen_acc_ty.kind == TY_INT && widen_acc_ty.bits == 64) {
+            Type aw_ty = ty_vec(widen_acc_ty, 1);
+            Type ew_ty = ty_vec(elem_ty, 1);
+            if (!cost_cliff(cost, OP_VWIDEN, aw_ty) && cost_lat(cost, OP_VWIDEN, aw_ty) >= 0 &&
+                !cost_cliff(cost, OP_VLOAD, ew_ty) && !cost_cliff(cost, OP_VSPLAT, aw_ty) &&
+                !cost_cliff(cost, OP_VADD, aw_ty) && !cost_cliff(cost, OP_VEXTRACT, aw_ty))
+                is_vwiden = true;
+        }
+        if (is_vwiden) is_swar = false;
+        bool use_scalar_unroll = (is_reduce && elem_ty.kind == TY_INT && elem_ty.bits == 64) || is_histo || is_fnv || (is_widen && !is_vwiden);
+        bool use_scalar_reduce = is_reduce && ((elem_ty.kind == TY_INT && elem_ty.bits == 64) || (is_widen && !is_vwiden));
 
         int vl_i32 = cost_vl_i32(cost);
         int lanes = use_scalar_unroll ? 1 : ((vl_i32 * 32) / elem_ty.bits);
         if (lanes < 1 || (!use_scalar_unroll && lanes < 2)) continue;
         Type vec_ty = ty_vec(elem_ty, 1);
         Type acc_ty = use_scalar_unroll ? elem_ty : vec_ty;
-        if (is_widen) acc_ty = widen_acc_ty;
+        if (is_widen) acc_ty = is_vwiden ? ty_vec(widen_acc_ty, 1) : widen_acc_ty;
 
         if (!use_scalar_unroll) {
             if (cost_cliff(cost, OP_VLOAD, vec_ty)) continue;
             if (cost_cliff(cost, OP_VSTORE, vec_ty)) continue;
             if (cost_cliff(cost, OP_VSPLAT, vec_ty)) continue;
             if (is_reduce) {
-                if (cost_cliff(cost, OP_VMUL, vec_ty)) continue;
-                if (cost_lat(cost, OP_VMUL, vec_ty) < 0) continue;
+                if (!is_vwiden && cost_cliff(cost, OP_VMUL, vec_ty)) continue;
+                if (!is_vwiden && cost_lat(cost, OP_VMUL, vec_ty) < 0) continue;
                 if (cost_cliff(cost, OP_VADD, vec_ty)) continue;
                 if (cost_cliff(cost, OP_VEXTRACT, vec_ty)) continue;
             }
@@ -2122,12 +2143,12 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
             p_args = (p_term->blk == h_idx) ? p_term->args : p_term->args2;
         }
         if (is_reduce) {
-            Instr zc = ins_iconst(is_widen ? acc_ty : elem_ty, 0);
+            Instr zc = ins_iconst(is_widen ? widen_acc_ty : elem_ty, 0);
             int zval = opt_emit_before_term(f, pre_idx, zc);
             if (use_scalar_reduce) {
                 vzval = zval;
             } else {
-                Instr splat0 = ins_un(OP_VSPLAT, vec_ty, zval);
+                Instr splat0 = ins_un(OP_VSPLAT, is_vwiden ? acc_ty : vec_ty, zval);
                 vzval = opt_emit_before_term(f, pre_idx, splat0);
             }
             P = &f->blocks[pre_idx];
@@ -2244,6 +2265,24 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
                 int prod = emit(f, b_vbody, mul_in);
                 int acc_i = u % num_acc;
                 Instr add_in = ins_bin(use_scalar_unroll ? OP_ADD : OP_VADD, acc_ty, cur_acc[acc_i], prod);
+                cur_acc[acc_i] = emit(f, b_vbody, add_in);
+            }
+        } else if (is_reduce && is_vwiden) {
+            for (int u = 0; u < num_acc; u++) cur_acc[u] = VB->arg_vals[vec_start + u];
+            for (int u = 0; u < U; u++) {
+                int load_ptr = cur_p;
+                if (u > 0) {
+                    Instr gep_u = ins_bin(OP_GEP, H->arg_types[base_arg_idx], cur_p, c_u_v[u]);
+                    gep_u.ety = elem_ty;
+                    load_ptr = emit(f, b_vbody, gep_u);
+                }
+                Instr vld = ins_un(OP_VLOAD, vec_ty, load_ptr);
+                vld.ety = elem_ty;
+                int loaded = emit(f, b_vbody, vld);
+                Instr wd = ins_un(OP_VWIDEN, acc_ty, loaded);
+                int wide = emit(f, b_vbody, wd);
+                int acc_i = u % num_acc;
+                Instr add_in = ins_bin(OP_VADD, acc_ty, cur_acc[acc_i], wide);
                 cur_acc[acc_i] = emit(f, b_vbody, add_in);
             }
         } else if (is_reduce && is_swar) {
@@ -2530,7 +2569,7 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
             for (int u = 0; u < num_acc; u++) ve_acc[u] = f->blocks[b_vexit].arg_vals[vec_start + u];
             int orig_acc = f->blocks[b_vexit].arg_vals[invar_start + acc_arg_idx];
 
-            Type comb_ty = is_widen ? acc_ty : elem_ty;
+            Type comb_ty = is_widen ? widen_acc_ty : elem_ty;
             int cur_sum;
             if (use_scalar_reduce) {
                 if (num_acc == 4) {
@@ -2547,18 +2586,23 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
             } else {
                 int cur_acc_sum = ve_acc[0];
                 for (int u = 1; u < num_acc; u++) {
-                    Instr a_u = ins_bin(OP_VADD, vec_ty, cur_acc_sum, ve_acc[u]);
+                    Instr a_u = ins_bin(OP_VADD, is_vwiden ? acc_ty : vec_ty, cur_acc_sum, ve_acc[u]);
                     cur_acc_sum = emit(f, b_vexit, a_u);
                 }
+                /* WP25: the vwiden accumulator vector carries the
+                 * widened element type, so the lane fold extracts
+                 * widen_acc_ty lanes, not elem_ty lanes. */
+                int sum_lanes = is_vwiden ? ty_lanes(acc_ty, vl_i32) : lanes;
+                Type sum_ty = is_vwiden ? widen_acc_ty : elem_ty;
                 int lane_vals[16];
-                for (int l = 0; l < lanes; l++) {
-                    Instr ext = ins_un(OP_VEXTRACT, elem_ty, cur_acc_sum);
+                for (int l = 0; l < sum_lanes; l++) {
+                    Instr ext = ins_un(OP_VEXTRACT, sum_ty, cur_acc_sum);
                     ext.imm = l;
                     lane_vals[l] = emit(f, b_vexit, ext);
                 }
                 cur_sum = lane_vals[0];
-                for (int l = 1; l < lanes; l++) {
-                    Instr sadd = ins_bin(OP_ADD, elem_ty, cur_sum, lane_vals[l]);
+                for (int l = 1; l < sum_lanes; l++) {
+                    Instr sadd = ins_bin(OP_ADD, sum_ty, cur_sum, lane_vals[l]);
                     cur_sum = emit(f, b_vexit, sadd);
                 }
             }

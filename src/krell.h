@@ -79,6 +79,11 @@ enum {
     OP_CALLI,                 /* v3: indirect call; a = ptr operand, callee = signature-table index */
     OP_TAILCALLI,             /* v3: indirect tail call (terminator), same fields */
     OP_FSHL, OP_FSHR,         /* v3: funnel shifts; a = high/left part, b = low/right part, c = shift amount (mod width) */
+    OP_VWIDEN,                /* WP25: widening horizontal sum: a = vec of narrow int lanes,
+                               * result = vec of wider int lanes (same vscale n); result lane j
+                               * is the zero-extended sum of the group of (result elem bits /
+                               * operand elem bits) consecutive operand lanes starting at
+                               * j * group. Group ratio must be a power of two >= 2. */
     OP_COUNT
 };
 /* icmp predicates */

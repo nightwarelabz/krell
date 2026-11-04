@@ -781,6 +781,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
              * and a is allocated to a register in this pool, reuse that register! */
             Instr *d = defins[iv->v];
             if (d && (d->op == OP_VADD || d->op == OP_VSUB || d->op == OP_VMUL || d->op == OP_VLSHR ||
+                      d->op == OP_VWIDEN ||
                       d->op == OP_ADD || d->op == OP_SUB || d->op == OP_MUL ||
                       d->op == OP_AND || d->op == OP_OR || d->op == OP_XOR ||
                       d->op == OP_ZEXT || d->op == OP_TRUNC)) {

@@ -2044,6 +2044,86 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         }
         break;
     }
+    case OP_VWIDEN: {
+        Type iet = ty_elem(f->vtypes[in->a]);
+        Type oet = ty_elem(t);
+        Loc *dl = &c->bf->loc[in->result], *al = &c->bf->loc[in->a];
+        if (iet.kind == TY_INT && iet.bits == 8 && oet.kind == TY_INT && oet.bits == 64 &&
+            in->ty.n == 1 && f->vtypes[in->a].n == 1) {
+            /* psadbw against zero sums each group of 8 bytes into one
+             * 64-bit lane: the op's exact semantics at this shape.
+             * Register discipline: xmm15 is the only FP scratch (the
+             * pool owns xmm0-14), so the zero lives in xmm15 and the
+             * operand is staged into the result register first (the
+             * operand may itself live in xmm15; it is read before the
+             * zero is materialized). A slot-resident result stages
+             * through xmm15 and takes its zero from a transient stack
+             * pair built with the GP scratch. */
+            if (dl->is_reg) {
+                int dreg = dl->idx;
+                load_fp(c, dreg, in->a);
+                if (vwide(c)) {
+                    E(c, "  vxorps ymm15, ymm15, ymm15");
+                    E(c, "  vpsadbw ymm%d, ymm%d, ymm15", dreg, dreg);
+                } else {
+                    E(c, "  pxor xmm15, xmm15");
+                    E(c, "  psadbw xmm%d, xmm15", dreg);
+                }
+            } else {
+                load_fp(c, 15, in->a);
+                E(c, "  xor r11d, r11d");
+                E(c, "  push r11");
+                E(c, "  push r11");
+                if (vwide(c)) {
+                    E(c, "  push r11");
+                    E(c, "  push r11");
+                    E(c, "  vpsadbw ymm15, ymm15, [rsp]");
+                } else {
+                    E(c, "  psadbw xmm15, [rsp]");
+                }
+                if (vwide(c)) E(c, "  add rsp, 32");
+                else E(c, "  add rsp, 16");
+                store_fp(c, in->result, 15);
+            }
+            break;
+        }
+        /* generic shapes: scalarized group-sum lane loop. Groups are
+         * consumed in order and result lane j occupies exactly the
+         * bytes of input group j, so a result register shared with
+         * the operand is safe (each group is fully read before its
+         * lane is written). */
+        int iln = ty_lanes(f->vtypes[in->a], c->vl), oln = ty_lanes(t, c->vl);
+        int grp = iln / oln, oeb = oet.bits / 8;
+        int half = 128 / (int)oet.bits;
+        for (int j = 0; j < oln; j++) {
+            vec_lane_gp(c, al, j * grp, iet, "r11", "r11d");
+            E(c, "  mov rax, r11");
+            for (int t2 = 1; t2 < grp; t2++) {
+                vec_lane_gp(c, al, j * grp + t2, iet, "r11", "r11d");
+                E(c, "  add rax, r11");
+            }
+            E(c, "  mov r11, rax");
+            mask_r11(c, oet);
+            if (dl->is_reg) {
+                if (vwide(c) && j >= half) {
+                    if (j == half) E(c, "  vextracti128 xmm14, ymm%d, 1", dl->idx);
+                    if (oeb == 1) E(c, "  pinsrb xmm14, r11d, %d", j - half);
+                    else if (oeb == 2) E(c, "  pinsrw xmm14, r11d, %d", j - half);
+                    else if (oeb == 4) E(c, "  pinsrd xmm14, r11d, %d", j - half);
+                    else E(c, "  pinsrq xmm14, r11, %d", j - half);
+                    if (j == oln - 1) E(c, "  vinserti128 ymm%d, ymm%d, xmm14, 1", dl->idx, dl->idx);
+                }
+                else if (oeb == 1) E(c, "  pinsrb xmm%d, r11d, %d", dl->idx, j);
+                else if (oeb == 2) E(c, "  pinsrw xmm%d, r11d, %d", dl->idx, j);
+                else if (oeb == 4) E(c, "  pinsrd xmm%d, r11d, %d", dl->idx, j);
+                else E(c, "  pinsrq xmm%d, r11, %d", dl->idx, j);
+            } else {
+                const char *r = oeb == 1 ? "r11b" : oeb == 2 ? "r11w" : oeb == 4 ? "r11d" : "r11";
+                E(c, "  mov [rbp - %d], %s", dl->off - j * oeb, r);
+            }
+        }
+        break;
+    }
     case OP_VLSHR: {
         Type et = ty_elem(t);
         Loc *dl = &c->bf->loc[in->result], *al = &c->bf->loc[in->a], *bl = &c->bf->loc[in->b];
@@ -2970,6 +3050,8 @@ static bool x86_clob_bless(void *ctx, const Instr *in, int v, uint8_t bit) {
     case OP_VADD: case OP_VSUB: case OP_VMUL: case OP_VAND: case OP_VOR:
     case OP_VXOR: case OP_VUDIV: case OP_VLSHR:
         return v == in->a || v == in->b;              /* lanes stage a via R11, b via RAX, before RCX/RDX writes */
+    case OP_VWIDEN:
+        return v == in->a;                            /* a is staged via xmm15/R11 before any write; the emission writes no RCX/RDX */
     default:
         return false;
     }

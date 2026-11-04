@@ -40,6 +40,7 @@ static const char *OPNAMES[OP_COUNT] = {
     [OP_AMINS]="amins", [OP_AMAXS]="amaxs", [OP_AMINU]="aminu", [OP_AMAXU]="amaxu",
     [OP_FUNCP]="funcptr", [OP_CALLI]="calli", [OP_TAILCALLI]="tailcalli",
     [OP_FSHL]="fshl", [OP_FSHR]="fshr",
+    [OP_VWIDEN]="vwiden",
 };
 const char *op_name(int op) {
     if (op <= 0 || op >= OP_COUNT || !OPNAMES[op]) return "?op";

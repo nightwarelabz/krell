@@ -55,7 +55,11 @@ Memory: `alloca` (immediate size, align), `load`, `store`, `gep`
 Vectors (lane-wise, element type = the vector's):
 `vsplat`, `vadd vsub vmul vudiv vfadd vfsub vfmul vfdiv`,
 `vand vor vxor`, `vload`, `vstore`,
-`vextract` (immediate lane), `vinsert` (immediate lane).
+`vextract` (immediate lane), `vinsert` (immediate lane),
+`vwiden` (widening horizontal sum: each result lane is the zero-extended
+sum of a group of consecutive narrower operand lanes; the group ratio —
+result element bits / operand element bits — is a power of two >= 2 and
+the vscale count is preserved).
 
 Atomics: `aload astore aadd` (immediate ordering: 0 relaxed, 1 acqrel,
 2 seqcst).

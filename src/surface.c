@@ -368,7 +368,7 @@ static bool parse_instr(P *p, Func *f, int blk) {
         break;
     }
     case OP_NEG: case OP_NOT: case OP_POPCOUNT: case OP_CLZ: case OP_CTZ: case OP_BSWAP:
-    case OP_FNEG: case OP_FABS: case OP_VSPLAT: {
+    case OP_FNEG: case OP_FABS: case OP_VSPLAT: case OP_VWIDEN: {
         if (!parse_type(p, &ty)) return false;
         Type at = op == OP_VSPLAT ? ty_elem(ty) : ty;
         int a = parse_value(p, f, blk, at);

@@ -1024,6 +1024,41 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         }
         break;
     }
+    case OP_VWIDEN: {
+        Type iet = ty_elem(f->vtypes[in->a]);
+        Type oet = ty_elem(t);
+        Loc *dl = &c->bf->loc[in->result], *al = &c->bf->loc[in->a];
+        if (iet.kind == TY_INT && iet.bits == 8 && oet.kind == TY_INT && oet.bits == 64) {
+            /* uaddlp chain: pairwise widening adds, 16b -> 8h -> 4s
+             * -> 2d; the final lanes are the exact 8-byte group sums. */
+            addr_of(c, X17, al->off);
+            addr_of(c, X16, dl->off);
+            for (int off = 0; off < 16 * t.n; off += 16) {
+                E(c, "  ldr q31, [x17, #%d]", off);
+                E(c, "  uaddlp v31.8h, v31.16b");
+                E(c, "  uaddlp v31.4s, v31.8h");
+                E(c, "  uaddlp v31.2d, v31.4s");
+                E(c, "  str q31, [x16, #%d]", off);
+            }
+            break;
+        }
+        /* generic shapes: scalarized group-sum lane loop over slots */
+        int iln = ty_lanes(f->vtypes[in->a], c->vl), oln = ty_lanes(t, c->vl);
+        int grp = iln / oln, ieb = iet.bits / 8, oeb = oet.bits / 8;
+        for (int j = 0; j < oln; j++) {
+            addr_of(c, X16, al->off - j * grp * ieb);
+            lane_load_gp(c, X16, X16, ieb);
+            for (int t2 = 1; t2 < grp; t2++) {
+                addr_of(c, X17, al->off - (j * grp + t2) * ieb);
+                lane_load_gp(c, X17, X17, ieb);
+                E(c, "  add x16, x16, x17");
+            }
+            mask_reg(c, X16, oet);
+            addr_of(c, X17, dl->off - j * oeb);
+            lane_store_gp(c, X16, X17, oeb);
+        }
+        break;
+    }
     case OP_VEXTRACT: {
         Type et = in->ty;
         Loc *al = &c->bf->loc[in->a];
