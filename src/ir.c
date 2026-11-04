@@ -33,6 +33,12 @@ static const char *OPNAMES[OP_COUNT] = {
     [OP_BR]="br", [OP_CONDBR]="condbr", [OP_RET]="ret", [OP_CALL]="call",
     [OP_TAILCALL]="tailcall", [OP_SELECT]="select", [OP_ASSUME]="assume",
     [OP_VLSHR]="vlshr",
+    [OP_LOADV]="loadv", [OP_STOREV]="storev",
+    [OP_FENCE]="fence",
+    [OP_ACMPXCHG]="acmpxchg", [OP_AXCHG]="axchg", [OP_ASUB]="asub",
+    [OP_AAND]="aand", [OP_AOR]="aor", [OP_AXOR]="axor",
+    [OP_AMINS]="amins", [OP_AMAXS]="amaxs", [OP_AMINU]="aminu", [OP_AMAXU]="amaxu",
+    [OP_FUNCP]="funcptr", [OP_CALLI]="calli", [OP_TAILCALLI]="tailcalli",
 };
 const char *op_name(int op) {
     if (op <= 0 || op >= OP_COUNT || !OPNAMES[op]) return "?op";
@@ -40,14 +46,26 @@ const char *op_name(int op) {
 }
 
 bool op_is_terminator(int op) {
-    return op == OP_BR || op == OP_CONDBR || op == OP_RET || op == OP_TAILCALL;
+    return op == OP_BR || op == OP_CONDBR || op == OP_RET || op == OP_TAILCALL || op == OP_TAILCALLI;
+}
+bool op_is_rmw(int op) {
+    switch (op) {
+    case OP_AADD: case OP_AXCHG: case OP_ASUB: case OP_AAND: case OP_AOR:
+    case OP_AXOR: case OP_AMINS: case OP_AMAXS: case OP_AMINU: case OP_AMAXU:
+        return true;
+    default:
+        return false;
+    }
 }
 bool op_is_pure(int op) {
     switch (op) {
     case OP_LOAD: case OP_STORE: case OP_ALOAD: case OP_ASTORE: case OP_AADD:
     case OP_MEMCPY: case OP_MEMSET: case OP_CALL: case OP_TAILCALL:
     case OP_BR: case OP_CONDBR: case OP_RET: case OP_ASSUME: case OP_VLOAD:
-    case OP_VSTORE: case OP_ALLOCA:
+    case OP_VSTORE: case OP_ALLOCA: case OP_LOADV: case OP_STOREV: case OP_FENCE:
+    case OP_ACMPXCHG: case OP_AXCHG: case OP_ASUB: case OP_AAND: case OP_AOR:
+    case OP_AXOR: case OP_AMINS: case OP_AMAXS: case OP_AMINU: case OP_AMAXU:
+    case OP_CALLI: case OP_TAILCALLI:
         return false;
     default:
         return true;
@@ -68,7 +86,7 @@ static void func_clear(Func *f) {
     }
     free(f->blocks); free(f->name);
     cons_free(f);
-    free(f->cval); free(f->isconst); free(f->vtypes);
+    free(f->cval); free(f->cval_hi); free(f->isconst); free(f->vtypes);
     memset(f, 0, sizeof *f);
 }
 
@@ -80,6 +98,8 @@ void mod_free(Module *m) {
     free(m->exts);
     for (int i = 0; i < m->ndata; i++) { free(m->data[i].name); free(m->data[i].bytes); }
     free(m->data);
+    for (int i = 0; i < m->nsigs; i++) free(m->sigs[i].params);
+    free(m->sigs);
     free(m);
 }
 
@@ -95,6 +115,27 @@ int mod_add_extern(Module *m, const char *name, const Type *params, int n, Type 
     e->nparams = n;
     e->ret = ret;
     return m->nexts++;
+}
+
+int mod_add_sig(Module *m, const Type *params, int n, Type ret) {
+    for (int i = 0; i < m->nsigs; i++) {
+        Sig *g = &m->sigs[i];
+        if (g->nparams == n && ty_eq(g->ret, ret)) {
+            bool same = true;
+            for (int j = 0; j < n; j++) if (!ty_eq(g->params[j], params[j])) { same = false; break; }
+            if (same) return i;
+        }
+    }
+    if (m->nsigs == m->capsigs) {
+        m->capsigs = m->capsigs ? m->capsigs * 2 : 8;
+        m->sigs = realloc(m->sigs, (size_t)m->capsigs * sizeof(Sig));
+    }
+    Sig *g = &m->sigs[m->nsigs];
+    g->params = malloc(sizeof(Type) * (size_t)(n ? n : 1));
+    for (int j = 0; j < n; j++) g->params[j] = params[j];
+    g->nparams = n;
+    g->ret = ret;
+    return m->nsigs++;
 }
 
 int mod_add_data(Module *m, const char *name, uint32_t align, const void *bytes, uint32_t len) {
@@ -141,10 +182,12 @@ static void func_reserve_value(Func *f, Type t) {
         f->vcap = f->vcap ? f->vcap * 2 : 32;
         f->vtypes  = realloc(f->vtypes,  (size_t)f->vcap * sizeof(Type));
         f->cval    = realloc(f->cval,    (size_t)f->vcap * sizeof(uint64_t));
+        f->cval_hi = realloc(f->cval_hi, (size_t)f->vcap * sizeof(uint64_t));
         f->isconst = realloc(f->isconst, (size_t)f->vcap);
     }
     f->vtypes[f->nvalues] = t;
     f->cval[f->nvalues] = 0;
+    f->cval_hi[f->nvalues] = 0;
     f->isconst[f->nvalues] = 0;
     f->nvalues++;
 }
@@ -183,6 +226,7 @@ Instr ins_make(uint8_t op, Type ty) {
     return in;
 }
 Instr ins_iconst(Type ty, int64_t v) { Instr in = ins_make(OP_ICONST, ty); in.imm = v; return in; }
+Instr ins_iconst128(int64_t lo, int64_t hi) { Instr in = ins_make(OP_ICONST, ty_i128()); in.imm = lo; in.imm2 = hi; return in; }
 Instr ins_fconst(Type ty, uint64_t bits) { Instr in = ins_make(OP_FCONST, ty); in.imm = (int64_t)bits; return in; }
 Instr ins_bin(uint8_t op, Type ty, int a, int b) { Instr in = ins_make(op, ty); in.a = a; in.b = b; return in; }
 Instr ins_un(uint8_t op, Type ty, int a) { Instr in = ins_make(op, ty); in.a = a; return in; }
@@ -200,6 +244,16 @@ Instr ins_call(Type ret, int callee, bool ext, int32_t *args, int n, bool tail) 
     in.callee = callee; in.callee_extern = ext ? 1 : 0;
     in.args = args; in.nargs = (uint16_t)n; return in;
 }
+Instr ins_funcptr(int callee, bool ext) {
+    Instr in = ins_make(OP_FUNCP, ty_ptr());
+    in.callee = callee; in.callee_extern = ext ? 1 : 0;
+    return in;
+}
+Instr ins_calli(Type ret, int sig, int fp, int32_t *args, int n, bool tail) {
+    Instr in = ins_make(tail ? OP_TAILCALLI : OP_CALLI, ret);
+    in.callee = sig; in.a = fp;
+    in.args = args; in.nargs = (uint16_t)n; return in;
+}
 int32_t *ids_dup(const int32_t *src, int n) {
     if (n <= 0) return NULL;
     int32_t *p = malloc(sizeof(int32_t) * (size_t)n);
@@ -210,7 +264,8 @@ int32_t *ids_dup(const int32_t *src, int n) {
 static bool ins_has_result(const Instr *in) {
     switch (in->op) {
     case OP_STORE: case OP_VSTORE: case OP_BR: case OP_CONDBR: case OP_RET:
-    case OP_ASSUME: case OP_ASTORE: case OP_MEMCPY: case OP_MEMSET:
+    case OP_ASSUME: case OP_ASTORE: case OP_MEMCPY: case OP_MEMSET: case OP_STOREV:
+    case OP_FENCE:
         return false;
     case OP_CALL:
         return in->ty.kind != TY_VOID;
@@ -227,7 +282,7 @@ static uint64_t sext_u64(uint64_t v, int bits) {
     return ((v & mask_for(bits)) ^ m) - m;
 }
 
-static int emit_raw(Func *f, int blk, Instr in) {
+static int emit_at(Func *f, int blk, int pos, Instr in) {
     Block *b = &f->blocks[blk];
     if (b->nins == b->cap) {
         b->cap = b->cap ? b->cap * 2 : 16;
@@ -237,8 +292,26 @@ static int emit_raw(Func *f, int blk, Instr in) {
         func_reserve_value(f, in.ty);
         in.result = f->nvalues - 1;
     }
-    b->ins[b->nins++] = in;
+    if (pos < 0 || pos > b->nins) pos = b->nins;
+    memmove(&b->ins[pos + 1], &b->ins[pos], sizeof(Instr) * (size_t)(b->nins - pos));
+    b->ins[pos] = in;
+    b->nins++;
     return in.result;
+}
+
+static int emit_raw(Func *f, int blk, Instr in) { return emit_at(f, blk, -1, in); }
+
+/* v3: constants are function-scoped. A constant requested in any block is
+ * materialized in the entry block (inserted before its terminator if it
+ * already has one), which dominates every block in the function, so the
+ * single hash-consed definition is a legal use everywhere. This removes
+ * the v1/v2 trap in which a literal first materialized in a non-dominating
+ * branch block was reused for a sibling block and failed verification. */
+static int emit_entry_const(Func *f, Instr in) {
+    Block *b0 = &f->blocks[0];
+    int pos = b0->nins;
+    if (pos > 0 && op_is_terminator(b0->ins[pos - 1].op)) pos--;
+    return emit_at(f, 0, pos, in);
 }
 
 int emit(Func *f, int blk, Instr in) { return emit_pure(f, blk, in); }
@@ -247,6 +320,7 @@ int emit(Func *f, int blk, Instr in) { return emit_pure(f, blk, in); }
 typedef struct {
     Instr   key;      /* the pure instruction (result field ignored) */
     int32_t value;    /* value id it produced */
+    int32_t defblk;   /* block the value was defined in (v3: dominance-aware reuse) */
     int     used;
 } ConsEnt;
 
@@ -264,14 +338,18 @@ static uint64_t hash_ins(const Instr *in) {
     h = (h ^ (uint64_t)(uint32_t)in->b) * 1099511628211ull;
     h = (h ^ (uint64_t)(uint32_t)in->c) * 1099511628211ull;
     h = (h ^ (uint64_t)in->imm) * 1099511628211ull;
+    h = (h ^ (uint64_t)in->imm2) * 1099511628211ull;
     h = (h ^ (uint64_t)in->pred) * 1099511628211ull;
     h = (h ^ (uint64_t)in->aux) * 1099511628211ull;
+    h = (h ^ (uint64_t)(uint32_t)in->callee) * 1099511628211ull;
+    h = (h ^ (uint64_t)in->callee_extern) * 1099511628211ull;
     return h;
 }
 static bool ins_eq(const Instr *x, const Instr *y) {
     return x->op == y->op && ty_pack(x->ty) == ty_pack(y->ty) &&
            x->a == y->a && x->b == y->b && x->c == y->c &&
-           x->imm == y->imm && x->pred == y->pred && x->aux == y->aux;
+           x->imm == y->imm && x->imm2 == y->imm2 && x->pred == y->pred && x->aux == y->aux &&
+           x->callee == y->callee && x->callee_extern == y->callee_extern;
 }
 static ConsTab *cons_tab(Func *f) {
     if (!f->cons) {
@@ -296,7 +374,18 @@ static int cons_find(Func *f, const Instr *in) {
     }
     return -1;
 }
-static void cons_put(Func *f, const Instr *in, int32_t value) {
+/* block in which the hash-consed value for `in` was defined, or -2 */
+static int cons_defblk(Func *f, const Instr *in) {
+    ConsTab *t = cons_tab(f);
+    uint64_t h = hash_ins(in);
+    for (int i = 0; i < t->cap; i++) {
+        ConsEnt *e = &t->e[(h + (uint64_t)i) & (uint64_t)(t->cap - 1)];
+        if (!e->used) return -2;
+        if (ins_eq(&e->key, in)) return e->defblk;
+    }
+    return -2;
+}
+static void cons_put(Func *f, const Instr *in, int32_t value, int32_t defblk) {
     ConsTab *t = cons_tab(f);
     if ((t->n + 1) * 2 >= t->cap) {
         ConsEnt *old = t->e; int ocap = t->cap;
@@ -316,8 +405,8 @@ static void cons_put(Func *f, const Instr *in, int32_t value) {
     uint64_t h = hash_ins(in);
     for (int i = 0; i < t->cap; i++) {
         ConsEnt *e = &t->e[(h + (uint64_t)i) & (uint64_t)(t->cap - 1)];
-        if (!e->used) { e->key = *in; e->value = value; e->used = 1; t->n++; return; }
-        if (ins_eq(&e->key, in)) { e->value = value; return; }
+        if (!e->used) { e->key = *in; e->value = value; e->defblk = defblk; e->used = 1; t->n++; return; }
+        if (ins_eq(&e->key, in)) { e->value = value; e->defblk = defblk; return; }
     }
 }
 
@@ -330,6 +419,102 @@ static int try_fold(Func *f, int blk, Instr *in) {
     uint64_t av = ac ? f->cval[in->a] : 0, bv = bc ? f->cval[in->b] : 0;
 
     if (op == OP_SELECT && ac) return f->cval[in->a] ? in->b : in->c;
+
+    if (t.kind == TY_INT && t.bits == 128 && op != OP_ICONST) {
+        /* i128 constants live in (cval, cval_hi); fold on the full pair.
+         * Nothing below this block may see a 128-bit result: the generic
+         * folder tracks only the low word and would fold e.g. x + 2^64
+         * (low word 0) to x. */
+        unsigned __int128 A  = ((unsigned __int128)(ac ? f->cval_hi[in->a] : 0) << 64) | av;
+        unsigned __int128 Bv = ((unsigned __int128)(bc ? f->cval_hi[in->b] : 0) << 64) | bv;
+        #define K128(x) emit_pure(f, blk, ins_iconst128((int64_t)(uint64_t)(unsigned __int128)(x), (int64_t)(uint64_t)((unsigned __int128)(x) >> 64)))
+        if (bc) {
+            switch (op) {
+            case OP_ADD: case OP_OR: case OP_XOR: if (Bv == 0) return in->a; break;
+            case OP_SUB: if (Bv == 0) return in->a; if (in->a == in->b) return K128(0); break;
+            case OP_MUL: if (Bv == 0) return K128(0); if (Bv == 1) return in->a; break;
+            case OP_AND: if (Bv == 0) return K128(0); if (Bv == ~(unsigned __int128)0) return in->a; break;
+            case OP_SHL: case OP_LSHR: case OP_ASHR: if ((Bv % 128) == 0) return in->a; break;
+            default: break;
+            }
+        }
+        if (ac) {
+            switch (op) {
+            case OP_ADD: case OP_OR: case OP_XOR: if (A == 0) return in->b; break;
+            case OP_MUL: if (A == 0) return K128(0); if (A == 1) return in->b; break;
+            case OP_AND: if (A == 0) return K128(0); break;
+            default: break;
+            }
+        }
+        if (ac && bc) {
+            unsigned __int128 r = 0; bool ok = true;
+            switch (op) {
+            case OP_ADD: r = A + Bv; break;
+            case OP_SUB: r = A - Bv; break;
+            case OP_MUL: r = A * Bv; break;
+            case OP_AND: r = A & Bv; break;
+            case OP_OR:  r = A | Bv; break;
+            case OP_XOR: r = A ^ Bv; break;
+            case OP_UDIV: r = Bv ? A / Bv : 0; break;
+            case OP_UREM: r = Bv ? A % Bv : 0; break;
+            case OP_SDIV: case OP_SREM: {
+                if (Bv == 0) { r = 0; break; }
+                __int128 sa = (__int128)A, sb = (__int128)Bv;
+                unsigned __int128 ua = sa < 0 ? (unsigned __int128)0 - (unsigned __int128)A : A;
+                unsigned __int128 ub = sb < 0 ? (unsigned __int128)0 - (unsigned __int128)Bv : Bv;
+                unsigned __int128 q = (op == OP_SDIV) ? ua / ub : ua % ub;
+                bool neg = (op == OP_SDIV) ? ((sa < 0) != (sb < 0)) : (sa < 0);
+                r = neg ? (unsigned __int128)0 - q : q;
+                break;
+            }
+            case OP_SHL:  r = A << (unsigned)(Bv % 128); break;
+            case OP_LSHR: r = A >> (unsigned)(Bv % 128); break;
+            case OP_ASHR: r = (unsigned __int128)((__int128)A >> (unsigned)(Bv % 128)); break;
+            default: ok = false; break;
+            }
+            if (ok) return K128(r);
+        }
+        if (ac) {
+            switch (op) {
+            case OP_NEG: return K128((unsigned __int128)0 - A);
+            case OP_NOT: return K128(~A);
+            case OP_POPCOUNT: return emit_pure(f, blk, ins_iconst(t, __builtin_popcountll((unsigned long long)A) + __builtin_popcountll((unsigned long long)(A >> 64))));
+            case OP_CLZ: {
+                unsigned long long hi = (unsigned long long)(A >> 64), lo = (unsigned long long)A;
+                return emit_pure(f, blk, ins_iconst(t, hi ? __builtin_clzll(hi) : 64 + (lo ? __builtin_clzll(lo) : 64)));
+            }
+            case OP_CTZ: {
+                unsigned long long hi = (unsigned long long)(A >> 64), lo = (unsigned long long)A;
+                return emit_pure(f, blk, ins_iconst(t, lo ? __builtin_ctzll(lo) : 64 + (hi ? __builtin_ctzll(hi) : 64)));
+            }
+            case OP_BSWAP: return K128(((unsigned __int128)__builtin_bswap64((unsigned long long)A) << 64) | __builtin_bswap64((unsigned long long)(A >> 64)));
+            case OP_ZEXT: return K128((unsigned __int128)av);
+            case OP_SEXT: {
+                int sb = func_value_type(f, in->a).bits;
+                uint64_t lo = sext_u64(av, sb);
+                return K128(((unsigned __int128)(lo >> 63 ? ~0ull : 0) << 64) | lo);
+            }
+            default: break;
+            }
+        }
+        #undef K128
+        return -1;
+    }
+
+    if (op == OP_ICMP && ac && bc && func_value_type(f, in->a).bits == 128) {
+        unsigned __int128 A  = ((unsigned __int128)f->cval_hi[in->a] << 64) | av;
+        unsigned __int128 Bv = ((unsigned __int128)f->cval_hi[in->b] << 64) | bv;
+        __int128 sa = (__int128)A, sb = (__int128)Bv;
+        bool r = false;
+        switch (in->pred) {
+        case IC_EQ: r = A == Bv; break; case IC_NE: r = A != Bv; break;
+        case IC_ULT: r = A < Bv; break; case IC_ULE: r = A <= Bv; break;
+        case IC_UGT: r = A > Bv; break; case IC_UGE: r = A >= Bv; break;
+        case IC_SLT: r = sa < sb; break; case IC_SLE: r = sa <= sb; break;
+        case IC_SGT: r = sa > sb; break; case IC_SGE: r = sa >= sb; break;
+        }
+        return emit_pure(f, blk, ins_iconst(ty_i1(), r ? 1 : 0));
+    }
 
     if (t.kind == TY_INT && op != OP_ICONST) {
         int bits = t.bits;
@@ -429,18 +614,37 @@ int emit_pure(Func *f, int blk, Instr in) {
     int folded = try_fold(f, blk, &in);
     if (folded >= 0) return folded;
     int found = cons_find(f, &in);
-    if (found >= 0) return found;
-    int r = emit_raw(f, blk, in);
+    if (found >= 0) {
+        /* Dominance-aware reuse (v3): a hash-consed value may only be
+         * reused where its definition dominates the use. The entry block
+         * dominates every block, and a definition earlier in the same
+         * block dominates by position. Any other hit (the classic case:
+         * first materialized in one arm of a branch, requested again in
+         * the sibling arm) must be re-emitted in the requesting block;
+         * for constants the re-emission is hoisted to the entry block
+         * below, after which the shared definition dominates all uses. */
+        int db = cons_defblk(f, &in);
+        if (db == blk || db == 0) return found;
+    }
+    int eblk = blk;
+    int r;
+    if ((in.op == OP_ICONST || in.op == OP_FCONST) && blk != 0 && f->nblocks > 0) {
+        r = emit_entry_const(f, in);
+        eblk = 0;
+    } else {
+        r = emit_raw(f, blk, in);
+    }
     if (r >= 0) {
         if (in.op == OP_ICONST) {
             Type t = in.ty;
             f->isconst[r] = 1;
             f->cval[r] = (uint64_t)in.imm & mask_for(t.bits);
+            f->cval_hi[r] = (uint64_t)in.imm2;
         } else if (in.op == OP_FCONST) {
             f->isconst[r] = 1;
             f->cval[r] = (uint64_t)in.imm;
         }
-        cons_put(f, &in, r);
+        cons_put(f, &in, r, eblk);
     }
     return r;
 }
@@ -455,6 +659,7 @@ void func_rebuild_constants(Func *f) {
             if (in->op == OP_ICONST && in->result >= 0 && in->result < f->nvalues) {
                 f->isconst[in->result] = 1;
                 f->cval[in->result] = (uint64_t)in->imm & mask_for(in->ty.bits);
+                f->cval_hi[in->result] = (uint64_t)in->imm2;
             } else if (in->op == OP_FCONST && in->result >= 0 && in->result < f->nvalues) {
                 f->isconst[in->result] = 1;
                 f->cval[in->result] = (uint64_t)in->imm;

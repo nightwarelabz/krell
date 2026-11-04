@@ -54,6 +54,9 @@ static const FSpec FUNCS[] = {
     /* memory functions (B cases) */
     { "mem",     3, { AK_PTR, AK_GP, AK_GP }, RK_GP },
     { "atomic",  2, { AK_PTR, AK_GP }, RK_GP },
+    { "rmw",     2, { AK_PTR, AK_GP }, RK_GP },
+    { "rmw32",   2, { AK_PTR, AK_GP }, RK_GP },
+    { "rmw8",    2, { AK_PTR, AK_GP }, RK_GP },
     { "vecadd",  2, { AK_PTR, AK_PTR }, RK_VOID },
     { "vecf",    3, { AK_PTR, AK_PTR, AK_F32 }, RK_VOID },
     { "vecins",  3, { AK_PTR, AK_PTR, AK_GP }, RK_VOID },
@@ -61,6 +64,11 @@ static const FSpec FUNCS[] = {
     { "memset_", 3, { AK_PTR, AK_GP, AK_GP }, RK_VOID },
     { "vecext",  1, { AK_PTR }, RK_GP },
     { "gepneg",  1, { AK_PTR }, RK_GP },
+    { "w128",    2, { AK_GP, AK_GP }, RK_GP },
+    { "vtable",  2, { AK_GP, AK_GP }, RK_GP },
+    { "alchk",   2, { AK_F64, AK_F64 }, RK_GP },
+    { "alchk1",  1, { AK_F64 }, RK_GP },
+    { "vtail",   2, { AK_GP, AK_GP }, RK_GP },
 };
 #define NFUNC (sizeof(FUNCS) / sizeof(FUNCS[0]))
 static int func_index(const char *name) {
@@ -246,6 +254,24 @@ static void gen_cases(void) {
     for (int i = 0; i < 12; i++)
         push_bcase("atomic", (uint64_t[]){ 0, rnd() });
     for (int i = 0; i < 12; i++)
+        push_bcase("rmw", (uint64_t[]){ 0, rnd() });
+    for (int i = 0; i < 12; i++)
+        push_bcase("rmw32", (uint64_t[]){ 0, (uint64_t)(uint32_t)rnd() });
+    for (int i = 0; i < 12; i++)
+        push_bcase("rmw8", (uint64_t[]){ 0, rnd() });
+    for (int i = 0; i < 12; i++)
+        push_scalar("w128", (uint64_t[]){ rnd(), rnd() });
+    for (int i = 0; i < 12; i++)
+        push_scalar("vtable", (uint64_t[]){ (uint64_t)i, rnd() });
+    for (int i = 0; i < 12; i++)
+        push_scalar("vtail", (uint64_t[]){ (uint64_t)i, rnd() });
+    for (int i = 0; i < 4; i++) {
+        double d1 = (double)(int)(rnd() % 2000) / 8.0, d2 = (double)(int)(rnd() % 2000) / 8.0;
+        uint64_t u1, u2; memcpy(&u1, &d1, 8); memcpy(&u2, &d2, 8);
+        push_scalar("alchk", (uint64_t[]){ u1, u2 });
+        push_scalar("alchk1", (uint64_t[]){ u1 });
+    }
+    for (int i = 0; i < 12; i++)
         push_bcase("vecadd", (uint64_t[]){ 128, 0 });
     for (int i = 0; i < 12; i++)
         push_bcase("vecf", (uint64_t[]){ 128, 0, fbits(1.5f + (float)(i % 5)) });
@@ -262,6 +288,14 @@ static void gen_cases(void) {
     (void)nscalar; (void)nbcases; (void)scalar_pos; (void)bcase_pos;
 }
 
+/* the AL probes' reference semantics: report the FP-register count
+ * of their own fixed signature (1 and 2 respectively) */
+static uint64_t host_alprobe(Interp *it, void *ctx, const IVal *args, int nargs, IVal *ret) {
+    (void)it; (void)ctx; (void)args; (void)nargs; ret->lanes[0] = 1; return 0;
+}
+static uint64_t host_alprobe2(Interp *it, void *ctx, const IVal *args, int nargs, IVal *ret) {
+    (void)it; (void)ctx; (void)args; (void)nargs; ret->lanes[0] = 2; return 0;
+}
 int main(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: gen <x86|arm|rv|llvm> <asm-out> <expected-out>\n"); return 2; }
     const char *be = argv[1];
@@ -314,6 +348,8 @@ int main(int argc, char **argv) {
     /* merge battery is what the interpreter runs (kernels tested natively vs C refs) */
     mod = bat;
     it = interp_new(mod);
+    interp_host(it, "alprobe", host_alprobe, NULL);
+    interp_host(it, "alprobe2", host_alprobe2, NULL);
     gen_cases();
     interp_free(it);
 

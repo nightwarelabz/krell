@@ -147,3 +147,39 @@ fn fill32(ptr %dst, i64 %n, i32 %val) -> void:
 It is output-only. Nothing parses it. (Phase 6's human surface syntax is a
 separate, deliberately different language that compiles to this IR through
 the builder API.)
+
+## 8. Variadic consumers (v3)
+
+Krell has no variadic functions and no varargs call operation: the
+call rule stays exact, with argument count and types checked against
+a fixed signature. A producer that needs printk-style variadic
+behavior passes an **explicit variadic descriptor** instead: a
+fixed-signature function takes, as an ordinary final argument, a
+pointer to a caller-built argument block. Producers build the block
+with alloca and stores; consumers read it with loads. The layout is
+a data convention, not an IR feature:
+
+```
+offset 0:  u64 nslots
+offset 8:  u64 reserved (0)
+then nslots slots, 16 bytes each:
+  +0: u64 tag      (0=i64, 1=i32, 2=i1/other small int (in low bits),
+                    3=f64, 4=f32 (bits in low 32), 5=ptr,
+                    6=string (ptr to bytes) + length in value's high 32)
+  +8: u64 value    (bit pattern of the argument, zero/sign-extended
+                    per the tag's usual rules)
+```
+
+A variadic consumer is an ordinary function, e.g.
+`klog(fmt: ptr, args: ptr) -> i64`. Its signature is fixed, so it
+can be called directly, indirectly (the signature-table entry is
+just `(ptr, ptr) -> i64`), and tail-called, with the verifier
+checking every call.
+
+Extern calls on x86_64 set AL to the number of FP registers used by
+the fixed signature, as the System V ABI requires for variadic
+callees; non-variadic callees ignore AL, so the value is set
+unconditionally. The native backends emit the store directly; the
+LLVM lane emits extern and indirect calls with a variadic function
+type whose fixed prefix matches the signature, which makes LLVM
+set AL identically.

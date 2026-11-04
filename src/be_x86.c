@@ -57,6 +57,8 @@ static void locstr(Ctx *c, char *buf, size_t cap, int v, int sz) {
 static inline uint64_t msk64(int bits) { return bits >= 64 ? ~0ull : ((1ull << bits) - 1ull); }
 static int mem_size_of(Type t, int vl);
 static void load_gp(Ctx *c, int reg, int v);
+static void load128_half(Ctx *c, int reg, int v, int half);
+static void store128_half(Ctx *c, int v, int reg, int half);
 
 typedef struct {
     int base_v;
@@ -209,6 +211,22 @@ static void copy_value(Ctx *c, int dst, int src) {
             load_fp(c, 15, src); store_fp(c, dst, 15);
         }
     }
+    else if (cls == BCLS_MEM128) {
+        if (c->f->isconst[src]) {
+            E(c, "  mov rax, %lld", (long long)c->f->cval[src]);
+            E(c, "  mov [rbp - %d], rax", c->bf->loc[dst].off);
+            E(c, "  mov rax, %lld", (long long)c->f->cval_hi[src]);
+            E(c, "  mov [rbp - %d], rax", c->bf->loc[dst].off - 8);
+        } else {
+            Loc *dl = &c->bf->loc[dst], *sl = &c->bf->loc[src];
+            if (dl->off != sl->off) {
+                E(c, "  mov rax, [rbp - %d]", sl->off);
+                E(c, "  mov [rbp - %d], rax", dl->off);
+                E(c, "  mov rax, [rbp - %d]", sl->off - 8);
+                E(c, "  mov [rbp - %d], rax", dl->off - 8);
+            }
+        }
+    }
     else { /* vector: chunk copy through xmm15 */
         Loc *dl = &c->bf->loc[dst], *sl = &c->bf->loc[src];
         int bytes = 16 * t.n;
@@ -290,7 +308,9 @@ static void restore_regs(Ctx *c) {
 
 /* move call arguments into the ABI; tail calls write stack args through
  * the outgoing area then to the caller's stack-arg region */
-static void emit_call_args(Ctx *c, Instr *in, const Type *params, bool tail) {
+/* returns the number of FP arguments placed in registers (the SysV
+ * AL value for extern calls) */
+static int emit_call_args(Ctx *c, Instr *in, const Type *params, bool tail) {
     int np = in->nargs;
     Loc *gs = malloc(sizeof(Loc) * (size_t)(np ? np : 1));
     Loc *gd = malloc(sizeof(Loc) * (size_t)(np ? np : 1));
@@ -314,6 +334,7 @@ static void emit_call_args(Ctx *c, Instr *in, const Type *params, bool tail) {
             nf++; fi2++;
         } else if (cls == BCLS_GP) { sa[nsa].v = v; sa[nsa].slot = stk++; nsa++; }
         else if (cls == BCLS_FP) { sa[nsa].v = v; sa[nsa].slot = stk++; nsa++; }
+        else if (cls == BCLS_MEM128) { sa[nsa].v = v; sa[nsa].slot = stk; stk += 2; nsa++; }
         else { /* vector by value: not in the v1 ABI; treat as stack blob (shouldn't happen post-verify) */ }
         if (cls == BCLS_GP && gi >= 6) { /* subsequent GP args also stack */ }
     }
@@ -323,10 +344,15 @@ static void emit_call_args(Ctx *c, Instr *in, const Type *params, bool tail) {
     for (int i = 0; i < nsa; i++) {
         int v = sa[i].v;
         int cls = be_class_of(c->f->vtypes[v]);
-        if (tail) {
+        if (cls == BCLS_MEM128) {
+            /* two slots; in the tail phase this is the phase-1 temp,
+             * addressed by slot like every other class */
+            load128_half(c, RAX, v, 0); E(c, "  mov [rbp - %d], rax", frame - 8 * sa[i].slot);
+            load128_half(c, RAX, v, 1); E(c, "  mov [rbp - %d], rax", frame - 8 * sa[i].slot - 8);
+        } else if (tail) {
             /* phase 1: to outgoing temp; phase 2: to caller stack-arg area */
-            if (cls == BCLS_GP) { load_gp(c, R11, v); E(c, "  mov [rbp - %d], r11", frame - 8 * i); }
-            else { load_fp(c, 15, v); E(c, "  movsd [rbp - %d], xmm15", frame - 8 * i); }
+            if (cls == BCLS_GP) { load_gp(c, R11, v); E(c, "  mov [rbp - %d], r11", frame - 8 * sa[i].slot); }
+            else { load_fp(c, 15, v); E(c, "  movsd [rbp - %d], xmm15", frame - 8 * sa[i].slot); }
         } else {
             if (cls == BCLS_GP) { load_gp(c, R11, v); E(c, "  mov [rbp - %d], r11", frame - 8 * sa[i].slot); }
             else { load_fp(c, 15, v); E(c, "  movsd [rbp - %d], xmm15", frame - 8 * sa[i].slot); }
@@ -335,13 +361,20 @@ static void emit_call_args(Ctx *c, Instr *in, const Type *params, bool tail) {
     if (tail) {
         for (int i = 0; i < nsa; i++) {
             int cls = be_class_of(c->f->vtypes[sa[i].v]);
-            if (cls == BCLS_GP) { E(c, "  mov r11, [rbp - %d]", frame - 8 * i); E(c, "  mov [rbp + %d], r11", 16 + 8 * sa[i].slot); }
-            else { E(c, "  movsd xmm15, [rbp - %d]", frame - 8 * i); E(c, "  movsd [rbp + %d], xmm15", 16 + 8 * sa[i].slot); }
+            if (cls == BCLS_MEM128) {
+                E(c, "  mov r11, [rbp - %d]", frame - 8 * sa[i].slot);
+                E(c, "  mov [rbp + %d], r11", 16 + 8 * sa[i].slot);
+                E(c, "  mov r11, [rbp - %d]", frame - 8 * sa[i].slot - 8);
+                E(c, "  mov [rbp + %d], r11", 16 + 8 * sa[i].slot + 8);
+            }
+            else if (cls == BCLS_GP) { E(c, "  mov r11, [rbp - %d]", frame - 8 * sa[i].slot); E(c, "  mov [rbp + %d], r11", 16 + 8 * sa[i].slot); }
+            else { E(c, "  movsd xmm15, [rbp - %d]", frame - 8 * sa[i].slot); E(c, "  movsd [rbp + %d], xmm15", 16 + 8 * sa[i].slot); }
         }
     }
     parallel_moves(c, gs, gd, ng, BCLS_GP);
     parallel_moves(c, fs, fd, nf, BCLS_FP);
     free(gs); free(gd); free(fs); free(fd); free(sa);
+    return fi2;
 }
 
 static void emit_epilogue(Ctx *c) {
@@ -594,10 +627,308 @@ static void vec_lane_fp(Ctx *c, Loc *l, int i, Type et, int reg) {
     }
 }
 
+/* ---- i128 (v3.0): memory-resident values, 16-byte slots holding
+ * (lo, hi); arithmetic runs through rax/rcx/rdx, none of which the
+ * allocator owns. Return convention: rax = lo, rdx = hi. Arguments:
+ * two consecutive 8-byte stack slots (caller writes, callee copies),
+ * the same classification walk on both sides. ---- */
+static bool ty128(Type t) { return t.kind == TY_INT && t.bits == 128; }
+static void m128(char *buf, size_t cap, Ctx *c, int v, int half) {
+    Loc *l = &c->bf->loc[v];
+    int eff = l->off - 8 * half;
+    if (eff >= 0) snprintf(buf, cap, "[rbp - %d]", eff);
+    else snprintf(buf, cap, "[rbp + %d]", -eff);
+}
+static void load128_half(Ctx *c, int reg, int v, int half) {
+    if (v >= 0 && v < c->f->nvalues && c->f->isconst[v]) {
+        uint64_t k = half ? c->f->cval_hi[v] : c->f->cval[v];
+        E(c, "  mov %s, %llu", G64[reg], (unsigned long long)k);
+    } else {
+        char b[64]; m128(b, sizeof b, c, v, half);
+        E(c, "  mov %s, %s", G64[reg], b);
+    }
+}
+static void store128_half(Ctx *c, int v, int reg, int half) {
+    if (v >= 0 && v < c->f->nvalues && c->bf->defpos[v] == c->bf->endpos[v]) return;
+    char b[64]; m128(b, sizeof b, c, v, half);
+    E(c, "  mov %s, %s", b, G64[reg]);
+}
+static void store128_zero(Ctx *c, int v, int half) {
+    if (v >= 0 && v < c->f->nvalues && c->bf->defpos[v] == c->bf->endpos[v]) return;
+    char b[64]; m128(b, sizeof b, c, v, half);
+    E(c, "  mov qword ptr %s, 0", b);
+}
+/* rax *= half of b (mul form), result rdx:rax */
+static void mul128_op(Ctx *c, int bv, int half) {
+    if (bv >= 0 && bv < c->f->nvalues && c->f->isconst[bv]) {
+        load128_half(c, RCX, bv, half);
+        E(c, "  mul rcx");
+    } else {
+        char b[64]; m128(b, sizeof b, c, bv, half);
+        E(c, "  mul qword ptr %s", b);
+    }
+}
+static bool emit_i128(Ctx *c, Instr *in) {
+    Func *f = c->f;
+    char rb[64];
+    switch (in->op) {
+    case OP_ICONST: {
+        E(c, "  mov rax, %lld", (long long)in->imm); store128_half(c, in->result, RAX, 0);
+        E(c, "  mov rax, %lld", (long long)in->imm2); store128_half(c, in->result, RAX, 1);
+        return true;
+    }
+    case OP_ADD: case OP_SUB: case OP_AND: case OP_OR: case OP_XOR: {
+        const char *lo_op = in->op == OP_ADD ? "add" : in->op == OP_SUB ? "sub" : in->op == OP_AND ? "and" : in->op == OP_OR ? "or" : "xor";
+        const char *hi_op = in->op == OP_ADD ? "adc" : in->op == OP_SUB ? "sbb" : lo_op;
+        load128_half(c, RAX, in->a, 0); load128_half(c, RCX, in->b, 0);
+        E(c, "  %s rax, rcx", lo_op); store128_half(c, in->result, RAX, 0);
+        load128_half(c, RAX, in->a, 1); load128_half(c, RCX, in->b, 1);
+        E(c, "  %s rax, rcx", hi_op); store128_half(c, in->result, RAX, 1);
+        return true;
+    }
+    case OP_NEG:
+        E(c, "  mov rax, 0"); load128_half(c, RCX, in->a, 0);
+        E(c, "  sub rax, rcx"); store128_half(c, in->result, RAX, 0);
+        E(c, "  mov rax, 0"); load128_half(c, RCX, in->a, 1);
+        E(c, "  sbb rax, rcx"); store128_half(c, in->result, RAX, 1);
+        return true;
+    case OP_NOT:
+        for (int h = 0; h < 2; h++) {
+            load128_half(c, RAX, in->a, h);
+            E(c, "  not rax"); store128_half(c, in->result, RAX, h);
+        }
+        return true;
+    case OP_MUL: {
+        /* cross terms accumulate in the result's high slot itself:
+         * mul128_op may clobber rcx (constant operands load there),
+         * so no register can hold the running sum */
+        load128_half(c, RAX, in->a, 0); mul128_op(c, in->b, 0);
+        store128_half(c, in->result, RAX, 0);
+        store128_half(c, in->result, RDX, 1);
+        load128_half(c, RAX, in->a, 0); mul128_op(c, in->b, 1);
+        if (!(in->result >= 0 && c->bf->defpos[in->result] == c->bf->endpos[in->result])) {
+            m128(rb, sizeof rb, c, in->result, 1); E(c, "  add %s, rax", rb);
+            load128_half(c, RAX, in->a, 1); mul128_op(c, in->b, 0);
+            E(c, "  add %s, rax", rb);
+        }
+        return true;
+    }
+    case OP_SHL: case OP_LSHR: case OP_ASHR: {
+        int64_t kc;
+        if (be_iconst_val(f, in->b, &kc) || (in->b >= 0 && f->isconst[in->b])) {
+            int k = (int)(((in->b >= 0 && f->isconst[in->b]) ? (int64_t)f->cval[in->b] : kc) & 127);
+            if (k < 64) {
+                if (in->op == OP_SHL) {
+                    load128_half(c, RDX, in->a, 1); load128_half(c, RAX, in->a, 0);
+                    if (k) { E(c, "  shld rdx, rax, %d", k); E(c, "  shl rax, %d", k); }
+                    store128_half(c, in->result, RDX, 1); store128_half(c, in->result, RAX, 0);
+                } else {
+                    load128_half(c, RAX, in->a, 0); load128_half(c, RDX, in->a, 1);
+                    if (k) { E(c, "  shrd rax, rdx, %d", k); E(c, "  %s rdx, %d", in->op == OP_LSHR ? "shr" : "sar", k); }
+                    store128_half(c, in->result, RAX, 0); store128_half(c, in->result, RDX, 1);
+                }
+            } else {
+                int k2 = k - 64;
+                if (in->op == OP_SHL) {
+                    load128_half(c, RAX, in->a, 0); if (k2) E(c, "  shl rax, %d", k2);
+                    store128_half(c, in->result, RAX, 1); store128_zero(c, in->result, 0);
+                } else if (in->op == OP_LSHR) {
+                    load128_half(c, RAX, in->a, 1); if (k2) E(c, "  shr rax, %d", k2);
+                    store128_half(c, in->result, RAX, 0); store128_zero(c, in->result, 1);
+                } else {
+                    load128_half(c, RAX, in->a, 1); load128_half(c, RDX, in->a, 1);
+                    if (k2) E(c, "  sar rax, %d", k2);
+                    E(c, "  sar rdx, 63");
+                    store128_half(c, in->result, RAX, 0); store128_half(c, in->result, RDX, 1);
+                }
+            }
+            return true;
+        }
+        /* variable amount: rcx = b_lo & 127 */
+        int Lbig = ++c->lbl, Ldone = ++c->lbl;
+        load128_half(c, RCX, in->b, 0);
+        E(c, "  and rcx, 127");
+        E(c, "  cmp rcx, 64");
+        E(c, "  jae .Lx%d_%d", c->fi, Lbig);
+        if (in->op == OP_SHL) {
+            load128_half(c, RDX, in->a, 1); load128_half(c, RAX, in->a, 0);
+            E(c, "  shld rdx, rax, cl"); E(c, "  shl rax, cl");
+            store128_half(c, in->result, RDX, 1); store128_half(c, in->result, RAX, 0);
+        } else {
+            load128_half(c, RAX, in->a, 0); load128_half(c, RDX, in->a, 1);
+            E(c, "  shrd rax, rdx, cl"); E(c, "  %s rdx, cl", in->op == OP_LSHR ? "shr" : "sar");
+            store128_half(c, in->result, RAX, 0); store128_half(c, in->result, RDX, 1);
+        }
+        E(c, "  jmp .Lx%d_%d", c->fi, Ldone);
+        E(c, ".Lx%d_%d:", c->fi, Lbig);
+        E(c, "  sub rcx, 64");
+        if (in->op == OP_SHL) {
+            load128_half(c, RAX, in->a, 0); E(c, "  shl rax, cl");
+            store128_half(c, in->result, RAX, 1); store128_zero(c, in->result, 0);
+        } else if (in->op == OP_LSHR) {
+            load128_half(c, RAX, in->a, 1); E(c, "  shr rax, cl");
+            store128_half(c, in->result, RAX, 0); store128_zero(c, in->result, 1);
+        } else {
+            load128_half(c, RAX, in->a, 1); load128_half(c, RDX, in->a, 1);
+            E(c, "  sar rax, cl"); E(c, "  sar rdx, 63");
+            store128_half(c, in->result, RAX, 0); store128_half(c, in->result, RDX, 1);
+        }
+        E(c, ".Lx%d_%d:", c->fi, Ldone);
+        return true;
+    }
+    case OP_ICMP: {
+        static const char *CCU[10] = { "e","ne","b","be","a","ae","b","be","a","ae" };
+        static const char *CCS[10] = { "e","ne","b","be","a","ae","l","le","g","ge" };
+        if (in->pred == IC_EQ || in->pred == IC_NE) {
+            load128_half(c, RAX, in->a, 0); load128_half(c, RCX, in->b, 0);
+            E(c, "  xor rax, rcx");
+            load128_half(c, RDX, in->a, 1); load128_half(c, RCX, in->b, 1);
+            E(c, "  xor rdx, rcx");
+            E(c, "  or rax, rdx");
+            E(c, "  mov eax, 0");
+            E(c, "  %s al", in->pred == IC_EQ ? "sete" : "setne");
+            store_gp(c, in->result, RAX);
+            return true;
+        }
+        bool sgn = in->pred >= IC_SLT;
+        int Lhi = ++c->lbl, Ldone = ++c->lbl;
+        load128_half(c, RAX, in->a, 1); load128_half(c, RCX, in->b, 1);
+        E(c, "  cmp rax, rcx");
+        E(c, "  jne .Lx%d_%d", c->fi, Lhi);
+        load128_half(c, RAX, in->a, 0); load128_half(c, RCX, in->b, 0);
+        E(c, "  cmp rax, rcx");
+        E(c, "  mov eax, 0");
+        E(c, "  set%s al", CCU[in->pred]);
+        E(c, "  jmp .Lx%d_%d", c->fi, Ldone);
+        E(c, ".Lx%d_%d:", c->fi, Lhi);
+        E(c, "  mov eax, 0");
+        E(c, "  set%s al", sgn ? CCS[in->pred] : CCU[in->pred]);
+        E(c, ".Lx%d_%d:", c->fi, Ldone);
+        store_gp(c, in->result, RAX);
+        return true;
+    }
+    case OP_POPCOUNT:
+        load128_half(c, RAX, in->a, 0); E(c, "  popcnt rax, rax");
+        load128_half(c, RCX, in->a, 1); E(c, "  popcnt rcx, rcx");
+        E(c, "  add rax, rcx");
+        store128_half(c, in->result, RAX, 0); store128_zero(c, in->result, 1);
+        return true;
+    case OP_CLZ: case OP_CTZ: {
+        int L1 = ++c->lbl, L2 = ++c->lbl;
+        if (in->op == OP_CLZ) {
+            load128_half(c, RAX, in->a, 1);
+            E(c, "  test rax, rax");
+            E(c, "  jnz .Lx%d_%d", c->fi, L1);
+            load128_half(c, RAX, in->a, 0);
+            E(c, "  test rax, rax");
+            E(c, "  jz .Lx%d_%d", c->fi, L2);
+            E(c, "  bsr rcx, rax");
+            E(c, "  mov rax, 127");
+            E(c, "  sub rax, rcx");
+            E(c, "  jmp .Lx%d_%d", c->fi, L2 + 100000);
+            E(c, ".Lx%d_%d:", c->fi, L1);
+            E(c, "  bsr rcx, rax");
+            E(c, "  mov rax, 63");
+            E(c, "  sub rax, rcx");
+            E(c, ".Lx%d_%d:", c->fi, L2 + 100000);
+            store128_half(c, in->result, RAX, 0); store128_zero(c, in->result, 1);
+            /* L2 target is the zero case: fallthrough label below */
+            E(c, "  jmp .Lx%d_%d", c->fi, L2 + 200000);
+            E(c, ".Lx%d_%d:", c->fi, L2);
+            E(c, "  mov rax, 128");
+            store128_half(c, in->result, RAX, 0); store128_zero(c, in->result, 1);
+            E(c, ".Lx%d_%d:", c->fi, L2 + 200000);
+        } else {
+            load128_half(c, RAX, in->a, 0);
+            E(c, "  test rax, rax");
+            E(c, "  jnz .Lx%d_%d", c->fi, L1);
+            load128_half(c, RAX, in->a, 1);
+            E(c, "  test rax, rax");
+            E(c, "  jz .Lx%d_%d", c->fi, L2);
+            E(c, "  bsf rax, rax");
+            E(c, "  add rax, 64");
+            E(c, "  jmp .Lx%d_%d", c->fi, L2 + 100000);
+            E(c, ".Lx%d_%d:", c->fi, L1);
+            E(c, "  bsf rax, rax");
+            E(c, ".Lx%d_%d:", c->fi, L2 + 100000);
+            store128_half(c, in->result, RAX, 0); store128_zero(c, in->result, 1);
+            E(c, "  jmp .Lx%d_%d", c->fi, L2 + 200000);
+            E(c, ".Lx%d_%d:", c->fi, L2);
+            E(c, "  mov rax, 128");
+            store128_half(c, in->result, RAX, 0); store128_zero(c, in->result, 1);
+            E(c, ".Lx%d_%d:", c->fi, L2 + 200000);
+        }
+        return true;
+    }
+    case OP_BSWAP:
+        load128_half(c, RAX, in->a, 0); E(c, "  bswap rax");
+        load128_half(c, RCX, in->a, 1); E(c, "  bswap rcx");
+        store128_half(c, in->result, RCX, 0); store128_half(c, in->result, RAX, 1);
+        return true;
+    case OP_ZEXT: {
+        load_gp(c, RAX, in->a);
+        store128_half(c, in->result, RAX, 0); store128_zero(c, in->result, 1);
+        return true;
+    }
+    case OP_SEXT: {
+        Type ta = f->vtypes[in->a];
+        load_gp(c, RAX, in->a);
+        if (ta.bits < 64) {
+            E(c, "  shl rax, %d", 64 - ta.bits);
+            E(c, "  sar rax, %d", 64 - ta.bits);
+        }
+        store128_half(c, in->result, RAX, 0);
+        E(c, "  mov rcx, rax");
+        E(c, "  sar rcx, 63");
+        store128_half(c, in->result, RCX, 1);
+        return true;
+    }
+    case OP_TRUNC:
+        load128_half(c, R11, in->a, 0);
+        mask_r11(c, in->ty);
+        store_gp(c, in->result, R11);
+        return true;
+    case OP_LOAD: case OP_LOADV: {
+        X86Addr addr;
+        if (c->folded_ins && in->a >= 0 && in->a < f->nvalues && c->folded_ins[in->a]) resolve_x86_addr(c, in->a, &addr);
+        else addr = (X86Addr){ .base_v = in->a, .idx_v = -1, .scale = 1, .disp = 0 };
+        char mstr[64]; format_x86_addr(c, mstr, sizeof mstr, &addr);
+        E(c, "  lea rax, %s", mstr);
+        E(c, "  mov rcx, [rax]"); store128_half(c, in->result, RCX, 0);
+        E(c, "  mov rcx, [rax + 8]"); store128_half(c, in->result, RCX, 1);
+        return true;
+    }
+    case OP_STORE: case OP_STOREV: {
+        X86Addr addr;
+        if (c->folded_ins && in->a >= 0 && in->a < f->nvalues && c->folded_ins[in->a]) resolve_x86_addr(c, in->a, &addr);
+        else addr = (X86Addr){ .base_v = in->a, .idx_v = -1, .scale = 1, .disp = 0 };
+        char mstr[64]; format_x86_addr(c, mstr, sizeof mstr, &addr);
+        E(c, "  lea rax, %s", mstr);
+        load128_half(c, RCX, in->b, 0); E(c, "  mov [rax], rcx");
+        load128_half(c, RCX, in->b, 1); E(c, "  mov [rax + 8], rcx");
+        return true;
+    }
+    case OP_RET:
+        if (in->a >= 0) {
+            load128_half(c, RAX, in->a, 0);
+            load128_half(c, RDX, in->a, 1);
+        }
+        emit_epilogue(c);
+        E(c, "  ret");
+        return true;
+    default:
+        (void)rb;
+        return false;
+    }
+}
+
 static void emit_instr(Ctx *c, int bi, int ii) {
     Func *f = c->f;
     Instr *in = &f->blocks[bi].ins[ii];
     if (in->result >= 0 && c->folded_ins && c->folded_ins[in->result]) return;
+    if (ty128(in->ty) || ty128(in->ety) ||
+        (in->a >= 0 && ty128(f->vtypes[in->a])) || (in->b >= 0 && ty128(f->vtypes[in->b])))
+        if (emit_i128(c, in)) return;
     Type t = in->ty;
     char sb[64], sb2[64];
     switch (in->op) {
@@ -977,7 +1308,10 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         store_gp(c, in->result, R11);
         break;
     }
-    case OP_LOAD: {
+    case OP_LOAD: case OP_LOADV: {
+        /* volatile lowers to the same single memory access; the
+         * emitter never caches memory contents, and the access is
+         * emitted exactly once, in program order */
         X86Addr addr;
         if (c->folded_ins && in->a >= 0 && in->a < f->nvalues && c->folded_ins[in->a]) {
             resolve_x86_addr(c, in->a, &addr);
@@ -1003,7 +1337,7 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         }
         break;
     }
-    case OP_STORE: {
+    case OP_STORE: case OP_STOREV: {
         X86Addr addr;
         if (c->folded_ins && in->a >= 0 && in->a < f->nvalues && c->folded_ins[in->a]) {
             resolve_x86_addr(c, in->a, &addr);
@@ -1013,7 +1347,10 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         char mstr[64];
         format_x86_addr(c, mstr, sizeof mstr, &addr);
         Type vt = f->vtypes[in->b];
-        if (in->b >= 0 && in->b < f->nvalues && c->folded_ins && c->folded_ins[in->b]) {
+        /* the folded `inc` shortcut below turns the store into a
+         * read-modify-write of the target cell; that is not a volatile
+         * store, so it is restricted to OP_STORE */
+        if (in->op == OP_STORE && in->b >= 0 && in->b < f->nvalues && c->folded_ins && c->folded_ins[in->b]) {
             const char *szp = vt.bits == 8 ? "BYTE PTR" : vt.bits == 16 ? "WORD PTR" : vt.bits == 32 ? "DWORD PTR" : "QWORD PTR";
             E(c, "  inc %s %s", szp, mstr);
             break;
@@ -1480,6 +1817,73 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         store_gp(c, in->result, R11);
         break;
     }
+    case OP_AXCHG: {
+        load_gp(c, RAX, in->a);
+        load_gp(c, R11, in->b);
+        const char *r = t.bits == 8 ? "r11b" : t.bits == 16 ? "r11w" : t.bits == 32 ? "r11d" : "r11";
+        E(c, "  xchg [rax], %s", r);   /* xchg with memory is implicitly locked */
+        mask_r11(c, t);
+        store_gp(c, in->result, R11);
+        break;
+    }
+    case OP_ACMPXCHG: {
+        /* expected must be in rax; result (old value) returns in rax.
+         * rax's upper bits above the cell width hold the expected
+         * value's (canonical, zero) upper bits, so masking r11 after
+         * the copy recovers the old value exactly. */
+        load_gp(c, RCX, in->a);
+        load_gp(c, RAX, in->b);
+        load_gp(c, R11, in->c);
+        const char *r = t.bits == 8 ? "r11b" : t.bits == 16 ? "r11w" : t.bits == 32 ? "r11d" : "r11";
+        E(c, "  lock cmpxchg [rcx], %s", r);
+        E(c, "  mov r11, rax");
+        mask_r11(c, t);
+        store_gp(c, in->result, R11);
+        break;
+    }
+    case OP_ASUB: case OP_AAND: case OP_AOR: case OP_AXOR:
+    case OP_AMINS: case OP_AMAXS: case OP_AMINU: case OP_AMAXU: {
+        /* no other x86 RMW form returns the old value: load the old
+         * value, compute the new one, and attempt a cmpxchg; retry on
+         * contention. Result is the old value from the successful
+         * cmpxchg (in rax). */
+        int L = ++c->lbl, L2 = ++c->lbl, L3 = ++c->lbl;
+        const char **gn = gname(t.bits / 8);
+        load_gp(c, RCX, in->a);
+        load_gp(c, RDX, in->b);
+        E(c, ".Lx%d_%d:", c->fi, L);
+        if (t.bits == 8 || t.bits == 16)
+            E(c, "  movzx eax, %s PTR [rcx]", t.bits == 8 ? "BYTE" : "WORD");
+        else if (t.bits == 32) E(c, "  mov eax, DWORD PTR [rcx]");
+        else E(c, "  mov rax, QWORD PTR [rcx]");
+        E(c, "  mov %s, %s", gn[R11], gn[RAX]);
+        switch (in->op) {
+        case OP_ASUB: E(c, "  sub %s, %s", gn[R11], gn[RDX]); break;
+        case OP_AAND: E(c, "  and %s, %s", gn[R11], gn[RDX]); break;
+        case OP_AOR:  E(c, "  or %s, %s", gn[R11], gn[RDX]); break;
+        case OP_AXOR: E(c, "  xor %s, %s", gn[R11], gn[RDX]); break;
+        default: {
+            /* min/max: r11 takes the operand iff it wins the compare.
+             * The sized cmp sets flags for the cell width, so signed
+             * and unsigned conditions are exact at 8/16 bits too. */
+            const char *jw = in->op == OP_AMINS ? "jg" : in->op == OP_AMAXS ? "jl"
+                           : in->op == OP_AMINU ? "ja" : "jb";
+            E(c, "  cmp %s, %s", gn[RAX], gn[RDX]);
+            E(c, "  %s .Lx%d_%d", jw, c->fi, L2);
+            E(c, "  jmp .Lx%d_%d", c->fi, L3);
+            E(c, ".Lx%d_%d:", c->fi, L2);
+            E(c, "  mov %s, %s", gn[R11], gn[RDX]);
+            E(c, ".Lx%d_%d:", c->fi, L3);
+            break;
+        }
+        }
+        E(c, "  lock cmpxchg [rcx], %s", gn[R11]);
+        E(c, "  jne .Lx%d_%d", c->fi, L);
+        E(c, "  mov r11, rax");
+        mask_r11(c, t);
+        store_gp(c, in->result, R11);
+        break;
+    }
     case OP_MEMCPY: case OP_MEMSET: {
         /* args (dst, src/byte, n) -> (rdi, rsi, rdx) via parallel moves */
         Loc srcs[3], dsts[3];
@@ -1498,10 +1902,18 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         if (in->callee_extern) { ps = c->m->exts[in->callee].params; np = c->m->exts[in->callee].nparams; name = c->m->exts[in->callee].name; }
         else { Func *g = &c->m->funcs[in->callee]; ps = g->blocks[0].arg_types; np = g->blocks[0].nargs; name = g->name; }
         (void)np;
-        emit_call_args(c, in, ps, false);
+        /* SysV: an extern call must set AL to the number of FP
+         * registers used by the fixed signature - variadic callees
+         * (and some non-variadic ones) read it */
+        int nf = emit_call_args(c, in, ps, false);
+        if (in->callee_extern) E(c, "  mov eax, %d", nf);
         E(c, "  call %s", name);
         if (t.kind != TY_VOID) {
             if (be_class_of(t) == BCLS_FP) store_fp(c, in->result, 0);
+            else if (be_class_of(t) == BCLS_MEM128) {
+                store128_half(c, in->result, RAX, 0);
+                store128_half(c, in->result, RDX, 1);
+            }
             else store_gp(c, in->result, RAX);
         }
         break;
@@ -1510,9 +1922,51 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         const Type *ps; const char *name;
         if (in->callee_extern) { ps = c->m->exts[in->callee].params; name = c->m->exts[in->callee].name; }
         else { Func *g = &c->m->funcs[in->callee]; ps = g->blocks[0].arg_types; name = g->name; }
-        emit_call_args(c, in, ps, true);
+        int nf = emit_call_args(c, in, ps, true);
+        if (in->callee_extern) E(c, "  mov eax, %d", nf);
         emit_epilogue(c);
         E(c, "  jmp %s", name);
+        break;
+    }
+    case OP_FUNCP: {
+        /* the function's address in r11, then home. For an extern the
+         * symbol may live in a shared object: a GOT-relative load
+         * yields the right address on every link. */
+        if (in->callee_extern) E(c, "  mov r11, qword ptr [rip + %s@GOTPCREL]", c->m->exts[in->callee].name);
+        else E(c, "  lea r11, [rip + %s]", c->m->funcs[in->callee].name);
+        store_gp(c, in->result, R11);
+        break;
+    }
+    case OP_CALLI: {
+        /* the target may be an extern: always set AL from the
+         * signature's FP register count */
+        Sig *g = &c->m->sigs[in->callee];
+        int nf = emit_call_args(c, in, g->params, false);
+        E(c, "  mov eax, %d", nf);
+        load_gp(c, R11, in->a);
+        E(c, "  call r11");
+        if (t.kind != TY_VOID) {
+            if (be_class_of(t) == BCLS_FP) store_fp(c, in->result, 0);
+            else if (be_class_of(t) == BCLS_MEM128) {
+                store128_half(c, in->result, RAX, 0);
+                store128_half(c, in->result, RDX, 1);
+            }
+            else store_gp(c, in->result, RAX);
+        }
+        break;
+    }
+    case OP_TAILCALLI: {
+        /* the pointer operand's home may be an argument register the
+         * setup overwrites, so park it on the stack first (all arg
+         * addressing is rbp-relative; the epilogue resets rsp) */
+        Sig *g = &c->m->sigs[in->callee];
+        load_gp(c, R11, in->a);
+        E(c, "  push r11");
+        int nf = emit_call_args(c, in, g->params, true);
+        E(c, "  pop r11");
+        E(c, "  mov eax, %d", nf);
+        emit_epilogue(c);
+        E(c, "  jmp r11");
         break;
     }
     case OP_SELECT: {
@@ -1528,6 +1982,12 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         break;
     }
     case OP_ASSUME: break;
+    case OP_FENCE:
+        /* x86 TSO: acquire/release/acqrel fences are compiler-only
+         * (this emitter never reorders); seqcst needs the hardware
+         * fence */
+        if (in->aux == AO_SEQCST) E(c, "  mfence");
+        break;
     case OP_BR:
         if (in->nargs == 0 && in->blk == bi + 1) break;
         emit_branch(c, in->blk, in->args, in->nargs);
@@ -2092,6 +2552,7 @@ static int emit_func(Ctx *c, int fi) {
         Loc *fs = malloc(sizeof(Loc) * (size_t)(b0->nargs ? b0->nargs : 1));
         Loc *fd = malloc(sizeof(Loc) * (size_t)(b0->nargs ? b0->nargs : 1));
         int ng = 0, nf = 0, gi = 0, fi2 = 0, stk = 0;
+        int wv[64], wstk[64], nw = 0;
         for (int i = 0; i < b0->nargs; i++) {
             int v = b0->arg_vals[i];
             int cls = be_class_of(b0->arg_types[i]);
@@ -2106,15 +2567,27 @@ static int emit_func(Ctx *c, int fi) {
             }
             else {
                 Loc src = { 0, (int8_t)cls, -1000 - stk, -(16 + 8 * stk) };
-                stk++;
-                if (bf->defpos[v] != bf->endpos[v]) {
-                    if (cls == BCLS_GP) { gs[ng] = src; gd[ng] = dst; ng++; }
-                    else if (cls == BCLS_FP) { fs[nf] = src; fd[nf] = dst; nf++; }
+                if (cls == BCLS_MEM128) {
+                    if (bf->defpos[v] != bf->endpos[v]) { wv[nw] = v; wstk[nw] = stk; nw++; }
+                    stk += 2;
+                } else {
+                    stk++;
+                    if (bf->defpos[v] != bf->endpos[v]) {
+                        if (cls == BCLS_GP) { gs[ng] = src; gd[ng] = dst; ng++; }
+                        else if (cls == BCLS_FP) { fs[nf] = src; fd[nf] = dst; nf++; }
+                    }
                 }
             }
         }
         parallel_moves(c, gs, gd, ng, BCLS_GP);
         parallel_moves(c, fs, fd, nf, BCLS_FP);
+        /* i128 params arrive as two stack slots; copy both halves home */
+        for (int i = 0; i < nw; i++) {
+            E(c, "  mov rax, [rbp + %d]", 16 + 8 * wstk[i]);
+            E(c, "  mov [rbp - %d], rax", bf->loc[wv[i]].off);
+            E(c, "  mov rax, [rbp + %d]", 16 + 8 * wstk[i] + 8);
+            E(c, "  mov [rbp - %d], rax", bf->loc[wv[i]].off - 8);
+        }
         free(gs); free(gd); free(fs); free(fd);
         /* canonical form: narrow integer params are masked in place —
          * the C ABI leaves their high register bits unspecified */

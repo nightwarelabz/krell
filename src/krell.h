@@ -30,6 +30,7 @@ static inline Type ty_i8(void) { return ty_int(8); }
 static inline Type ty_i16(void) { return ty_int(16); }
 static inline Type ty_i32(void) { return ty_int(32); }
 static inline Type ty_i64(void) { return ty_int(64); }
+static inline Type ty_i128(void) { return ty_int(128); }
 static inline Type ty_f32(void) { Type t = { TY_FLOAT, 32, 0, 0, 0 }; return t; }
 static inline Type ty_f64(void) { Type t = { TY_FLOAT, 64, 0, 0, 0 }; return t; }
 static inline Type ty_ptr(void) { Type t = { TY_PTR, 64, 0, 0, 0 }; return t; }
@@ -69,6 +70,14 @@ enum {
     OP_ALOAD, OP_ASTORE, OP_AADD,
     OP_BR, OP_CONDBR, OP_RET, OP_CALL, OP_TAILCALL, OP_SELECT, OP_ASSUME,
     OP_VLSHR,   /* appended: existing opcode numbers are binary-format */
+    OP_LOADV, OP_STOREV,  /* v3: volatile load/store (appended, v2 numbers unchanged) */
+    OP_FENCE,             /* v3: ordering fence, aux = AO_* (appended) */
+    OP_ACMPXCHG,          /* v3: atomic compare-exchange, a=ptr b=expected c=desired, aux = AO_* */
+    OP_AXCHG, OP_ASUB, OP_AAND, OP_AOR, OP_AXOR,   /* v3: RMW family, a=ptr b=operand, aux = AO_* */
+    OP_AMINS, OP_AMAXS, OP_AMINU, OP_AMAXU,        /* v3: RMW signed/unsigned min/max */
+    OP_FUNCP,                 /* v3: address of a function as a ptr value; callee/callee_extern select it */
+    OP_CALLI,                 /* v3: indirect call; a = ptr operand, callee = signature-table index */
+    OP_TAILCALLI,             /* v3: indirect tail call (terminator), same fields */
     OP_COUNT
 };
 /* icmp predicates */
@@ -76,12 +85,13 @@ enum { IC_EQ, IC_NE, IC_ULT, IC_ULE, IC_UGT, IC_UGE, IC_SLT, IC_SLE, IC_SGT, IC_
 /* fcmp predicates */
 enum { FC_OEQ, FC_ONE, FC_OLT, FC_OLE, FC_OGT, FC_OGE,
        FC_UEQ, FC_UNE, FC_ULT, FC_ULE, FC_UGT, FC_UGE, FC_ORD, FC_UNO };
-/* atomic orderings */
-enum { AO_RELAXED = 0, AO_ACQREL = 1, AO_SEQCST = 2 };
+/* atomic orderings (v3 appends ACQUIRE/RELEASE; existing values are encoding) */
+enum { AO_RELAXED = 0, AO_ACQREL = 1, AO_SEQCST = 2, AO_ACQUIRE = 3, AO_RELEASE = 4 };
 
 const char *op_name(int op);
 bool op_is_pure(int op);        /* no side effects, hash-consable */
 bool op_is_terminator(int op);
+bool op_is_rmw(int op);         /* atomic RMW returning the old value (aadd + v3 family) */
 
 /* ---------------- IR structures ---------------- */
 typedef struct {
@@ -89,6 +99,7 @@ typedef struct {
     Type     ty;          /* result type (TY_VOID if none) */
     int32_t  a, b, c;     /* value operands, -1 if unused */
     int64_t  imm;         /* iconst payload / fconst bits / size / lane / data idx */
+    int64_t  imm2;        /* iconst high half (i128 only; 0 otherwise) */
     uint8_t  pred;        /* icmp/fcmp predicate */
     uint8_t  aux;         /* atomic ordering, call flags */
     int32_t  result;      /* value id of result, -1 if none */
@@ -123,6 +134,7 @@ typedef struct Func {
     void *cons;
     /* integer/float constant tracking per value (bit patterns) */
     uint64_t *cval; uint8_t *isconst; int cvalcap;
+    uint64_t *cval_hi;    /* high half of an i128 constant (cval holds the low) */
     /* per-value type table */
     Type    *vtypes; int vcap;
 } Func;
@@ -140,10 +152,20 @@ typedef struct {
     uint32_t len;
 } DataBlob;
 
+/* a function signature in the module signature table (v3): indirect
+ * calls dispatch through a table entry, so a call site's expected
+ * signature is a module-level fact the verifier can check and the
+ * interpreter can enforce */
+typedef struct {
+    Type *params; int nparams;
+    Type  ret;
+} Sig;
+
 typedef struct Module {
     Func    *funcs;  int nfuncs,  capfuncs;
     Extern  *exts;   int nexts,   capexts;
     DataBlob *data;  int ndata,   capdata;
+    Sig     *sigs;   int nsigs,   capsigs;
 } Module;
 
 /* ---------------- builder (ir.c) ---------------- */
@@ -151,6 +173,7 @@ Module *mod_new(void);
 void    mod_free(Module *m);
 int     mod_add_extern(Module *m, const char *name, const Type *params, int n, Type ret);
 int     mod_add_data(Module *m, const char *name, uint32_t align, const void *bytes, uint32_t len);
+int     mod_add_sig(Module *m, const Type *params, int n, Type ret);   /* deduplicated; returns table index */
 Func   *mod_add_func(Module *m, const char *name, Type ret, uint8_t flags);
 int     mod_find_func(Module *m, const char *name);
 int     mod_find_extern(Module *m, const char *name);
@@ -161,6 +184,7 @@ int     emit(Func *f, int blk, Instr in);            /* returns result id or -1 
 int     emit_pure(Func *f, int blk, Instr in);       /* hash-consed + folded */
 /* convenience constructors */
 Instr   ins_iconst(Type ty, int64_t v);
+Instr   ins_iconst128(int64_t lo, int64_t hi);
 Instr   ins_fconst(Type ty, uint64_t bits);
 Instr   ins_bin(uint8_t op, Type ty, int a, int b);
 Instr   ins_un(uint8_t op, Type ty, int a);
@@ -168,6 +192,8 @@ Instr   ins_br(int blk, int32_t *args, int n);
 Instr   ins_condbr(int cond, int b1, int32_t *a1, int n1, int b2, int32_t *a2, int n2);
 Instr   ins_ret(int v);          /* v = -1 for void */
 Instr   ins_call(Type ret, int callee, bool ext, int32_t *args, int n, bool tail);
+Instr   ins_funcptr(int callee, bool ext);                              /* OP_FUNCP */
+Instr   ins_calli(Type ret, int sig, int fp, int32_t *args, int n, bool tail);
 int32_t *ids_dup(const int32_t *src, int n);
 Type     func_value_type(Func *f, int32_t v);
 void     func_rebuild_constants(Func *f);

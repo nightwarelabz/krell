@@ -55,11 +55,13 @@ static int opt_new_value(Opt *o, Type t) {
         f->vcap = f->vcap ? f->vcap * 2 : 32;
         f->vtypes  = realloc(f->vtypes,  (size_t)f->vcap * sizeof(Type));
         f->cval    = realloc(f->cval,    (size_t)f->vcap * sizeof(uint64_t));
+        f->cval_hi = realloc(f->cval_hi, (size_t)f->vcap * sizeof(uint64_t));
         f->isconst = realloc(f->isconst, (size_t)f->vcap);
     }
     int v = f->nvalues++;
     f->vtypes[v] = t;
     f->cval[v] = 0;
+    f->cval_hi[v] = 0;
     f->isconst[v] = 0;
     opt_grow(o, v);
     return v;
@@ -882,9 +884,14 @@ static void optimize_func(Opt *o) {
             for (int ii = 0; ii < b->nins; ii++) {
                 Instr *in = &b->ins[ii];
                 bool root = op_is_terminator(in->op)
-                    || in->op == OP_STORE || in->op == OP_VSTORE || in->op == OP_CALL
+                    || in->op == OP_STORE || in->op == OP_VSTORE || in->op == OP_CALL || in->op == OP_CALLI
                     || in->op == OP_MEMCPY || in->op == OP_MEMSET
-                    || in->op == OP_ASTORE || in->op == OP_AADD;
+                    || in->op == OP_ASTORE || in->op == OP_AADD
+                    || in->op == OP_ACMPXCHG || op_is_rmw(in->op)
+                    /* volatile accesses are observable even when the
+                     * loaded value is unused: root them so neither the
+                     * access nor its operands can be eliminated */
+                    || in->op == OP_LOADV || in->op == OP_STOREV || in->op == OP_FENCE;
                 if (root && !bmark[bi][ii]) { bmark[bi][ii] = 1; PUSH(bi, ii); }
             }
         }
@@ -2705,11 +2712,13 @@ static int lr_new_value(Func *f, Type t) {
         f->vcap = f->vcap ? f->vcap * 2 : 32;
         f->vtypes  = realloc(f->vtypes,  (size_t)f->vcap * sizeof(Type));
         f->cval    = realloc(f->cval,    (size_t)f->vcap * sizeof(uint64_t));
+        f->cval_hi = realloc(f->cval_hi, (size_t)f->vcap * sizeof(uint64_t));
         f->isconst = realloc(f->isconst, (size_t)f->vcap);
     }
     int v = f->nvalues++;
     f->vtypes[v] = t;
     f->cval[v] = 0;
+    f->cval_hi[v] = 0;
     f->isconst[v] = 0;
     return v;
 }

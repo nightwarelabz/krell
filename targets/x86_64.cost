@@ -45,13 +45,26 @@ op uitofp.f lat 6 thr 2
 op bitcast.i lat 1 thr 1
 op alloca.i lat 0 thr 1
 op load.i lat 4 thr 1
+op loadv.i lat 4 thr 1
 op store.i lat 1 thr 1
+op storev.i lat 1 thr 1
 op gep.i lat 1 thr 1
 op memcpy.i lat 30 thr 10
 op memset.i lat 30 thr 10
 op aload.i lat 4 thr 1
 op astore.i lat 1 thr 1
+op fence.i lat 30 thr 10
 op aadd.i lat 12 thr 6
+op acmpxchg.i lat 18 thr 9
+op axchg.i lat 12 thr 6
+op asub.i lat 24 thr 12
+op aand.i lat 24 thr 12
+op aor.i lat 24 thr 12
+op axor.i lat 24 thr 12
+op amins.i lat 26 thr 13
+op amaxs.i lat 26 thr 13
+op aminu.i lat 26 thr 13
+op amaxu.i lat 26 thr 13
 op vsplat.v lat 4 thr 2
 op vadd.v lat 1 thr 1
 op vsub.v lat 1 thr 1
@@ -73,3 +86,31 @@ fn memcpy cost 30
 fn memset cost 30
 fn fma cost 30
 fn fmaf cost 30
+# i128 width rows (v3.0): memory-resident lowering; division gated off.
+op add.i128 lat 2 thr 1
+op sub.i128 lat 2 thr 1
+op mul.i128 lat 7 thr 1
+op neg.i128 lat 2 thr 1
+op and.i128 lat 2 thr 1
+op or.i128 lat 2 thr 1
+op xor.i128 lat 2 thr 1
+op not.i128 lat 2 thr 1
+op shl.i128 lat 6 thr 1
+op lshr.i128 lat 6 thr 1
+op ashr.i128 lat 7 thr 1
+op icmp.i128 lat 3 thr 1
+op popcount.i128 lat 4 thr 1
+op clz.i128 lat 5 thr 1
+op ctz.i128 lat 5 thr 1
+op bswap.i128 lat 4 thr 1
+op trunc.i128 lat 1 thr 1
+op zext.i128 lat 1 thr 1
+op sext.i128 lat 2 thr 1
+op freeze.i128 lat 1 thr 1
+op load.i128 lat 5 thr 1
+op store.i128 lat 2 thr 1
+op udiv.i128 lat 40 thr 1 cliff 1
+op sdiv.i128 lat 44 thr 1 cliff 1
+op urem.i128 lat 40 thr 1 cliff 1
+op srem.i128 lat 44 thr 1 cliff 1
+op funcptr.i lat 1 thr 1

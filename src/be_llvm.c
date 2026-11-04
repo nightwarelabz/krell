@@ -32,6 +32,7 @@ typedef struct {
     bool need_ctpop[65], need_ctlz[65], need_cttz[65], need_bswap[65];
     bool need_fma32, need_fma64, need_fabs32, need_fabs64;
     bool need_memcpy, need_memset;
+    const bool *addrtaken;   /* internal funcs whose address escapes (funcptr) */
 } Ctx;
 
 static void E(Ctx *c, const char *fmt, ...) {
@@ -309,9 +310,17 @@ static void emit_instr(Ctx *c, Instr *in) {
     case OP_LOAD:
         E(c, "  %s = load %s, ptr %s, align 1", R, tb, ab);
         break;
+    case OP_LOADV:
+        E(c, "  %s = load volatile %s, ptr %s, align 1", R, tb, ab);
+        break;
     case OP_STORE: {
         char stb[48]; ty_str(c, f->vtypes[in->b], stb, sizeof stb);
         E(c, "  store %s %s, ptr %s, align 1", stb, bb, ab);
+        break;
+    }
+    case OP_STOREV: {
+        char stb[48]; ty_str(c, f->vtypes[in->b], stb, sizeof stb);
+        E(c, "  store volatile %s %s, ptr %s, align 1", stb, bb, ab);
         break;
     }
     case OP_VLOAD:
@@ -401,14 +410,14 @@ static void emit_instr(Ctx *c, Instr *in) {
         break;
     }
     case OP_ALOAD: {
-        const char *ord = in->aux == AO_SEQCST ? "seq_cst" : in->aux == AO_ACQREL ? "acquire" : "monotonic";
+        const char *ord = in->aux == AO_SEQCST ? "seq_cst" : (in->aux == AO_ACQREL || in->aux == AO_ACQUIRE) ? "acquire" : "monotonic";
         int al = t.bits >= 8 ? t.bits / 8 : 1;
         E(c, "  %s = load atomic %s, ptr %s %s, align %d", R, tb, ab, ord, al);
         break;
     }
     case OP_ASTORE: {
         char stb[48]; ty_str(c, f->vtypes[in->b], stb, sizeof stb);
-        const char *ord = in->aux == AO_SEQCST ? "seq_cst" : in->aux == AO_ACQREL ? "release" : "monotonic";
+        const char *ord = in->aux == AO_SEQCST ? "seq_cst" : (in->aux == AO_ACQREL || in->aux == AO_RELEASE) ? "release" : "monotonic";
         int al = f->vtypes[in->b].bits >= 8 ? f->vtypes[in->b].bits / 8 : 1;
         E(c, "  store atomic %s %s, ptr %s %s, align %d", stb, bb, ab, ord, al);
         break;
@@ -417,6 +426,79 @@ static void emit_instr(Ctx *c, Instr *in) {
         const char *ord = in->aux == AO_SEQCST ? "seq_cst" : in->aux == AO_ACQREL ? "acq_rel" : "monotonic";
         int al = t.bits >= 8 ? t.bits / 8 : 1;
         E(c, "  %s = atomicrmw add ptr %s, %s %s %s, align %d", R, ab, tb, bb, ord, al);
+        break;
+    }
+    case OP_ACMPXCHG: {
+        /* strong cmpxchg; the IR result is the old value (first element
+         * of LLVM's {ty, i1} pair). The failure ordering is the success
+         * ordering weakened: acq_rel -> acquire, release -> monotonic
+         * (LLVM forbids release/acq_rel as a failure ordering). */
+        char ctb[48]; ty_str(c, f->vtypes[in->c], ctb, sizeof ctb);
+        const char *ord = in->aux == AO_SEQCST ? "seq_cst" : in->aux == AO_ACQREL ? "acq_rel"
+                        : in->aux == AO_ACQUIRE ? "acquire" : in->aux == AO_RELEASE ? "release" : "monotonic";
+        const char *ford = in->aux == AO_ACQREL ? "acquire" : in->aux == AO_RELEASE ? "monotonic" : ord;
+        int al = t.bits >= 8 ? t.bits / 8 : 1;
+        int n = emit_tmp(c, "cmpxchg ptr %s, %s %s, %s %s %s %s, align %d",
+                         ab, tb, bb, ctb, cb, ord, ford, al);
+        E(c, "  %s = extractvalue { %s, i1 } %%t%d, 0", R, tb, n);
+        break;
+    }
+    case OP_AXCHG: case OP_ASUB: case OP_AAND: case OP_AOR: case OP_AXOR:
+    case OP_AMINS: case OP_AMAXS: case OP_AMINU: case OP_AMAXU: {
+        const char *nm = in->op == OP_AXCHG ? "xchg" : in->op == OP_ASUB ? "sub"
+                       : in->op == OP_AAND ? "and" : in->op == OP_AOR ? "or"
+                       : in->op == OP_AXOR ? "xor" : in->op == OP_AMINS ? "min"
+                       : in->op == OP_AMAXS ? "max" : in->op == OP_AMINU ? "umin" : "umax";
+        const char *ord = in->aux == AO_SEQCST ? "seq_cst" : in->aux == AO_ACQREL ? "acq_rel"
+                        : in->aux == AO_ACQUIRE ? "acquire" : in->aux == AO_RELEASE ? "release" : "monotonic";
+        int al = t.bits >= 8 ? t.bits / 8 : 1;
+        E(c, "  %s = atomicrmw %s ptr %s, %s %s %s, align %d", R, nm, ab, tb, bb, ord, al);
+        break;
+    }
+    case OP_FENCE: {
+        const char *ord = in->aux == AO_SEQCST ? "seq_cst" : in->aux == AO_ACQREL ? "acq_rel"
+                        : in->aux == AO_ACQUIRE ? "acquire" : "release";
+        E(c, "  fence %s", ord);
+        break;
+    }
+    case OP_FUNCP: {
+        const char *name = in->callee_extern ? c->m->exts[in->callee].name : c->m->funcs[in->callee].name;
+        E(c, "  %s = getelementptr inbounds i8, ptr @%s, i64 0", R, name);
+        break;
+    }
+    case OP_CALLI: case OP_TAILCALLI: {
+        /* indirect calls always use the C convention; the function
+         * type comes from the signature-table entry */
+        Sig *g = &c->m->sigs[in->callee];
+        char rtb[48]; ty_str(c, g->ret, rtb, sizeof rtb);
+        char fty[1024]; int fpos = 0; fty[0] = 0;
+        for (int i = 0; i < g->nparams; i++) {
+            char pb[48]; ty_str(c, g->params[i], pb, sizeof pb);
+            fpos += snprintf(fty + fpos, sizeof fty - (size_t)fpos, "%s%s", i ? ", " : "", pb);
+        }
+        char args[2048]; int pos = 0; args[0] = 0;
+        for (int i = 0; i < in->nargs; i++) {
+            char pb[48], ob[80];
+            ty_str(c, g->params[i], pb, sizeof pb);
+            op_str(c, in->args[i], ob, sizeof ob);
+            pos += snprintf(args + pos, sizeof args - (size_t)pos, "%s%s %s", i ? ", " : "", pb, ob);
+        }
+        /* the type is variadic: the target may be an extern, and a
+         * variadic-typed call makes the backend set AL (x86_64) to the
+         * FP register count of the fixed prefix, exactly like the
+         * native lanes; fixed callees observe no other difference */
+        fpos += snprintf(fty + fpos, sizeof fty - (size_t)fpos, "%s...", g->nparams ? ", " : "");
+        char fp[80]; op_str(c, in->a, fp, sizeof fp);
+        const char *tail = in->op == OP_TAILCALLI ? "tail " : "";
+        if (g->ret.kind == TY_VOID) {
+            E(c, "  %scall %s (%s) %s(%s)", tail, rtb, fty, fp, args);
+            if (in->op == OP_TAILCALLI) E(c, "  ret void");
+        } else if (in->op == OP_TAILCALLI) {
+            int n = emit_tmp(c, "%scall %s (%s) %s(%s)", tail, rtb, fty, fp, args);
+            E(c, "  ret %s %%t%d", rtb, n);
+        } else {
+            E(c, "  %s = %scall %s (%s) %s(%s)", R, tail, rtb, fty, fp, args);
+        }
         break;
     }
     case OP_CALL: case OP_TAILCALL: {
@@ -432,8 +514,31 @@ static void emit_instr(Ctx *c, Instr *in) {
             op_str(c, in->args[i], ob, sizeof ob);
             pos += snprintf(args + pos, sizeof args - (size_t)pos, "%s%s %s", i ? ", " : "", pb, ob);
         }
-        const char *cc = in->callee_extern ? "" : "fastcc ";
+        const char *cc = (in->callee_extern || (c->addrtaken && in->callee >= 0 && c->addrtaken[in->callee])) ? "" : "fastcc ";
         const char *tail = in->op == OP_TAILCALL ? "tail " : "";
+        if (in->callee_extern) {
+            /* extern calls carry an explicit variadic function type
+             * (see OP_CALLI): the fixed prefix is passed identically,
+             * and the backend sets AL on x86_64 */
+            char fty[1024]; int fpos = 0; fty[0] = 0;
+            int np2 = in->callee_extern ? c->m->exts[in->callee].nparams : 0;
+            for (int i = 0; i < np2; i++) {
+                char pb[48]; ty_str(c, ps[i], pb, sizeof pb);
+                fpos += snprintf(fty + fpos, sizeof fty - (size_t)fpos, "%s%s", i ? ", " : "", pb);
+            }
+            fpos += snprintf(fty + fpos, sizeof fty - (size_t)fpos, "%s...", np2 ? ", " : "");
+            (void)fpos;
+            if (rt.kind == TY_VOID) {
+                E(c, "  %scall void (%s) @%s(%s)", tail, fty, name, args);
+                if (in->op == OP_TAILCALL) E(c, "  ret void");
+            } else if (in->op == OP_TAILCALL) {
+                int n = emit_tmp(c, "%scall %s (%s) @%s(%s)", tail, rtb, fty, name, args);
+                E(c, "  ret %s %%t%d", rtb, n);
+            } else {
+                E(c, "  %s = %scall %s (%s) @%s(%s)", R, tail, rtb, fty, name, args);
+            }
+            break;
+        }
         if (rt.kind == TY_VOID) {
             E(c, "  %scall %svoid @%s(%s)", tail, cc, name, args);
             if (in->op == OP_TAILCALL) E(c, "  ret void");
@@ -518,7 +623,7 @@ static void emit_func(Ctx *c, int fi) {
         }
     /* signature */
     char rtb[48]; ty_str(c, f->ret, rtb, sizeof rtb);
-    const char *cc = (strcmp(f->name, "main") == 0) ? "" : "fastcc ";
+    const char *cc = (strcmp(f->name, "main") == 0 || (c->addrtaken && c->addrtaken[fi])) ? "" : "fastcc ";
     fprintf(c->out, "define %s%s @%s(", cc, rtb, f->name);
     if (f->nblocks > 0) {
         Block *b0 = &f->blocks[0];
@@ -595,7 +700,7 @@ static void emit_func(Ctx *c, int fi) {
                 op_str(c, t->a, ob, sizeof ob);
                 E(c, "  ret %s %s", rb, ob);
             }
-        } else if (t && t->op == OP_TAILCALL) {
+        } else if (t && (t->op == OP_TAILCALL || t->op == OP_TAILCALLI)) {
             emit_instr(c, t);   /* emits the call and its ret */
         } else {
             E(c, "  unreachable");
@@ -614,7 +719,20 @@ static void emit_func(Ctx *c, int fi) {
 int be_llvm(Module *m, const Cost *cost, FILE *out, char *err, size_t errcap) {
     const char *ve = mod_verify(m);
     if (ve) { snprintf(err, errcap, "%s", ve); return -1; }
-    Ctx c = { .out = out, .m = m, .vl = cost_vl_i32(cost) };
+    /* address-taken internal functions are emitted with the C
+     * convention (definition and every call site, direct or
+     * indirect): an indirect call cannot use fastcc */
+    bool *addrtaken = calloc((size_t)(m->nfuncs ? m->nfuncs : 1), sizeof(bool));
+    for (int i = 0; i < m->nfuncs; i++) {
+        Func *g = &m->funcs[i];
+        for (int b = 0; b < g->nblocks; b++)
+            for (int j = 0; j < g->blocks[b].nins; j++) {
+                Instr *in = &g->blocks[b].ins[j];
+                if (in->op == OP_FUNCP && !in->callee_extern && in->callee >= 0 && in->callee < m->nfuncs)
+                    addrtaken[in->callee] = true;
+            }
+    }
+    Ctx c = { .out = out, .m = m, .vl = cost_vl_i32(cost), .addrtaken = addrtaken };
     E(&c, "; Krell-IR -> LLVM IR (lowering lane)");
     /* data globals */
     for (int i = 0; i < m->ndata; i++) {
@@ -654,5 +772,6 @@ int be_llvm(Module *m, const Cost *cost, FILE *out, char *err, size_t errcap) {
     if (c.need_fabs64) E(&c, "declare double @llvm.fabs.f64(double)");
     if (c.need_memcpy) E(&c, "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1 immarg)");
     if (c.need_memset) E(&c, "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1 immarg)");
+    free(addrtaken);
     return 0;
 }

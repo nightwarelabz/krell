@@ -63,6 +63,9 @@ static void sext_reg(Ctx *c, int reg, int bits) {
 }
 /* SP-relative offset text for a stack location */
 static int sp_imm(Ctx *c, Loc *l) { return c->bf->frame_bytes - l->off; }
+static int sp128(Ctx *c, int v, int half);
+static void load128_half(Ctx *c, int reg, int v, int half);
+static void store128_half(Ctx *c, int v, int reg, int half);
 
 static void load_gp(Ctx *c, int reg, int v) {
     Loc *l = &c->bf->loc[v];
@@ -99,6 +102,19 @@ static void copy_value(Ctx *c, int dst, int src) {
     int cls = be_class_of(t);
     if (cls == BCLS_GP) { load_gp(c, X16, src); store_gp(c, dst, X16); }
     else if (cls == BCLS_FP) { load_fp(c, 31, src); store_fp(c, dst, 31); }
+    else if (cls == BCLS_MEM128) {
+        if (c->f->isconst[src]) {
+            load_imm64(c, X16, c->f->cval[src]);
+            E(c, "  str x16, [sp, #%d]", sp128(c, dst, 0));
+            load_imm64(c, X16, c->f->cval_hi[src]);
+            E(c, "  str x16, [sp, #%d]", sp128(c, dst, 1));
+        } else if (c->bf->loc[dst].off != c->bf->loc[src].off) {
+            E(c, "  ldr x16, [sp, #%d]", sp128(c, src, 0));
+            E(c, "  str x16, [sp, #%d]", sp128(c, dst, 0));
+            E(c, "  ldr x16, [sp, #%d]", sp128(c, src, 1));
+            E(c, "  str x16, [sp, #%d]", sp128(c, dst, 1));
+        }
+    }
     else {
         Loc *dl = &c->bf->loc[dst], *sl = &c->bf->loc[src];
         int bytes = 16 * t.n;
@@ -250,6 +266,8 @@ static void emit_call_args(Ctx *c, Instr *in, const Type *params, bool tail) {
             nf++; fi2++;
         } else if (cls == BCLS_GP || cls == BCLS_FP) {
             sa[nsa].v = v; sa[nsa].slot = stk++; nsa++;
+        } else if (cls == BCLS_MEM128) {
+            sa[nsa].v = v; sa[nsa].slot = stk; stk += 2; nsa++;
         }
     }
     /* stack args go to the outgoing area at [sp + 8*slot]; for a tail
@@ -257,13 +275,23 @@ static void emit_call_args(Ctx *c, Instr *in, const Type *params, bool tail) {
     for (int i = 0; i < nsa; i++) {
         int v = sa[i].v;
         int cls = be_class_of(c->f->vtypes[v]);
-        if (cls == BCLS_GP) { load_gp(c, X16, v); E(c, "  str x16, [sp, #%d]", 8 * sa[i].slot); }
+        if (cls == BCLS_MEM128) {
+            load128_half(c, X16, v, 0); E(c, "  str x16, [sp, #%d]", 8 * sa[i].slot);
+            load128_half(c, X16, v, 1); E(c, "  str x16, [sp, #%d]", 8 * sa[i].slot + 8);
+        }
+        else if (cls == BCLS_GP) { load_gp(c, X16, v); E(c, "  str x16, [sp, #%d]", 8 * sa[i].slot); }
         else { load_fp(c, 31, v); E(c, "  str d31, [sp, #%d]", 8 * sa[i].slot); }
     }
     if (tail) {
         for (int i = 0; i < nsa; i++) {
             int cls = be_class_of(c->f->vtypes[sa[i].v]);
-            if (cls == BCLS_GP) {
+            if (cls == BCLS_MEM128) {
+                E(c, "  ldr x16, [sp, #%d]", 8 * sa[i].slot);
+                E(c, "  str x16, [x29, #%d]", 16 + 8 * sa[i].slot);
+                E(c, "  ldr x16, [sp, #%d]", 8 * sa[i].slot + 8);
+                E(c, "  str x16, [x29, #%d]", 16 + 8 * sa[i].slot + 8);
+            }
+            else if (cls == BCLS_GP) {
                 E(c, "  ldr x16, [sp, #%d]", 8 * i);
                 E(c, "  str x16, [x29, #%d]", 16 + 8 * sa[i].slot);
             } else {
@@ -319,10 +347,272 @@ static void lane_store_gp(Ctx *c, int reg, int addr_reg, int eb) {
     else E(c, "  str x%d, [x%d]", reg, addr_reg);
 }
 
+/* ---- i128 (v3.0): memory-resident (lo, hi) pairs; scratch x16/x17
+ * (x0 joins for shift cross terms). Return: x0 = lo, x1 = hi.
+ * Arguments: two consecutive 8-byte stack slots, as on x86_64. ---- */
+static bool ty128(Type t) { return t.kind == TY_INT && t.bits == 128; }
+static int sp128(Ctx *c, int v, int half) { return c->bf->frame_bytes - c->bf->loc[v].off + 8 * half; }
+static void load128_half(Ctx *c, int reg, int v, int half) {
+    if (v >= 0 && v < c->f->nvalues && c->f->isconst[v]) {
+        load_imm64(c, reg, half ? c->f->cval_hi[v] : c->f->cval[v]);
+    } else E(c, "  ldr x%d, [sp, #%d]", reg, sp128(c, v, half));
+}
+static void store128_half(Ctx *c, int v, int reg, int half) {
+    if (v >= 0 && v < c->f->nvalues && c->bf->defpos[v] == c->bf->endpos[v]) return;
+    E(c, "  str x%d, [sp, #%d]", reg, sp128(c, v, half));
+}
+static void store128_zero(Ctx *c, int v, int half) {
+    if (v >= 0 && v < c->f->nvalues && c->bf->defpos[v] == c->bf->endpos[v]) return;
+    E(c, "  str xzr, [sp, #%d]", sp128(c, v, half));
+}
+static bool emit_i128(Ctx *c, Instr *in) {
+    Func *f = c->f;
+    switch (in->op) {
+    case OP_ICONST:
+        load_imm64(c, X16, (uint64_t)in->imm); store128_half(c, in->result, X16, 0);
+        load_imm64(c, X16, (uint64_t)in->imm2); store128_half(c, in->result, X16, 1);
+        return true;
+    case OP_ADD: case OP_SUB: case OP_AND: case OP_OR: case OP_XOR: {
+        const char *lo_op = in->op == OP_ADD ? "adds" : in->op == OP_SUB ? "subs" : in->op == OP_AND ? "and" : in->op == OP_OR ? "orr" : "eor";
+        const char *hi_op = in->op == OP_ADD ? "adcs" : in->op == OP_SUB ? "sbcs" : lo_op;
+        load128_half(c, X16, in->a, 0); load128_half(c, X17, in->b, 0);
+        E(c, "  %s x16, x16, x17", lo_op); store128_half(c, in->result, X16, 0);
+        load128_half(c, X16, in->a, 1); load128_half(c, X17, in->b, 1);
+        E(c, "  %s x16, x16, x17", hi_op); store128_half(c, in->result, X16, 1);
+        return true;
+    }
+    case OP_NEG:
+        load128_half(c, X17, in->a, 0);
+        E(c, "  subs x16, xzr, x17"); store128_half(c, in->result, X16, 0);
+        load128_half(c, X17, in->a, 1);
+        E(c, "  sbcs x16, xzr, x17"); store128_half(c, in->result, X16, 1);
+        return true;
+    case OP_NOT:
+        for (int h = 0; h < 2; h++) {
+            load128_half(c, X16, in->a, h);
+            E(c, "  mvn x16, x16"); store128_half(c, in->result, X16, h);
+        }
+        return true;
+    case OP_MUL:
+        load128_half(c, X16, in->a, 0); load128_half(c, X17, in->b, 0);
+        E(c, "  mul x16, x16, x17"); store128_half(c, in->result, X16, 0);
+        load128_half(c, X16, in->a, 0); load128_half(c, X17, in->b, 0);
+        E(c, "  umulh x16, x16, x17"); store128_half(c, in->result, X16, 1);
+        for (int h = 0; h < 2; h++) {
+            load128_half(c, X16, in->a, h); load128_half(c, X17, in->b, 1 - h);
+            E(c, "  mul x16, x16, x17");
+            if (!(in->result >= 0 && c->bf->defpos[in->result] == c->bf->endpos[in->result])) {
+                E(c, "  ldr x17, [sp, #%d]", sp128(c, in->result, 1));
+                E(c, "  add x17, x17, x16");
+                E(c, "  str x17, [sp, #%d]", sp128(c, in->result, 1));
+            }
+        }
+        return true;
+    case OP_SHL: case OP_LSHR: case OP_ASHR: {
+        int64_t kc;
+        bool isc = be_iconst_val(f, in->b, &kc) || (in->b >= 0 && f->isconst[in->b]);
+        if (isc) {
+            int k = (int)((in->b >= 0 && f->isconst[in->b] ? (int64_t)f->cval[in->b] : kc) & 127);
+            if (k == 0) { copy_value(c, in->result, in->a); return true; }
+            if (k < 64) {
+                if (in->op == OP_SHL) {
+                    load128_half(c, X16, in->a, 0); load128_half(c, X17, in->a, 1);
+                    E(c, "  lsr x16, x16, #%d", 64 - k); E(c, "  lsl x17, x17, #%d", k);
+                    E(c, "  orr x16, x16, x17"); store128_half(c, in->result, X16, 1);
+                    load128_half(c, X16, in->a, 0); E(c, "  lsl x16, x16, #%d", k);
+                    store128_half(c, in->result, X16, 0);
+                } else {
+                    load128_half(c, X16, in->a, 1); load128_half(c, X17, in->a, 0);
+                    E(c, "  lsl x16, x16, #%d", 64 - k); E(c, "  lsr x17, x17, #%d", k);
+                    E(c, "  orr x16, x16, x17"); store128_half(c, in->result, X16, 0);
+                    load128_half(c, X16, in->a, 1);
+                    E(c, "  %s x16, x16, #%d", in->op == OP_LSHR ? "lsr" : "asr", k);
+                    store128_half(c, in->result, X16, 1);
+                }
+            } else {
+                int k2 = k - 64;
+                if (in->op == OP_SHL) {
+                    load128_half(c, X16, in->a, 0); if (k2) E(c, "  lsl x16, x16, #%d", k2);
+                    store128_half(c, in->result, X16, 1); store128_zero(c, in->result, 0);
+                } else if (in->op == OP_LSHR) {
+                    load128_half(c, X16, in->a, 1); if (k2) E(c, "  lsr x16, x16, #%d", k2);
+                    store128_half(c, in->result, X16, 0); store128_zero(c, in->result, 1);
+                } else {
+                    load128_half(c, X16, in->a, 1); if (k2) E(c, "  asr x16, x16, #%d", k2);
+                    store128_half(c, in->result, X16, 0);
+                    load128_half(c, X16, in->a, 1); E(c, "  asr x16, x16, #63");
+                    store128_half(c, in->result, X16, 1);
+                }
+            }
+            return true;
+        }
+        /* variable amount: x16 = k (mod 128); x0 = 64 - k on the small path */
+        int Lz = ++c->lbl, Lbig = ++c->lbl, Ldone = ++c->lbl;
+        load128_half(c, X16, in->b, 0);
+        E(c, "  and x16, x16, #127");
+        E(c, "  cbz x16, .La%d_%d", c->fi, Lz);
+        E(c, "  cmp x16, #64");
+        E(c, "  b.hs .La%d_%d", c->fi, Lbig);
+        E(c, "  mov x0, #64");
+        E(c, "  sub x0, x0, x16");
+        if (in->op == OP_SHL) {
+            load128_half(c, X17, in->a, 0); E(c, "  lsr x17, x17, x0"); store128_half(c, in->result, X17, 1);
+            load128_half(c, X17, in->a, 1); E(c, "  lsl x17, x17, x16");
+            if (!(in->result >= 0 && c->bf->defpos[in->result] == c->bf->endpos[in->result])) {
+                E(c, "  ldr x0, [sp, #%d]", sp128(c, in->result, 1));
+                E(c, "  orr x17, x17, x0"); E(c, "  str x17, [sp, #%d]", sp128(c, in->result, 1));
+            }
+            load128_half(c, X17, in->a, 0); E(c, "  lsl x17, x17, x16"); store128_half(c, in->result, X17, 0);
+        } else {
+            load128_half(c, X17, in->a, 1); E(c, "  lsl x17, x17, x0"); store128_half(c, in->result, X17, 0);
+            load128_half(c, X17, in->a, 0); E(c, "  lsr x17, x17, x16");
+            if (!(in->result >= 0 && c->bf->defpos[in->result] == c->bf->endpos[in->result])) {
+                E(c, "  ldr x0, [sp, #%d]", sp128(c, in->result, 0));
+                E(c, "  orr x17, x17, x0"); E(c, "  str x17, [sp, #%d]", sp128(c, in->result, 0));
+            }
+            load128_half(c, X17, in->a, 1);
+            E(c, "  %s x17, x17, x16", in->op == OP_LSHR ? "lsr" : "asr");
+            store128_half(c, in->result, X17, 1);
+        }
+        E(c, "  b .La%d_%d", c->fi, Ldone);
+        E(c, ".La%d_%d:", c->fi, Lz);
+        copy_value(c, in->result, in->a);
+        E(c, "  b .La%d_%d", c->fi, Ldone);
+        E(c, ".La%d_%d:", c->fi, Lbig);
+        E(c, "  sub x16, x16, #64");
+        if (in->op == OP_SHL) {
+            load128_half(c, X17, in->a, 0); E(c, "  lsl x17, x17, x16");
+            store128_half(c, in->result, X17, 1); store128_zero(c, in->result, 0);
+        } else if (in->op == OP_LSHR) {
+            load128_half(c, X17, in->a, 1); E(c, "  lsr x17, x17, x16");
+            store128_half(c, in->result, X17, 0); store128_zero(c, in->result, 1);
+        } else {
+            load128_half(c, X17, in->a, 1); E(c, "  asr x17, x17, x16");
+            store128_half(c, in->result, X17, 0);
+            load128_half(c, X17, in->a, 1); E(c, "  asr x17, x17, #63");
+            store128_half(c, in->result, X17, 1);
+        }
+        E(c, ".La%d_%d:", c->fi, Ldone);
+        return true;
+    }
+    case OP_ICMP: {
+        static const char *CCU[10] = { "eq","ne","lo","ls","hi","hs","lo","ls","hi","hs" };
+        static const char *CCS[10] = { "eq","ne","lo","ls","hi","hs","lt","le","gt","ge" };
+        if (in->pred == IC_EQ || in->pred == IC_NE) {
+            load128_half(c, X16, in->a, 0); load128_half(c, X17, in->b, 0);
+            E(c, "  eor x16, x16, x17");
+            load128_half(c, X17, in->a, 1); load128_half(c, 0, in->b, 1);
+            E(c, "  eor x17, x17, x0");
+            E(c, "  orr x16, x16, x17");
+            E(c, "  cmp x16, #0");
+            E(c, "  cset x16, %s", in->pred == IC_EQ ? "eq" : "ne");
+            store_gp(c, in->result, X16);
+            return true;
+        }
+        bool sgn = in->pred >= IC_SLT;
+        int Lhi = ++c->lbl, Ldone = ++c->lbl;
+        load128_half(c, X16, in->a, 1); load128_half(c, X17, in->b, 1);
+        E(c, "  cmp x16, x17");
+        E(c, "  b.ne .La%d_%d", c->fi, Lhi);
+        load128_half(c, X16, in->a, 0); load128_half(c, X17, in->b, 0);
+        E(c, "  cmp x16, x17");
+        E(c, "  cset x16, %s", CCU[in->pred]);
+        E(c, "  b .La%d_%d", c->fi, Ldone);
+        E(c, ".La%d_%d:", c->fi, Lhi);
+        E(c, "  cset x16, %s", sgn ? CCS[in->pred] : CCU[in->pred]);
+        E(c, ".La%d_%d:", c->fi, Ldone);
+        store_gp(c, in->result, X16);
+        return true;
+    }
+    case OP_POPCOUNT: {
+        int tot = 0;
+        (void)tot;
+        for (int h = 0; h < 2; h++) {
+            load128_half(c, X16, in->a, h);
+            E(c, "  fmov d31, x16");
+            E(c, "  cnt v31.8b, v31.8b");
+            E(c, "  addv b31, v31.8b");
+            if (h == 0) { E(c, "  fmov w17, s31"); }
+            else { E(c, "  fmov w16, s31"); E(c, "  add w17, w17, w16"); }
+        }
+        E(c, "  mov x16, x17");
+        store128_half(c, in->result, X16, 0); store128_zero(c, in->result, 1);
+        return true;
+    }
+    case OP_CLZ:
+        load128_half(c, X16, in->a, 1);
+        E(c, "  clz x17, x16");
+        load128_half(c, 0, in->a, 0);
+        E(c, "  clz x0, x0");
+        E(c, "  add x0, x0, #64");
+        E(c, "  cmp x16, #0");
+        E(c, "  csel x17, x17, x0, ne");
+        store128_half(c, in->result, X17, 0); store128_zero(c, in->result, 1);
+        return true;
+    case OP_CTZ:
+        load128_half(c, X16, in->a, 0);
+        E(c, "  rbit x17, x16");
+        E(c, "  clz x17, x17");
+        load128_half(c, 0, in->a, 1);
+        E(c, "  rbit x0, x0");
+        E(c, "  clz x0, x0");
+        E(c, "  add x0, x0, #64");
+        E(c, "  cmp x16, #0");
+        E(c, "  csel x17, x17, x0, ne");
+        store128_half(c, in->result, X17, 0); store128_zero(c, in->result, 1);
+        return true;
+    case OP_BSWAP:
+        load128_half(c, X16, in->a, 0); E(c, "  rev x16, x16");
+        load128_half(c, X17, in->a, 1); E(c, "  rev x17, x17");
+        store128_half(c, in->result, X17, 0); store128_half(c, in->result, X16, 1);
+        return true;
+    case OP_ZEXT:
+        load_gp(c, X16, in->a);
+        store128_half(c, in->result, X16, 0); store128_zero(c, in->result, 1);
+        return true;
+    case OP_SEXT: {
+        Type ta = f->vtypes[in->a];
+        load_gp(c, X16, in->a);
+        sext_reg(c, X16, ta.bits);
+        store128_half(c, in->result, X16, 0);
+        E(c, "  asr x17, x16, #63");
+        store128_half(c, in->result, X17, 1);
+        return true;
+    }
+    case OP_TRUNC:
+        load128_half(c, X16, in->a, 0);
+        mask_reg(c, X16, in->ty);
+        store_gp(c, in->result, X16);
+        return true;
+    case OP_LOAD: case OP_LOADV:
+        load_gp(c, X16, in->a);
+        E(c, "  ldr x17, [x16]"); store128_half(c, in->result, X17, 0);
+        E(c, "  ldr x17, [x16, #8]"); store128_half(c, in->result, X17, 1);
+        return true;
+    case OP_STORE: case OP_STOREV:
+        load_gp(c, X16, in->a);
+        load128_half(c, X17, in->b, 0); E(c, "  str x17, [x16]");
+        load128_half(c, X17, in->b, 1); E(c, "  str x17, [x16, #8]");
+        return true;
+    case OP_RET:
+        if (in->a >= 0) {
+            load128_half(c, 0, in->a, 0);
+            load128_half(c, 1, in->a, 1);
+        }
+        emit_epilogue(c);
+        E(c, "  ret");
+        return true;
+    default: return false;
+    }
+}
+
 static void emit_instr(Ctx *c, int bi, int ii) {
     Func *f = c->f;
     Instr *in = &f->blocks[bi].ins[ii];
     Type t = in->ty;
+    if (ty128(in->ty) || ty128(in->ety) ||
+        (in->a >= 0 && ty128(f->vtypes[in->a])) || (in->b >= 0 && ty128(f->vtypes[in->b])))
+        if (emit_i128(c, in)) return;
     switch (in->op) {
     case OP_ICONST: {
         load_imm64(c, X16, (uint64_t)in->imm);
@@ -554,7 +844,7 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         store_gp(c, in->result, X16);
         break;
     }
-    case OP_LOAD: {
+    case OP_LOAD: case OP_LOADV: {
         load_gp(c, X16, in->a);
         if (t.kind == TY_FLOAT) {
             E(c, "  ldr %c31, [x16]", t.bits == 32 ? 's' : 'd');
@@ -567,7 +857,7 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         }
         break;
     }
-    case OP_STORE: {
+    case OP_STORE: case OP_STOREV: {
         load_gp(c, X16, in->a);
         Type vt = f->vtypes[in->b];
         if (vt.kind == TY_FLOAT) {
@@ -750,6 +1040,10 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         E(c, "  bl %s", name);
         if (t.kind != TY_VOID) {
             if (be_class_of(t) == BCLS_FP) store_fp(c, in->result, 0);
+            else if (be_class_of(t) == BCLS_MEM128) {
+                store128_half(c, in->result, 0, 0);
+                store128_half(c, in->result, 1, 1);
+            }
             else store_gp(c, in->result, 0);
         }
         break;
@@ -763,7 +1057,48 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         E(c, "  b %s", name);
         break;
     }
+    case OP_FUNCP: {
+        if (in->callee_extern) {
+            E(c, "  adrp x16, %s@GOTPAGE", c->m->exts[in->callee].name);
+            E(c, "  ldr x16, [x16, %s@GOTPAGEOFF]", c->m->exts[in->callee].name);
+        } else {
+            E(c, "  adrp x16, %s", c->m->funcs[in->callee].name);
+            E(c, "  add x16, x16, :lo12:%s", c->m->funcs[in->callee].name);
+        }
+        store_gp(c, in->result, X16);
+        break;
+    }
+    case OP_CALLI: {
+        Sig *g = &c->m->sigs[in->callee];
+        emit_call_args(c, in, g->params, false);
+        load_gp(c, X16, in->a);
+        E(c, "  blr x16");
+        if (t.kind != TY_VOID) {
+            if (be_class_of(t) == BCLS_FP) store_fp(c, in->result, 0);
+            else if (be_class_of(t) == BCLS_MEM128) {
+                store128_half(c, in->result, 0, 0);
+                store128_half(c, in->result, 1, 1);
+            }
+            else store_gp(c, in->result, 0);
+        }
+        break;
+    }
+    case OP_TAILCALLI: {
+        /* x17 survives emit_call_args (its scratch is x16) and the
+         * epilogue; park the target there before the setup, which may
+         * overwrite the pointer operand's home */
+        Sig *g = &c->m->sigs[in->callee];
+        load_gp(c, X17, in->a);
+        emit_call_args(c, in, g->params, true);
+        emit_epilogue(c);
+        E(c, "  br x17");
+        break;
+    }
     case OP_ASSUME: break;
+    case OP_FENCE:
+        if (in->aux == AO_ACQUIRE) E(c, "  dmb ishld");
+        else E(c, "  dmb ish");
+        break;
     case OP_BR:
         emit_branch(c, in->blk, in->args, in->nargs);
         break;
@@ -783,6 +1118,47 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         const char *sz = t.bits == 8 ? "b" : t.bits == 16 ? "h" : "";
         char wr = t.bits == 64 ? 'x' : 'w';
         E(c, "  ldadd%s%s %c17, %c0, [x16]", ord, sz, wr, wr);
+        E(c, "  mov x16, x0");
+        mask_reg(c, X16, t);
+        store_gp(c, in->result, X16);
+        break;
+    }
+    case OP_ACMPXCHG: {
+        load_gp(c, X16, in->a);
+        load_gp(c, X17, in->b);   /* expected; cas leaves the old value here */
+        load_gp(c, 0, in->c);     /* desired */
+        const char *ord = in->aux == AO_ACQUIRE ? "a" : in->aux == AO_RELEASE ? "l"
+                        : in->aux == AO_RELAXED ? "" : "al";
+        const char *sz = t.bits == 8 ? "b" : t.bits == 16 ? "h" : "";
+        char wr = t.bits == 64 ? 'x' : 'w';
+        E(c, "  cas%s%s %c17, %c0, [x16]", ord, sz, wr, wr);
+        mask_reg(c, X17, t);
+        store_gp(c, in->result, X17);
+        break;
+    }
+    case OP_AXCHG: case OP_ASUB: case OP_AAND: case OP_AOR: case OP_AXOR:
+    case OP_AMINS: case OP_AMAXS: case OP_AMINU: case OP_AMAXU: {
+        load_gp(c, X16, in->a);
+        load_gp(c, X17, in->b);
+        const char *ord = in->aux == AO_ACQUIRE ? "a" : in->aux == AO_RELEASE ? "l"
+                        : in->aux == AO_RELAXED ? "" : "al";
+        const char *sz = t.bits == 8 ? "b" : t.bits == 16 ? "h" : "";
+        char wr = t.bits == 64 ? 'x' : 'w';
+        const char *nm;
+        switch (in->op) {
+        case OP_AXCHG: nm = "swp"; break;
+        case OP_ASUB:  /* LSE has no ldsub: add the negated operand */
+            E(c, "  neg %c17, %c17", wr, wr); nm = "ldadd"; break;
+        case OP_AAND:  /* ldclr clears the operand's bits: complement it */
+            E(c, "  mvn %c17, %c17", wr, wr); nm = "ldclr"; break;
+        case OP_AOR:   nm = "ldset"; break;
+        case OP_AXOR:  nm = "ldeor"; break;
+        case OP_AMINS: nm = "ldsmin"; break;
+        case OP_AMAXS: nm = "ldsmax"; break;
+        case OP_AMINU: nm = "ldumin"; break;
+        default:       nm = "ldumax"; break;
+        }
+        E(c, "  %s%s%s %c17, %c0, [x16]", nm, ord, sz, wr, wr);
         E(c, "  mov x16, x0");
         mask_reg(c, X16, t);
         store_gp(c, in->result, X16);
@@ -853,6 +1229,7 @@ static int emit_func(Ctx *c, int fi) {
         Loc *fs = malloc(sizeof(Loc) * (size_t)(b0->nargs ? b0->nargs : 1));
         Loc *fd = malloc(sizeof(Loc) * (size_t)(b0->nargs ? b0->nargs : 1));
         int ng = 0, nf = 0, gi = 0, fi2 = 0, stk = 0;
+        int wv[64], wstk[64], nw = 0;
         for (int i = 0; i < b0->nargs; i++) {
             int v = b0->arg_vals[i];
             int cls = be_class_of(b0->arg_types[i]);
@@ -864,6 +1241,11 @@ static int emit_func(Ctx *c, int fi) {
             else if (cls == BCLS_FP && fi2 < 8) { if (!dead) { fs[nf] = (Loc){ 1, BCLS_FP, fi2, 0 }; fd[nf] = dst; nf++; } fi2++; }
             else {
                 Loc src = { 0, (int8_t)cls, -1000 - stk, -(16 + 8 * stk) };
+                if (cls == BCLS_MEM128) {
+                    if (!dead) { wv[nw] = v; wstk[nw] = stk; nw++; }
+                    stk += 2;
+                    continue;
+                }
                 stk++;
                 if (dead) continue;
                 if (cls == BCLS_GP) { gs[ng] = src; gd[ng] = dst; ng++; }
@@ -872,6 +1254,13 @@ static int emit_func(Ctx *c, int fi) {
         }
         parallel_moves(c, gs, gd, ng, BCLS_GP);
         parallel_moves(c, fs, fd, nf, BCLS_FP);
+        /* i128 params arrive as two stack slots; copy both halves home */
+        for (int i = 0; i < nw; i++) {
+            E(c, "  ldr x16, [x29, #%d]", 16 + 8 * wstk[i]);
+            E(c, "  str x16, [sp, #%d]", sp128(c, wv[i], 0));
+            E(c, "  ldr x16, [x29, #%d]", 16 + 8 * wstk[i] + 8);
+            E(c, "  str x16, [sp, #%d]", sp128(c, wv[i], 1));
+        }
         free(gs); free(gd); free(fs); free(fd);
         /* canonical form: narrow integer params are masked in place */
         for (int i = 0; i < b0->nargs; i++) {

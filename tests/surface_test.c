@@ -87,6 +87,27 @@ static const char *PROG =
 "    ret %x\n"
 "}\n"
 "\n"
+"fn vround(ptr, i32) -> i32 {\n"
+"  entry(dst: ptr, val: i32):\n"
+"    storev i32 dst, val\n"
+"    fence.seqcst\n"
+"    %a = loadv i32, dst\n"
+"    %b = loadv i32, dst\n"
+"    %s = add i32 %a, %b\n"
+"    ret %s\n"
+"}\n"
+"\n"
+"fn armw(ptr, i64) -> i64 {\n"
+"  entry(dst: ptr, val: i64):\n"
+"    %o1 = axchg.seqcst i64 dst, val\n"
+"    %o2 = asub.acqrel i64 dst, 5\n"
+"    %cur = sub i64 %o2, 5\n"
+"    %o3 = acmpxchg.seqcst i64 dst, %cur, 9\n"
+"    %o4 = aminu.relaxed i64 dst, 100\n"
+"    %r = add i64 %o3, %o4\n"
+"    ret %r\n"
+"}\n"
+"\n"
 "fn maybe_set(ptr, i32, i1) -> void {\n"
 "  entry(dst: ptr, val: i32, flag: i1):\n"
 "    condbr flag, set(dst, val), skip()\n"
@@ -152,6 +173,21 @@ int main(void) {
         av[0].lanes[0] = base; av[1].lanes[0] = 999; av[2].lanes[0] = 0;
         if (interp_call(it, "maybe_set", av, 3, NULL) != 0) { printf("FAIL maybe_set interp 2\n"); failures++; }
         else if (img[0] != 123) { printf("FAIL maybe_set skip: got %u want 123\n", img[0]); failures++; }
+        /* vround: volatile store then two volatile loads of the same
+         * cell; both loads must observe the stored value (77 + 77) */
+        av[0].lanes[0] = base; av[1].lanes[0] = 77;
+        rv.lanes = lb[0] + 16;
+        if (interp_call(it, "vround", av, 2, &rv) != 0) { printf("FAIL vround interp\n"); failures++; }
+        else if (rv.lanes[0] != 154 || img[0] != 77) { printf("FAIL vround: got %llu cell %u want 154/77\n", (unsigned long long)rv.lanes[0], img[0]); failures++; }
+        /* armw: axchg (old=77, cell=50), asub 5 (old=50, cell=45),
+         * acmpxchg expecting 45 -> 9 (old=45), aminu 100 (old=9, cell=9);
+         * returns 45 + 9 = 54 and leaves 9 in the cell */
+        uint64_t *cell = (uint64_t *)(mem + base + 16);
+        *cell = 77;
+        av[0].lanes[0] = base + 16; av[1].lanes[0] = 50;
+        rv.lanes = lb[0] + 16;
+        if (interp_call(it, "armw", av, 2, &rv) != 0) { printf("FAIL armw interp\n"); failures++; }
+        else if (rv.lanes[0] != 54 || *cell != 9) { printf("FAIL armw: got %llu cell %llu want 54/9\n", (unsigned long long)rv.lanes[0], (unsigned long long)*cell); failures++; }
     }
     interp_free(it);
     /* a condbr to a block that does not exist is a parse error,
@@ -216,8 +252,205 @@ int main(void) {
             mod_free(fm);
         }
     }
-    /* binary round-trip */
+    /* i128 (v3.0): arithmetic with cross-word carries, shifts,
+     * signed/unsigned compares, and a memory round trip, in the
+     * interpreter (backends gate i128 until the lowering step).
+     * The module must encode as format v2, the main PROG as v1. */
+    {
+        static const char *W128 =
+        "fn add128(i128, i128) -> i128 {\n"
+        "  entry(a: i128, b: i128):\n"
+        "    %s = add i128 a, b\n"
+        "    ret %s\n"
+        "}\n"
+        "fn shl128(i128) -> i128 {\n"
+        "  entry(a: i128):\n"
+        "    %s = shl i128 a, 100\n"
+        "    ret %s\n"
+        "}\n"
+        "fn lt128(i128, i128) -> i1 {\n"
+        "  entry(a: i128, b: i128):\n"
+        "    %c = icmp.slt i128 a, b\n"
+        "    ret %c\n"
+        "}\n"
+        "fn mem128(ptr, i128) -> i128 {\n"
+        "  entry(p: ptr, v: i128):\n"
+        "    store i128 p, v\n"
+        "    %l = load i128, p\n"
+        "    %o = add i128 %l, 1\n"
+        "    ret %o\n"
+        "}\n";
+        Module *wm = surface_parse(W128, err, sizeof err);
+        if (!wm) { printf("FAIL w128 parse: %s\n", err); failures++; }
+        else {
+            const char *wve = mod_verify(wm);
+            if (wve) { printf("FAIL w128 verify: %s\n", wve); failures++; }
+            /* target gate: the admitted i128 ops carry cost rows on
+             * every target, so this module verifies everywhere */
+            const char *tg = mod_verify_target(wm, "x86_64");
+            if (tg) { printf("FAIL w128 gate: x86_64 rejected i128: %s\n", tg); failures++; }
+            tg = mod_verify_target(wm, "aarch64");
+            if (tg) { printf("FAIL w128 gate: aarch64 rejected i128: %s\n", tg); failures++; }
+            tg = mod_verify_target(wm, "riscv64");
+            if (tg) { printf("FAIL w128 gate: riscv64 rejected i128: %s\n", tg); failures++; }
+            size_t wl; uint8_t *wb = mod_encode(wm, &wl);
+            if (!wb || wb[4] != 2) { printf("FAIL w128: encoding version is not 2\n"); failures++; }
+            Module *wm2 = wb ? mod_decode(wb, wl, err, sizeof err) : NULL;
+            if (!wm2) { printf("FAIL w128 decode: %s\n", err); failures++; }
+            Interp *wit = interp_new(wm2 ? wm2 : wm);
+            uint64_t ab[2][2], rb[2];
+            IVal av[2], rv; av[0].lanes = ab[0]; av[1].lanes = ab[1]; rv.lanes = rb;
+            /* (2^64-1) + 1 = 2^64: lo 0, hi 1 (carry across the seam) */
+            ab[0][0] = ~0ull; ab[0][1] = 0; ab[1][0] = 1; ab[1][1] = 0; rb[0] = rb[1] = 0;
+            if (interp_call(wit, "add128", av, 2, &rv) != 0 || rb[0] != 0 || rb[1] != 1)
+                { printf("FAIL w128 add carry: got %llx:%llx want 1:0\n", (unsigned long long)rb[1], (unsigned long long)rb[0]); failures++; }
+            /* (2^64-1) * 2 via add of the value to itself: hi 1, lo 2^64-2 */
+            ab[1][0] = ~0ull; ab[1][1] = 0; rb[0] = rb[1] = 0;
+            if (interp_call(wit, "add128", av, 2, &rv) != 0 || rb[0] != ~0ull - 1 || rb[1] != 1)
+                { printf("FAIL w128 add2: got %llx:%llx\n", (unsigned long long)rb[1], (unsigned long long)rb[0]); failures++; }
+            /* 1 << 100 = hi 2^36, lo 0 */
+            ab[0][0] = 1; ab[0][1] = 0; rb[0] = rb[1] = 0;
+            if (interp_call(wit, "shl128", av, 1, &rv) != 0 || rb[0] != 0 || rb[1] != (1ull << 36))
+                { printf("FAIL w128 shl: got %llx:%llx\n", (unsigned long long)rb[1], (unsigned long long)rb[0]); failures++; }
+            /* signed: -1 < 1; the same bits unsigned-compare the other way
+             * is covered by the icmp fold tests in kernels; here slt only */
+            ab[0][0] = ~0ull; ab[0][1] = ~0ull; ab[1][0] = 1; ab[1][1] = 0; rb[0] = 0;
+            if (interp_call(wit, "lt128", av, 2, &rv) != 0 || rb[0] != 1)
+                { printf("FAIL w128 slt: got %llx want 1\n", (unsigned long long)rb[0]); failures++; }
+            /* memory round trip: store (5,7), load, add 1 -> (6,7) */
+            size_t msz; interp_mem(wit, &msz);
+            uint64_t cell = interp_alloc(wit, 16, 16);
+            ab[0][0] = cell; ab[0][1] = 0; ab[1][0] = 5; ab[1][1] = 7; rb[0] = rb[1] = 0;
+            if (interp_call(wit, "mem128", av, 2, &rv) != 0 || rb[0] != 6 || rb[1] != 7)
+                { printf("FAIL w128 mem: got %llx:%llx want 7:6\n", (unsigned long long)rb[1], (unsigned long long)rb[0]); failures++; }
+            interp_free(wit);
+            if (wm2) mod_free(wm2);
+            free(wb);
+            mod_free(wm);
+        }
+    }
+    /* indirect calls (v3.0): a function-pointer table dispatch and a
+     * tail dispatch in the interpreter, signature-mismatch and
+     * not-a-function-pointer detection, and v2 encoding (the module
+     * carries a signature table) */
+    {
+        static const char *VT =
+        "sig bin(i64, i64) -> i64\n"
+        "fn oadd(i64, i64) -> i64 {\n"
+        "  entry(a: i64, b: i64):\n"
+        "    %s = add i64 a, b\n"
+        "    ret %s\n"
+        "}\n"
+        "fn omul(i64, i64) -> i64 {\n"
+        "  entry(a: i64, b: i64):\n"
+        "    %s = mul i64 a, b\n"
+        "    ret %s\n"
+        "}\n"
+        "fn apply(i64, i64, i64) -> i64 {\n"
+        "  entry(sel: i64, x: i64, y: i64):\n"
+        "    %cell = alloca 16, 8\n"
+        "    %p0 = funcptr oadd\n"
+        "    store ptr %cell, %p0\n"
+        "    %s1 = gep ptr %cell, 1\n"
+        "    %p1 = funcptr omul\n"
+        "    store ptr %s1, %p1\n"
+        "    %idx = and i64 sel, 1\n"
+        "    %slot = gep ptr %cell, %idx\n"
+        "    %fp = load ptr, %slot\n"
+        "    %r = calli i64 bin %fp(%x, %y)\n"
+        "    ret %r\n"
+        "}\n"
+        "fn tappy(i64, i64, i64) -> i64 {\n"
+        "  entry(sel: i64, x: i64, y: i64):\n"
+        "    %p0 = funcptr oadd\n"
+        "    %p1 = funcptr omul\n"
+        "    %bit = and i64 sel, 1\n"
+        "    %c = icmp.ne i64 %bit, 0\n"
+        "    %fp = select ptr %c, %p1, %p0\n"
+        "    tailcalli i64 bin %fp(%x, %y)\n"
+        "}\n";
+        Module *vm = surface_parse(VT, err, sizeof err);
+        if (!vm) { printf("FAIL vt parse: %s\n", err); failures++; }
+        else {
+            const char *vve = mod_verify(vm);
+            if (vve) { printf("FAIL vt verify: %s\n", vve); failures++; }
+            size_t vl2; uint8_t *vb = mod_encode(vm, &vl2);
+            if (!vb || vb[4] != 2) { printf("FAIL vt: encoding version is not 2\n"); failures++; }
+            Module *vm2 = vb ? mod_decode(vb, vl2, err, sizeof err) : NULL;
+            if (!vm2) { printf("FAIL vt decode: %s\n", err); failures++; }
+            Interp *vit = interp_new(vm2 ? vm2 : vm);
+            check(vit, "apply", (uint64_t[]){ 0, 5, 10 }, 3, 15);
+            check(vit, "apply", (uint64_t[]){ 1, 5, 10 }, 3, 50);
+            check(vit, "apply", (uint64_t[]){ 3, 6, 7 }, 3, 42);
+            check(vit, "tappy", (uint64_t[]){ 0, 5, 10 }, 3, 15);
+            check(vit, "tappy", (uint64_t[]){ 1, 5, 10 }, 3, 50);
+            interp_free(vit);
+            if (vm2) mod_free(vm2);
+            free(vb);
+            mod_free(vm);
+        }
+        /* mismatch: the pointer target's own signature differs from
+         * the call site's table entry - a producer contract breach
+         * the interpreter must report, not misexecute */
+        static const char *BAD =
+        "sig bin(i64, i64) -> i64\n"
+        "fn oth(i64) -> i64 {\n"
+        "  entry(a: i64):\n"
+        "    ret a\n"
+        "}\n"
+        "fn boom(i64, i64) -> i64 {\n"
+        "  entry(x: i64, y: i64):\n"
+        "    %p = funcptr oth\n"
+        "    %r = calli i64 bin %p(%x, %y)\n"
+        "    ret %r\n"
+        "}\n"
+        "fn boom2(ptr, i64, i64) -> i64 {\n"
+        "  entry(p: ptr, x: i64, y: i64):\n"
+        "    %r = calli i64 bin %p(%x, %y)\n"
+        "    ret %r\n"
+        "}\n";
+        Module *bm = surface_parse(BAD, err, sizeof err);
+        if (!bm) { printf("FAIL bad parse: %s\n", err); failures++; }
+        else {
+            Interp *bit2 = interp_new(bm);
+            uint64_t la[3][256]; IVal av[3], rv; uint64_t rb[256];
+            for (int i = 0; i < 3; i++) av[i].lanes = la[i];
+            rv.lanes = rb;
+            av[0].lanes[0] = 5; av[1].lanes[0] = 6;
+            if (interp_call(bit2, "boom", av, 2, &rv) == 0)
+                { printf("FAIL bad: signature mismatch not detected\n"); failures++; }
+            /* boom2 with a data pointer (not a function address) */
+            size_t msz2; interp_mem(bit2, &msz2);
+            uint64_t cell2 = interp_alloc(bit2, 64, 8);
+            av[0].lanes[0] = cell2; av[1].lanes[0] = 5; av[2].lanes[0] = 6;
+            if (interp_call(bit2, "boom2", av, 3, &rv) == 0)
+                { printf("FAIL bad: non-function pointer not detected\n"); failures++; }
+            interp_free(bit2);
+            mod_free(bm);
+        }
+    }
+    /* i128 division is cliff-gated on every target in v3.0 */
+    {
+        static const char *D128 =
+        "fn div128(i128, i128) -> i128 {\n"
+        "  entry(a: i128, b: i128):\n"
+        "    %q = udiv i128 a, b\n"
+        "    ret %q\n"
+        "}\n";
+        Module *dm = surface_parse(D128, err, sizeof err);
+        if (!dm) { printf("FAIL div128 parse: %s\n", err); failures++; }
+        else {
+            if (mod_verify(dm)) { printf("FAIL div128 structural verify\n"); failures++; }
+            const char *tg = mod_verify_target(dm, "x86_64");
+            if (!tg) { printf("FAIL div128 gate: x86_64 accepted i128 udiv\n"); failures++; }
+            tg = mod_verify_target(dm, "riscv64");
+            if (!tg) { printf("FAIL div128 gate: riscv64 accepted i128 udiv\n"); failures++; }
+            mod_free(dm);
+        }
+    }
+    /* binary round-trip (the main PROG uses no v2 feature: version 1) */
     size_t blen; uint8_t *bytes = mod_encode(m, &blen);
+    if (!bytes || bytes[4] != 1) { printf("FAIL: v1 module encoded as version %d\n", bytes ? bytes[4] : -1); failures++; }
     Module *m2 = mod_decode(bytes, blen, err, sizeof err);
     if (!m2) { printf("FAIL decode: %s\n", err); failures++; }
     else {

@@ -231,13 +231,19 @@ int main(int argc, char **argv) {
         if (fi < 0) { fprintf(stderr, "krellc: no such function\n"); return 1; }
         Func *f = &m->funcs[fi];
         int na = f->blocks[0].nargs;
-        if (argc - 4 < na) { fprintf(stderr, "krellc: function takes %d args\n", na); return 2; }
         IVal av[16]; uint64_t lanes[16][256];
         uint64_t scratch = interp_alloc(it, 1 << 20, 16);
+        int ai = 4;
         for (int i = 0; i < na; i++) {
             av[i].lanes = lanes[i];
             Type pt = f->blocks[0].arg_types[i];
-            av[i].lanes[0] = pt.kind == TY_PTR ? scratch : strtoull(argv[4 + i], NULL, 0);
+            if (ai >= argc) { fprintf(stderr, "krellc: function takes %d args (i128 params take two words, lo then hi)\n", na); return 2; }
+            if (pt.kind == TY_PTR) { av[i].lanes[0] = scratch; ai++; }
+            else if (pt.kind == TY_INT && pt.bits == 128) {
+                av[i].lanes[0] = strtoull(argv[ai++], NULL, 0);
+                if (ai >= argc) { fprintf(stderr, "krellc: i128 param needs two words (lo, hi)\n"); return 2; }
+                av[i].lanes[1] = strtoull(argv[ai++], NULL, 0);
+            } else av[i].lanes[0] = strtoull(argv[ai++], NULL, 0);
         }
         IVal rv; uint64_t rl[256]; rv.lanes = rl;
         int rc = interp_call(it, argv[3], av, na, f->ret.kind == TY_VOID ? NULL : &rv);
@@ -250,6 +256,17 @@ int main(int argc, char **argv) {
             if (f->ret.kind == TY_FLOAT) {
                 if (f->ret.bits == 32) { float fv; uint32_t u = (uint32_t)rv.lanes[0]; memcpy(&fv, &u, 4); printf("%g\n", fv); }
                 else { double dv; memcpy(&dv, &rv.lanes[0], 8); printf("%g\n", dv); }
+            } else if (f->ret.kind == TY_INT && f->ret.bits == 128) {
+                /* decimal rendering of the signed 128-bit result */
+                unsigned __int128 u = ((unsigned __int128)rv.lanes[1] << 64) | rv.lanes[0];
+                bool neg = (rv.lanes[1] >> 63) != 0;
+                if (neg) u = (unsigned __int128)0 - u;
+                char dig[48]; int nd = 0;
+                if (u == 0) dig[nd++] = '0';
+                while (u) { dig[nd++] = (char)('0' + (int)(u % 10)); u /= 10; }
+                if (neg) putchar('-');
+                while (nd) putchar(dig[--nd]);
+                printf(" (0x%llx:%llx)\n", (unsigned long long)rv.lanes[1], (unsigned long long)rv.lanes[0]);
             } else printf("%lld (0x%llx)\n", (long long)rv.lanes[0], (unsigned long long)rv.lanes[0]);
         }
         interp_free(it);

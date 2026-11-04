@@ -46,7 +46,16 @@ typedef struct {
        can be typed before the callee's body has been parsed (forward refs) */
     Type fsig_params[1024][16];
     int fsig_nparams[1024];
+    /* named signature-table entries from `sig` declarations */
+    char signames[256][64];
+    int signidx[256];
+    int nsignames;
 } P;
+static int sig_find(P *p, const char *name) {
+    for (int i = 0; i < p->nsignames; i++)
+        if (strcmp(p->signames[i], name) == 0) return p->signidx[i];
+    return -1;
+}
 
 static void perr(P *p, const char *msg) {
     if (!p->err[0]) snprintf(p->err, sizeof p->err, "surface: %s (near: %.24s)", msg, p->p);
@@ -111,7 +120,7 @@ static bool parse_type(P *p, Type *t) {
     if (strcmp(w, "f64") == 0) { *t = ty_f64(); return true; }
     if (w[0] == 'i' && isdigit((uint8_t)w[1])) {
         int bits = atoi(w + 1);
-        if (bits < 1 || bits > 64) { perr(p, "bad int width"); return false; }
+        if (bits < 1 || bits > 128) { perr(p, "bad int width"); return false; }
         *t = ty_int(bits); return true;
     }
     if (w[0] == 'v') {   /* v<lanes><elem> e.g. v4i32, v2f64 */
@@ -178,6 +187,8 @@ static int parse_order(P *p, const char *w) {
     if (!dot) return AO_RELAXED;
     if (strcmp(dot, ".acqrel") == 0) return AO_ACQREL;
     if (strcmp(dot, ".seqcst") == 0) return AO_SEQCST;
+    if (strcmp(dot, ".acquire") == 0) return AO_ACQUIRE;
+    if (strcmp(dot, ".release") == 0) return AO_RELEASE;
     return AO_RELAXED;
 }
 
@@ -295,6 +306,29 @@ static bool parse_instr(P *p, Func *f, int blk) {
         emit(f, blk, ins_call(ty, ci, ext, args, n, true));
         return true;
     }
+    if (strcmp(w, "tailcalli") == 0) {
+        if (!parse_type(p, &ty)) return false;
+        char sn[64];
+        if (!word(p, sn, sizeof sn)) return false;
+        int si = sig_find(p, sn);
+        if (si < 0) { perr(p, "unknown signature name"); return false; }
+        Sig *g = &p->m->sigs[si];
+        int fp = parse_value(p, f, blk, ty_ptr());
+        if (!eat_ch(p, '(')) { perr(p, "tailcalli ("); return false; }
+        int32_t *args = NULL; int n = 0;
+        skip_ws(p);
+        if (*p->p != ')') {
+            for (;;) {
+                int v = parse_value(p, f, blk, g->params[n < g->nparams ? n : 0]);
+                args = realloc(args, sizeof(int32_t) * (size_t)(n + 1));
+                args[n++] = (int32_t)v;
+                if (!eat_ch(p, ',')) break;
+            }
+        }
+        if (!eat_ch(p, ')')) { perr(p, "tailcalli )"); return false; }
+        emit(f, blk, ins_calli(ty, si, fp, args, n, true));
+        return true;
+    }
     /* everything else makes a value or a statement */
     int op = -1;
     for (int i = 1; i < OP_COUNT; i++) {
@@ -307,7 +341,13 @@ static bool parse_instr(P *p, Func *f, int blk) {
     switch (op) {
     case OP_ICONST:
         if (!parse_type(p, &ty)) return false;
-        result = emit(f, blk, ins_iconst(ty, parse_int(p)));
+        if (ty.kind == TY_INT && ty.bits == 128) {
+            /* i128 surface form: iconst i128 <lo>[, <hi>] (two words) */
+            int64_t lo = parse_int(p);
+            int64_t hi = 0;
+            if (eat_ch(p, ',')) hi = parse_int(p);
+            result = emit(f, blk, ins_iconst128(lo, hi));
+        } else result = emit(f, blk, ins_iconst(ty, parse_int(p)));
         break;
     case OP_FCONST:
         if (!parse_type(p, &ty)) return false;
@@ -407,7 +447,7 @@ static bool parse_instr(P *p, Func *f, int blk) {
         }
         break;
     }
-    case OP_LOAD: case OP_VLOAD: {
+    case OP_LOAD: case OP_VLOAD: case OP_LOADV: {
         if (!parse_type(p, &ty)) return false;
         if (!eat_ch(p, ',')) { perr(p, "load ,"); return false; }
         int a = parse_value(p, f, blk, ty_ptr());
@@ -415,7 +455,7 @@ static bool parse_instr(P *p, Func *f, int blk) {
         result = emit(f, blk, in);
         break;
     }
-    case OP_STORE: case OP_VSTORE: {
+    case OP_STORE: case OP_VSTORE: case OP_STOREV: {
         if (!parse_type(p, &ty)) return false;
         int a = parse_value(p, f, blk, ty_ptr());
         if (!eat_ch(p, ',')) { perr(p, "store ,"); return false; }
@@ -447,6 +487,38 @@ static bool parse_instr(P *p, Func *f, int blk) {
         int64_t idx = parse_int(p);
         Instr in = ins_make(OP_DATAPTR, ty_ptr()); in.imm = idx;
         result = emit(f, blk, in);
+        break;
+    }
+    case OP_FUNCP: {
+        char nm[64];
+        if (!word(p, nm, sizeof nm)) return false;
+        bool ext = false; int ci = mod_find_func(p->m, nm);
+        if (ci < 0) { ci = mod_find_extern(p->m, nm); ext = true; }
+        if (ci < 0) { perr(p, "unknown funcptr target"); return false; }
+        result = emit(f, blk, ins_funcptr(ci, ext));
+        break;
+    }
+    case OP_CALLI: {
+        if (!parse_type(p, &ty)) return false;
+        char sn[64];
+        if (!word(p, sn, sizeof sn)) return false;
+        int si = sig_find(p, sn);
+        if (si < 0) { perr(p, "unknown signature name"); return false; }
+        Sig *g = &p->m->sigs[si];
+        int fp = parse_value(p, f, blk, ty_ptr());
+        if (!eat_ch(p, '(')) { perr(p, "calli ("); return false; }
+        int32_t *args = NULL; int n = 0;
+        skip_ws(p);
+        if (*p->p != ')') {
+            for (;;) {
+                int v = parse_value(p, f, blk, g->params[n < g->nparams ? n : 0]);
+                args = realloc(args, sizeof(int32_t) * (size_t)(n + 1));
+                args[n++] = (int32_t)v;
+                if (!eat_ch(p, ',')) break;
+            }
+        }
+        if (!eat_ch(p, ')')) { perr(p, "calli )"); return false; }
+        result = emit(f, blk, ins_calli(ty, si, fp, args, n, false));
         break;
     }
     case OP_CALL: {
@@ -485,13 +557,19 @@ static bool parse_instr(P *p, Func *f, int blk) {
         result = -1;
         break;
     }
-    case OP_ALOAD: case OP_AADD: {
+    case OP_ALOAD: case OP_AADD: case OP_AXCHG: case OP_ASUB: case OP_AAND:
+    case OP_AOR: case OP_AXOR: case OP_AMINS: case OP_AMAXS: case OP_AMINU:
+    case OP_AMAXU: case OP_ACMPXCHG: {
         if (!parse_type(p, &ty)) return false;
         int a = parse_value(p, f, blk, ty_ptr());
         Instr in = ins_make((uint8_t)op, ty); in.a = a; in.aux = (uint8_t)parse_order(p, w);
-        if (op == OP_AADD) {
+        if (op != OP_ALOAD) {
             if (!eat_ch(p, ',')) return false;
             in.b = parse_value(p, f, blk, ty);
+        }
+        if (op == OP_ACMPXCHG) {
+            if (!eat_ch(p, ',')) return false;
+            in.c = parse_value(p, f, blk, ty);
         }
         result = emit(f, blk, in);
         break;
@@ -502,6 +580,12 @@ static bool parse_instr(P *p, Func *f, int blk) {
         if (!eat_ch(p, ',')) return false;
         int b = parse_value(p, f, blk, ty);
         Instr in = ins_make(OP_ASTORE, ty); in.a = a; in.b = b; in.aux = (uint8_t)parse_order(p, w);
+        emit(f, blk, in);
+        result = -1;
+        break;
+    }
+    case OP_FENCE: {
+        Instr in = ins_make(OP_FENCE, ty_void()); in.aux = (uint8_t)parse_order(p, w);
         emit(f, blk, in);
         result = -1;
         break;
@@ -716,7 +800,31 @@ Module *surface_parse(const char *text, char *err, size_t errcap) {
     for (;;) {
         skip_ws(p);
         if (!*p->p) break;
-        if (eat(p, "fn")) { if (!parse_fn_header(p)) goto fail; }
+        if (eat(p, "sig")) {
+            char name[64];
+            if (!word(p, name, sizeof name)) { perr(p, "sig name"); goto fail; }
+            if (!eat_ch(p, '(')) { perr(p, "sig ("); goto fail; }
+            Type pt[16]; int np = 0;
+            skip_ws(p);
+            if (*p->p != ')') {
+                for (;;) {
+                    if (np >= 16) { perr(p, "sig params"); goto fail; }
+                    if (!parse_type(p, &pt[np])) goto fail;
+                    np++;
+                    if (!eat_ch(p, ',')) break;
+                }
+            }
+            if (!eat_ch(p, ')')) { perr(p, "sig )"); goto fail; }
+            Type rt = ty_void();
+            if (eat(p, "->")) { if (!parse_type(p, &rt)) goto fail; }
+            int si = mod_add_sig(p->m, pt, np, rt);
+            if (p->nsignames < 256) {
+                snprintf(p->signames[p->nsignames], 64, "%s", name);
+                p->signidx[p->nsignames] = si;
+                p->nsignames++;
+            }
+        }
+        else if (eat(p, "fn")) { if (!parse_fn_header(p)) goto fail; }
         else if (eat(p, "data")) {
             char name[64];
             if (!word(p, name, sizeof name)) { perr(p, "data name"); goto fail; }

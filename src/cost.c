@@ -7,10 +7,10 @@
 struct Cost {
     char target[64];
     int  vl_i32;
-    /* per-op rows per class: 0 int, 1 float, 2 vec */
-    int  lat[OP_COUNT][3];
-    int  thr[OP_COUNT][3];
-    int  cliff[OP_COUNT][3];
+    /* per-op rows per class: 0 int, 1 float, 2 vec, 3 i128 (v3.0) */
+    int  lat[OP_COUNT][4];
+    int  thr[OP_COUNT][4];
+    int  cliff[OP_COUNT][4];
     char fnname[COST_MAXFN][32];
     int  fncost[COST_MAXFN];
     int  nfn;
@@ -19,6 +19,7 @@ struct Cost {
 static int cls_of(Type t) {
     if (t.kind == TY_VEC) return 2;
     if (t.kind == TY_FLOAT) return 1;
+    if (t.kind == TY_INT && t.bits == 128) return 3;
     return 0;
 }
 
@@ -42,7 +43,7 @@ Cost *cost_load(const char *target) {
     snprintf(c->target, sizeof c->target, "%s", target);
     c->vl_i32 = 4;
     for (int i = 0; i < OP_COUNT; i++)
-        for (int j = 0; j < 3; j++) { c->lat[i][j] = -1; c->thr[i][j] = -1; }
+        for (int j = 0; j < 4; j++) { c->lat[i][j] = -1; c->thr[i][j] = -1; }
     char line[256];
     while (fgets(line, sizeof line, fp)) {
         char w1[64], w2[64];
@@ -54,7 +55,8 @@ Cost *cost_load(const char *target) {
                 if (op_name(i) && strcmp(op_name(i), w1) == 0) { op = i; break; }
             if (op < 0) continue;
             int cls = 0;
-            if (w2[0] == 'f') cls = 1; else if (w2[0] == 'v') cls = 2; else cls = 0;
+            if (strcmp(w2, "i128") == 0) cls = 3;
+            else if (w2[0] == 'f') cls = 1; else if (w2[0] == 'v') cls = 2; else cls = 0;
             int lat = -2, thr = -2, cliff = -1;
             char *p;
             if ((p = strstr(line, "lat "))) lat = atoi(p + 4);

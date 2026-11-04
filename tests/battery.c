@@ -12,6 +12,10 @@
 
 Module *build_battery(void) {
     Module *m = mod_new();
+    /* externs exercised by the alchk functions: the driver provides
+     * probes that report the AL value they were called with */
+    mod_add_extern(m, "alprobe", (Type[]){ ty_f64() }, 1, ty_i64());
+    mod_add_extern(m, "alprobe2", (Type[]){ ty_f64(), ty_f64() }, 2, ty_i64());
     static const uint32_t tab[4] = { 11, 22, 33, 44 };
     mod_add_data(m, "tab", 4, tab, sizeof tab);
 
@@ -300,7 +304,122 @@ Module *build_battery(void) {
         int r = B(f, b, OP_MUL, ty_i64(), old, K(f, b, ty_i64(), 1000));
         emit(f, b, ins_ret(B(f, b, OP_ADD, ty_i64(), r, cur)));
     }
-    /* 22 vecadd(ptr dst, ptr src) */
+    /* 22 rmw(ptr p, i64 v) -> i64 : the v3 RMW family + cmpxchg over one
+     * cell. Every op returns the old value; fold them together and finish
+     * with the final cell contents (memory is compared too, via the B-case
+     * image). The first cmpxchg must succeed (expected = current cell),
+     * the second must fail unless the cell coincidentally holds 42. */
+    {
+        Func *f = mod_add_func(m, "rmw", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_ptr(), ty_i64() }, 2);
+        int p = ARG(f, b, 0), v = ARG(f, b, 1);
+        #define RMW1(op, operand) ({ Instr _i = ins_make((op), ty_i64()); _i.a = p; _i.b = (operand); _i.aux = AO_SEQCST; emit(f, b, _i); })
+        int o1 = RMW1(OP_AXCHG, v);
+        int o2 = RMW1(OP_ASUB, K(f, b, ty_i64(), 5));
+        int o3 = RMW1(OP_AAND, v);
+        int o4 = RMW1(OP_AOR, K(f, b, ty_i64(), 0x5a5a));
+        int o5 = RMW1(OP_AXOR, v);
+        int o6 = RMW1(OP_AMINS, K(f, b, ty_i64(), -3));
+        int o7 = RMW1(OP_AMAXS, K(f, b, ty_i64(), 17));
+        int o8 = RMW1(OP_AMINU, K(f, b, ty_i64(), 1000));
+        int o9 = RMW1(OP_AMAXU, K(f, b, ty_i64(), 3));
+        #undef RMW1
+        Instr al = ins_make(OP_ALOAD, ty_i64()); al.a = p; al.aux = AO_SEQCST;
+        int cur = emit(f, b, al);
+        Instr cx = ins_make(OP_ACMPXCHG, ty_i64()); cx.a = p; cx.b = cur; cx.c = K(f, b, ty_i64(), 42); cx.aux = AO_SEQCST;
+        int oc = emit(f, b, cx);
+        Instr cx2 = ins_make(OP_ACMPXCHG, ty_i64()); cx2.a = p; cx2.b = cur; cx2.c = K(f, b, ty_i64(), 43); cx2.aux = AO_ACQREL;
+        int oc2 = emit(f, b, cx2);
+        Instr al2 = ins_make(OP_ALOAD, ty_i64()); al2.a = p; al2.aux = AO_RELAXED;
+        int fin = emit(f, b, al2);
+        int olds[11] = { o1, o2, o3, o4, o5, o6, o7, o8, o9, oc, oc2 };
+        int r = fin;
+        for (int i = 0; i < 11; i++)
+            r = B(f, b, OP_ADD, ty_i64(), B(f, b, OP_MUL, ty_i64(), r, K(f, b, ty_i64(), 31)), olds[i]);
+        emit(f, b, ins_ret(r));
+    }
+    /* 23 rmw32(ptr p, i32 v) -> i32 : the 32-bit forms */
+    {
+        Func *f = mod_add_func(m, "rmw32", ty_i32(), 0);
+        int b = func_add_block(f, (Type[]){ ty_ptr(), ty_i32() }, 2);
+        int p = ARG(f, b, 0), v = ARG(f, b, 1);
+        #define RMW32(op, operand) ({ Instr _i = ins_make((op), ty_i32()); _i.a = p; _i.b = (operand); _i.aux = AO_SEQCST; emit(f, b, _i); })
+        int o1 = RMW32(OP_AXCHG, v);
+        int o2 = RMW32(OP_ASUB, K(f, b, ty_i32(), 100000));
+        int o3 = RMW32(OP_AMINS, K(f, b, ty_i32(), -7));
+        int o4 = RMW32(OP_AMAXU, K(f, b, ty_i32(), 65536));
+        #undef RMW32
+        Instr al = ins_make(OP_ALOAD, ty_i32()); al.a = p; al.aux = AO_SEQCST;
+        int cur = emit(f, b, al);
+        Instr cx = ins_make(OP_ACMPXCHG, ty_i32()); cx.a = p; cx.b = cur; cx.c = K(f, b, ty_i32(), -1); cx.aux = AO_SEQCST;
+        int oc = emit(f, b, cx);
+        int olds[5] = { o1, o2, o3, o4, oc };
+        int r = cur;
+        for (int i = 0; i < 5; i++)
+            r = B(f, b, OP_ADD, ty_i32(), B(f, b, OP_MUL, ty_i32(), r, K(f, b, ty_i32(), 31)), olds[i]);
+        emit(f, b, ins_ret(r));
+    }
+    /* 24 rmw8(ptr p, i64 v) -> i64 : the 8-bit (sub-word) forms */
+    {
+        Func *f = mod_add_func(m, "rmw8", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_ptr(), ty_i64() }, 2);
+        int p = ARG(f, b, 0), v = ARG(f, b, 1);
+        int v8 = U(f, b, OP_TRUNC, ty_i8(), v);
+        #define RMW8(op, operand) ({ Instr _i = ins_make((op), ty_i8()); _i.a = p; _i.b = (operand); _i.aux = AO_SEQCST; emit(f, b, _i); })
+        int o1 = RMW8(OP_AXCHG, v8);
+        int o2 = RMW8(OP_ASUB, K(f, b, ty_i8(), 3));
+        int o3 = RMW8(OP_AAND, v8);
+        int o4 = RMW8(OP_AMAXS, K(f, b, ty_i8(), -2));
+        #undef RMW8
+        Instr al = ins_make(OP_ALOAD, ty_i8()); al.a = p; al.aux = AO_SEQCST;
+        int cur = emit(f, b, al);
+        Instr cx = ins_make(OP_ACMPXCHG, ty_i8()); cx.a = p; cx.b = cur; cx.c = K(f, b, ty_i8(), 0x55); cx.aux = AO_SEQCST;
+        int oc = emit(f, b, cx);
+        int olds[5] = { o1, o2, o3, o4, oc };
+        int r = U(f, b, OP_ZEXT, ty_i64(), cur);
+        for (int i = 0; i < 5; i++) {
+            int z = U(f, b, OP_ZEXT, ty_i64(), olds[i]);
+            r = B(f, b, OP_ADD, ty_i64(), B(f, b, OP_MUL, ty_i64(), r, K(f, b, ty_i64(), 31)), z);
+        }
+        emit(f, b, ins_ret(r));
+    }
+    /* 26 w128(i64 a, i64 b) -> i64 : i128 arithmetic end to end -
+     * zext, shl into the high word, add (carry), mul by 3, lshr,
+     * icmp, popcount, and an alloca store/load round trip - folded
+     * into an i64 checksum the driver can compare */
+    {
+        Func *f = mod_add_func(m, "w128", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_i64(), ty_i64() }, 2);
+        int a = ARG(f, b, 0), bb = ARG(f, b, 1);
+        Type W = ty_i128();
+        int x = U(f, b, OP_ZEXT, W, a);
+        int y = U(f, b, OP_ZEXT, W, bb);
+        y = B(f, b, OP_SHL, W, y, K(f, b, W, 64));
+        int v = B(f, b, OP_ADD, W, x, y);
+        int w = B(f, b, OP_MUL, W, v, K(f, b, W, 3));
+        int sh = B(f, b, OP_LSHR, W, w, K(f, b, W, 37));
+        int pc = U(f, b, OP_POPCOUNT, W, sh);
+        Instr cmp = ins_make(OP_ICMP, ty_i1()); cmp.a = sh; cmp.b = K(f, b, W, 1000); cmp.pred = IC_UGT;
+        int gt = emit(f, b, cmp);
+        int g1 = U(f, b, OP_ZEXT, ty_i64(), gt);
+        Instr al = ins_make(OP_ALLOCA, ty_ptr()); al.imm = 16; al.c = 16;
+        int cell = emit(f, b, al);
+        Instr st = ins_make(OP_STORE, W); st.a = cell; st.b = v;
+        emit(f, b, st);
+        Instr ld = ins_make(OP_LOAD, W); ld.a = cell;
+        int back = emit(f, b, ld);
+        back = B(f, b, OP_ADD, W, back, K(f, b, W, 1));
+        int lo = U(f, b, OP_TRUNC, ty_i64(), sh);
+        int hi = U(f, b, OP_TRUNC, ty_i64(), B(f, b, OP_LSHR, W, sh, K(f, b, W, 64)));
+        int mlo = U(f, b, OP_TRUNC, ty_i64(), back);
+        int pclo = U(f, b, OP_TRUNC, ty_i64(), pc);
+        int r = B(f, b, OP_ADD, ty_i64(), B(f, b, OP_MUL, ty_i64(), lo, K(f, b, ty_i64(), 31)), hi);
+        r = B(f, b, OP_ADD, ty_i64(), B(f, b, OP_MUL, ty_i64(), r, K(f, b, ty_i64(), 31)), mlo);
+        r = B(f, b, OP_ADD, ty_i64(), B(f, b, OP_MUL, ty_i64(), r, K(f, b, ty_i64(), 31)), pclo);
+        r = B(f, b, OP_ADD, ty_i64(), r, g1);
+        emit(f, b, ins_ret(r));
+    }
+    /* 25 vecadd(ptr dst, ptr src) */
     {
         Func *f = mod_add_func(m, "vecadd", ty_void(), 0);
         int b = func_add_block(f, (Type[]){ ty_ptr(), ty_ptr() }, 2);
@@ -443,6 +562,75 @@ Module *build_battery(void) {
         int r = mid;
         for (int i = 0; i < 16; i++) r = B(f, b, OP_ADD, ty_i64(), r, vs[i]);
         emit(f, b, ins_ret(r));
+    }
+    /* 34 tadd/tmul: indirect-call targets (no driver cases of their own) */
+    {
+        Func *f = mod_add_func(m, "tadd", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_i64(), ty_i64() }, 2);
+        emit(f, b, ins_ret(B(f, b, OP_ADD, ty_i64(), ARG(f, b, 0), ARG(f, b, 1))));
+    }
+    {
+        Func *f = mod_add_func(m, "tmul", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_i64(), ty_i64() }, 2);
+        emit(f, b, ins_ret(B(f, b, OP_MUL, ty_i64(), ARG(f, b, 0), ARG(f, b, 1))));
+    }
+    /* 35 vtable(i64 sel, i64 x) -> i64 : a two-entry function-pointer
+     * table in an alloca, indexed, loaded, and called indirectly */
+    {
+        int sg = mod_add_sig(m, (Type[]){ ty_i64(), ty_i64() }, 2, ty_i64());
+        Func *f = mod_add_func(m, "vtable", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_i64(), ty_i64() }, 2);
+        int sel = ARG(f, b, 0), x = ARG(f, b, 1);
+        Instr al = ins_make(OP_ALLOCA, ty_ptr()); al.imm = 16; al.c = 8;
+        int cell = emit(f, b, al);
+        int pa = emit(f, b, ins_funcptr(mod_find_func(m, "tadd"), false));
+        Instr st0 = ins_make(OP_STORE, ty_ptr()); st0.a = cell; st0.b = pa;
+        emit(f, b, st0);
+        Instr g1 = ins_make(OP_GEP, ty_ptr()); g1.a = cell; g1.b = K(f, b, ty_i64(), 1); g1.ety = ty_ptr();
+        int slot1 = emit(f, b, g1);
+        int pb = emit(f, b, ins_funcptr(mod_find_func(m, "tmul"), false));
+        Instr st1 = ins_make(OP_STORE, ty_ptr()); st1.a = slot1; st1.b = pb;
+        emit(f, b, st1);
+        int idx = B(f, b, OP_AND, ty_i64(), sel, K(f, b, ty_i64(), 1));
+        Instr gs = ins_make(OP_GEP, ty_ptr()); gs.a = cell; gs.b = idx; gs.ety = ty_ptr();
+        int slot = emit(f, b, gs);
+        Instr ld = ins_make(OP_LOAD, ty_ptr()); ld.a = slot;
+        int fp = emit(f, b, ld);
+        int r = emit(f, b, ins_calli(ty_i64(), sg, fp, ids_dup((int32_t[]){ x, K(f, b, ty_i64(), 10) }, 2), 2, false));
+        emit(f, b, ins_ret(r));
+    }
+    /* 36 vtail(i64 sel, i64 x) -> i64 : funcptr chosen by select,
+     * dispatched with an indirect tail call */
+    {
+        int sg = mod_add_sig(m, (Type[]){ ty_i64(), ty_i64() }, 2, ty_i64());
+        Func *f = mod_add_func(m, "vtail", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_i64(), ty_i64() }, 2);
+        int sel = ARG(f, b, 0), x = ARG(f, b, 1);
+        int pa = emit(f, b, ins_funcptr(mod_find_func(m, "tadd"), false));
+        int pb = emit(f, b, ins_funcptr(mod_find_func(m, "tmul"), false));
+        int bit = B(f, b, OP_AND, ty_i64(), sel, K(f, b, ty_i64(), 1));
+        Instr sc = ins_make(OP_ICMP, ty_i1()); sc.a = bit; sc.b = K(f, b, ty_i64(), 0); sc.pred = IC_NE;
+        int cond = emit(f, b, sc);
+        Instr sl = ins_make(OP_SELECT, ty_ptr()); sl.a = cond; sl.b = pb; sl.c = pa;
+        int fp = emit(f, b, sl);
+        emit(f, b, ins_calli(ty_i64(), sg, fp, ids_dup((int32_t[]){ x, K(f, b, ty_i64(), 7) }, 2), 2, true));
+    }
+    /* 37 alchk / alchk1: extern calls with FP arguments - on x86_64
+     * the caller must set AL to the number of FP registers used by
+     * the fixed signature; the probes return what they observed */
+    {
+        Func *f = mod_add_func(m, "alchk", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_f64(), ty_f64() }, 2);
+        emit(f, b, ins_ret(emit(f, b, ins_call(ty_i64(),
+            mod_find_extern(m, "alprobe2"), true,
+            ids_dup((int32_t[]){ ARG(f, b, 0), ARG(f, b, 1) }, 2), 2, false))));
+    }
+    {
+        Func *f = mod_add_func(m, "alchk1", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_f64() }, 1);
+        emit(f, b, ins_ret(emit(f, b, ins_call(ty_i64(),
+            mod_find_extern(m, "alprobe"), true,
+            ids_dup((int32_t[]){ ARG(f, b, 0) }, 1), 1, false))));
     }
     return m;
 }

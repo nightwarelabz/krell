@@ -6,7 +6,9 @@ void be_err(char *err, size_t cap, const char *msg) { if (err) snprintf(err, cap
 
 int be_class_of(Type t) {
     switch (t.kind) {
-    case TY_INT: case TY_PTR: return BCLS_GP;
+    case TY_INT: if (t.bits == 128) return BCLS_MEM128; /* memory-resident */
+             /* fall through */
+    case TY_PTR: return BCLS_GP;
     case TY_FLOAT: return BCLS_FP;
     case TY_VEC: return t.n == 1 ? BCLS_FP : BCLS_VEC;
     default: return -1;
@@ -169,7 +171,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
             Instr *in = &bl->ins[i];
             int p = be_pos(bf, b, i);
             if (in->result >= 0) { bf->defpos[in->result] = p; bf->endpos[in->result] = p; }
-            if (in->op == OP_CALL || in->op == OP_FMA || in->op == OP_MEMCPY || in->op == OP_MEMSET) {
+            if (in->op == OP_CALL || in->op == OP_CALLI || in->op == OP_FMA || in->op == OP_MEMCPY || in->op == OP_MEMSET) {
                 /* FMA/memcpy/memset lower to libcalls on some targets: any
                  * value live across them must survive a call */
                 if (ncall == callcap) { callcap = callcap ? callcap * 2 : 16; callpos = realloc(callpos, sizeof(int) * (size_t)callcap); }
@@ -276,7 +278,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
     for (int b = 0; b < f->nblocks; b++)
         for (int i = 0; i < f->blocks[b].nins; i++) {
             Instr *in = &f->blocks[b].ins[i];
-            if ((in->op == OP_CALL || in->op == OP_TAILCALL) && in->nargs > out_slots) out_slots = in->nargs;
+            if ((in->op == OP_CALL || in->op == OP_TAILCALL || in->op == OP_CALLI || in->op == OP_TAILCALLI) && in->nargs > out_slots) out_slots = in->nargs;
         }
     /* layout intent: allocation below decides slot indices; offsets computed
      * after allocation once we know how many slots are actually used. To keep
@@ -481,7 +483,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
                 Instr *dd = defins[iv->v];
                 if (pv >= 0 && pv != iv->v &&
                     bf->vclass[pv] == cls && bf->loc[pv].is_reg && bf->loc[pv].cls == cls &&
-                    dd->op != OP_CALL && dd->op != OP_TAILCALL && dd->op != OP_FMA &&
+                    dd->op != OP_CALL && dd->op != OP_TAILCALL && dd->op != OP_CALLI && dd->op != OP_TAILCALLI && dd->op != OP_FMA &&
                     dd->op != OP_MEMCPY && dd->op != OP_MEMSET && dd->op != OP_ALLOCA) {
                     Block *sb = &f->blocks[defblk[iv->v]];
                     Instr *term = &sb->ins[sb->nins - 1];
@@ -674,6 +676,14 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
                     unit += f->vtypes[v].n;
                 }
             }
+        /* i128 values (v3.0): always memory-resident, one 16-byte unit
+         * each in the same area; emitters compute on the (lo, hi) pair
+         * through scratch registers. */
+        for (int v = 0; v < f->nvalues; v++)
+            if (bf->vclass[v] == BCLS_MEM128 && bf->loc[v].idx < 0) {
+                bf->loc[v].is_reg = 0; bf->loc[v].cls = BCLS_MEM128; bf->loc[v].idx = unit;
+                unit += 1;
+            }
         bf->nalloca = unit; /* temporarily stash unit count; fixed below */
     }
     /* Assign scalar slot indices uniquely (allocator used per-class counters;
@@ -731,7 +741,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
         for (int b = 0; b < f->nblocks; b++)
             for (int i = 0; i < f->blocks[b].nins; i++) {
                 Instr *in = &f->blocks[b].ins[i];
-                if ((in->op == OP_CALL || in->op == OP_TAILCALL) && in->nargs * 8 > outb) outb = in->nargs * 8;
+                if ((in->op == OP_CALL || in->op == OP_TAILCALL || in->op == OP_CALLI || in->op == OP_TAILCALLI) && in->nargs * 8 > outb) outb = in->nargs * 8;
             }
         int frame = slot_base + total_scalar_slots * 8 + vec_unit_total * 16 + alloca_bytes + outb;
         frame = (frame + 15) & ~15;
@@ -742,7 +752,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
         int vec_base = slot_base + total_scalar_slots * 8;
         int allo_base = vec_base + vec_unit_total * 16;
         for (int v = 0; v < f->nvalues; v++) {
-            if (bf->loc[v].cls == BCLS_VEC && !bf->loc[v].is_reg) {
+            if ((bf->loc[v].cls == BCLS_VEC || bf->loc[v].cls == BCLS_MEM128) && !bf->loc[v].is_reg) {
                 bf->vec_off[v] = vec_base + bf->loc[v].idx * 16;
                 bf->loc[v].off = bf->vec_off[v];
             } else if (bf->vclass[v] >= 0 && !bf->loc[v].is_reg) {

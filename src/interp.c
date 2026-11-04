@@ -21,6 +21,7 @@ struct Interp {
 };
 
 int ty_lanes(Type t, int vl_i32) {
+    if (t.kind == TY_INT && t.bits == 128) return 2;   /* i128 scalar: (lo, hi) lanes */
     if (t.kind != TY_VEC) return 1;
     int per = (vl_i32 * 32) / t.elem_bits;   /* lanes per vscale unit */
     return per * t.n;
@@ -75,6 +76,39 @@ static int ierr(Interp *it, const char *msg) { snprintf(it->err, sizeof it->err,
 
 /* ---------- scalar helpers ---------- */
 static uint64_t msk(int bits) { return bits >= 64 ? ~0ull : ((1ull << bits) - 1ull); }
+static unsigned __int128 val128(const uint64_t *L) { return ((unsigned __int128)L[1] << 64) | (unsigned __int128)L[0]; }
+
+/* indirect calls (v3.0): funcptr materializes a synthetic code
+ * address - internal functions at 0xF0000000 + 16*idx, externs at
+ * 0xF1000000 + 16*idx, disjoint from the flat data memory. A calli
+ * decodes the address back to a target, then checks the target's own
+ * signature against the call site's signature-table entry: a
+ * mismatch is a producer contract breach and is reported, as is a
+ * call through anything that is not a function address at all. */
+#define SYNTH_FN_BASE 0xF0000000ull
+#define SYNTH_EX_BASE 0xF1000000ull
+static const char *resolve_calli(Interp *it, uint64_t addr, int sigidx, int *callee, bool *ext) {
+    Module *m = it->m;
+    int idx; bool isext;
+    if (addr >= SYNTH_FN_BASE && addr < SYNTH_EX_BASE && ((addr - SYNTH_FN_BASE) & 15) == 0) {
+        idx = (int)((addr - SYNTH_FN_BASE) / 16); isext = false;
+        if (idx >= m->nfuncs) return "interp: calli target is not a function pointer";
+    } else if (addr >= SYNTH_EX_BASE && addr < SYNTH_EX_BASE + 0x100000 && ((addr - SYNTH_EX_BASE) & 15) == 0) {
+        idx = (int)((addr - SYNTH_EX_BASE) / 16); isext = true;
+        if (idx >= m->nexts) return "interp: calli target is not a function pointer";
+    } else return "interp: calli target is not a function pointer";
+    if (sigidx < 0 || sigidx >= m->nsigs) return "interp: calli signature index out of range";
+    Sig *g = &m->sigs[sigidx];
+    const Type *ps; int np; Type rt;
+    if (isext) { ps = m->exts[idx].params; np = m->exts[idx].nparams; rt = m->exts[idx].ret; }
+    else { Func *tg = &m->funcs[idx]; ps = tg->blocks[0].arg_types; np = tg->blocks[0].nargs; rt = tg->ret; }
+    if (np != g->nparams || !ty_eq(rt, g->ret)) return "interp: calli signature mismatch (producer contract breach)";
+    for (int i = 0; i < np; i++)
+        if (!ty_eq(ps[i], g->params[i])) return "interp: calli signature mismatch (producer contract breach)";
+    *callee = idx; *ext = isext;
+    return NULL;
+}
+static void put128(uint64_t *L, unsigned __int128 v) { L[0] = (uint64_t)v; L[1] = (uint64_t)(v >> 64); }
 static int64_t sx(uint64_t v, int bits) {
     if (bits >= 64) return (int64_t)v;
     uint64_t m = 1ull << (bits - 1);
@@ -157,21 +191,33 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
         uint64_t *C = in->c >= 0 ? fr->lanes[in->c] : NULL;
         Type ta = in->a >= 0 ? f->vtypes[in->a] : ty_void();
         switch (op) {
-        case OP_ICONST: R[0] = (uint64_t)in->imm & msk(in->ty.bits); break;
+        case OP_ICONST: R[0] = (uint64_t)in->imm & msk(in->ty.bits); if (in->ty.bits == 128) R[1] = (uint64_t)in->imm2; break;
         case OP_FCONST: R[0] = (uint64_t)in->imm; break;
         case OP_FREEZE: val_copy(f, fr, in->result, in->a); break;
-        case OP_ADD: R[0] = (A[0] + B[0]) & msk(in->ty.bits); break;
-        case OP_SUB: R[0] = (A[0] - B[0]) & msk(in->ty.bits); break;
-        case OP_MUL: R[0] = (A[0] * B[0]) & msk(in->ty.bits); break;
-        case OP_NEG: R[0] = (0 - A[0]) & msk(in->ty.bits); break;
-        case OP_AND: R[0] = A[0] & B[0]; break;
-        case OP_OR:  R[0] = A[0] | B[0]; break;
-        case OP_XOR: R[0] = A[0] ^ B[0]; break;
-        case OP_NOT: R[0] = ~A[0] & msk(in->ty.bits); break;
-        case OP_UDIV: R[0] = B[0] ? (A[0] / B[0]) & msk(in->ty.bits) : 0; break;
-        case OP_UREM: R[0] = B[0] ? (A[0] % B[0]) & msk(in->ty.bits) : 0; break;
+        case OP_ADD: if (in->ty.bits == 128) put128(R, val128(A) + val128(B)); else R[0] = (A[0] + B[0]) & msk(in->ty.bits); break;
+        case OP_SUB: if (in->ty.bits == 128) put128(R, val128(A) - val128(B)); else R[0] = (A[0] - B[0]) & msk(in->ty.bits); break;
+        case OP_MUL: if (in->ty.bits == 128) put128(R, val128(A) * val128(B)); else R[0] = (A[0] * B[0]) & msk(in->ty.bits); break;
+        case OP_NEG: if (in->ty.bits == 128) put128(R, (unsigned __int128)0 - val128(A)); else R[0] = (0 - A[0]) & msk(in->ty.bits); break;
+        case OP_AND: R[0] = A[0] & B[0]; if (in->ty.bits == 128) R[1] = A[1] & B[1]; break;
+        case OP_OR:  R[0] = A[0] | B[0]; if (in->ty.bits == 128) R[1] = A[1] | B[1]; break;
+        case OP_XOR: R[0] = A[0] ^ B[0]; if (in->ty.bits == 128) R[1] = A[1] ^ B[1]; break;
+        case OP_NOT: R[0] = ~A[0] & msk(in->ty.bits); if (in->ty.bits == 128) R[1] = ~A[1]; break;
+        case OP_UDIV: if (in->ty.bits == 128) { unsigned __int128 d = val128(B); put128(R, d ? val128(A) / d : 0); } else R[0] = B[0] ? (A[0] / B[0]) & msk(in->ty.bits) : 0; break;
+        case OP_UREM: if (in->ty.bits == 128) { unsigned __int128 d = val128(B); put128(R, d ? val128(A) % d : 0); } else R[0] = B[0] ? (A[0] % B[0]) & msk(in->ty.bits) : 0; break;
         case OP_SDIV: {
             int bits = in->ty.bits;
+            if (bits == 128) {
+                /* unsigned magnitudes: INT_MIN / -1 wraps, /0 yields 0 */
+                __int128 sa = (__int128)val128(A), sb = (__int128)val128(B);
+                unsigned __int128 r = 0;
+                if (sb != 0) {
+                    unsigned __int128 ua = sa < 0 ? (unsigned __int128)0 - val128(A) : val128(A);
+                    unsigned __int128 ub = sb < 0 ? (unsigned __int128)0 - val128(B) : val128(B);
+                    unsigned __int128 q = ua / ub;
+                    r = ((sa < 0) != (sb < 0)) ? (unsigned __int128)0 - q : q;
+                }
+                put128(R, r); break;
+            }
             int64_t sa = sx(A[0], bits), sb = sx(B[0], bits);
             int64_t r = 0;
             if (sb != 0) r = (sb == -1 && sa == (bits == 64 ? INT64_MIN : -(1ll << (bits - 1)))) ? sa : sa / sb;
@@ -179,19 +225,42 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
         }
         case OP_SREM: {
             int bits = in->ty.bits;
+            if (bits == 128) {
+                __int128 sa = (__int128)val128(A), sb = (__int128)val128(B);
+                unsigned __int128 r = 0;
+                if (sb != 0) {
+                    unsigned __int128 ua = sa < 0 ? (unsigned __int128)0 - val128(A) : val128(A);
+                    unsigned __int128 ub = sb < 0 ? (unsigned __int128)0 - val128(B) : val128(B);
+                    unsigned __int128 q = ua % ub;
+                    r = sa < 0 ? (unsigned __int128)0 - q : q;
+                }
+                put128(R, r); break;
+            }
             int64_t sa = sx(A[0], bits), sb = sx(B[0], bits);
             int64_t r = 0;
             if (sb != 0) r = (sb == -1 && sa == (bits == 64 ? INT64_MIN : -(1ll << (bits - 1)))) ? 0 : sa % sb;
             R[0] = (uint64_t)r & msk(bits); break;
         }
-        case OP_SHL: R[0] = (A[0] << (B[0] % (uint64_t)in->ty.bits)) & msk(in->ty.bits); break;
-        case OP_LSHR: R[0] = (A[0] & msk(in->ty.bits)) >> (B[0] % (uint64_t)in->ty.bits); break;
-        case OP_ASHR: R[0] = (uint64_t)(sx(A[0], in->ty.bits) >> (B[0] % (uint64_t)in->ty.bits)) & msk(in->ty.bits); break;
+        case OP_SHL: if (in->ty.bits == 128) put128(R, val128(A) << (unsigned)(val128(B) % 128)); else R[0] = (A[0] << (B[0] % (uint64_t)in->ty.bits)) & msk(in->ty.bits); break;
+        case OP_LSHR: if (in->ty.bits == 128) put128(R, val128(A) >> (unsigned)(val128(B) % 128)); else R[0] = (A[0] & msk(in->ty.bits)) >> (B[0] % (uint64_t)in->ty.bits); break;
+        case OP_ASHR: if (in->ty.bits == 128) put128(R, (unsigned __int128)((__int128)val128(A) >> (unsigned)(val128(B) % 128))); else R[0] = (uint64_t)(sx(A[0], in->ty.bits) >> (B[0] % (uint64_t)in->ty.bits)) & msk(in->ty.bits); break;
         case OP_ICMP: {
             int bits = ta.bits;
+            bool r = false;
+            if (bits == 128) {
+                unsigned __int128 ua = val128(A), ub = val128(B);
+                __int128 sa = (__int128)ua, sb = (__int128)ub;
+                switch (in->pred) {
+                case IC_EQ: r = ua == ub; break; case IC_NE: r = ua != ub; break;
+                case IC_ULT: r = ua < ub; break; case IC_ULE: r = ua <= ub; break;
+                case IC_UGT: r = ua > ub; break; case IC_UGE: r = ua >= ub; break;
+                case IC_SLT: r = sa < sb; break; case IC_SLE: r = sa <= sb; break;
+                case IC_SGT: r = sa > sb; break; case IC_SGE: r = sa >= sb; break;
+                }
+                R[0] = r ? 1 : 0; break;
+            }
             uint64_t ua = A[0] & msk(bits), ub = B[0] & msk(bits);
             int64_t sa = sx(ua, bits), sb = sx(ub, bits);
-            bool r = false;
             switch (in->pred) {
             case IC_EQ: r = ua == ub; break; case IC_NE: r = ua != ub; break;
             case IC_ULT: r = ua < ub; break; case IC_ULE: r = ua <= ub; break;
@@ -201,18 +270,24 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
             }
             R[0] = r ? 1 : 0; break;
         }
-        case OP_POPCOUNT: { int c = 0; uint64_t x = A[0] & msk(in->ty.bits); while (x) { x &= x - 1; c++; } R[0] = (uint64_t)c; break; }
-        case OP_CLZ: { int bits = in->ty.bits, c = 0; uint64_t x = A[0] & msk(bits);
-                       for (int i = bits - 1; i >= 0; i--) { if ((x >> i) & 1) break; c++; } R[0] = (uint64_t)c; break; }
-        case OP_CTZ: { int bits = in->ty.bits, c = 0; uint64_t x = A[0] & msk(bits);
-                       for (int i = 0; i < bits; i++) { if ((x >> i) & 1) break; c++; } R[0] = (uint64_t)c; break; }
+        case OP_POPCOUNT: { int c = 0; if (in->ty.bits == 128) { uint64_t x0 = A[0], x1 = A[1]; while (x0) { x0 &= x0 - 1; c++; } while (x1) { x1 &= x1 - 1; c++; } } else { uint64_t x = A[0] & msk(in->ty.bits); while (x) { x &= x - 1; c++; } } R[0] = (uint64_t)c; if (in->ty.bits == 128) R[1] = 0; break; }
+        case OP_CLZ: { int bits = in->ty.bits, c = 0;
+                       if (bits == 128) { if (A[1]) { uint64_t x = A[1]; for (int i = 63; i >= 0; i--) { if ((x >> i) & 1) break; c++; } } else { c = 64; uint64_t x = A[0]; for (int i = 63; i >= 0; i--) { if ((x >> i) & 1) break; c++; } } }
+                       else { uint64_t x = A[0] & msk(bits); for (int i = bits - 1; i >= 0; i--) { if ((x >> i) & 1) break; c++; } } R[0] = (uint64_t)c; if (bits == 128) R[1] = 0; break; }
+        case OP_CTZ: { int bits = in->ty.bits, c = 0;
+                       if (bits == 128) { if (A[0]) { uint64_t x = A[0]; for (int i = 0; i < 64; i++) { if ((x >> i) & 1) break; c++; } } else { c = 64; uint64_t x = A[1]; for (int i = 0; i < 64; i++) { if ((x >> i) & 1) break; c++; } } }
+                       else { uint64_t x = A[0] & msk(bits); for (int i = 0; i < bits; i++) { if ((x >> i) & 1) break; c++; } } R[0] = (uint64_t)c; if (bits == 128) R[1] = 0; break; }
         case OP_BSWAP: {
+            if (in->ty.bits == 128) {
+                put128(R, ((unsigned __int128)__builtin_bswap64(A[0]) << 64) | (unsigned __int128)__builtin_bswap64(A[1]));
+                break;
+            }
             uint64_t x = A[0]; int n = in->ty.bits / 8; uint64_t r = 0;
             for (int i = 0; i < n; i++) r = (r << 8) | ((x >> (8 * i)) & 0xff);
             R[0] = r; break;
         }
-        case OP_TRUNC: case OP_ZEXT: R[0] = A[0] & msk(in->ty.bits); break;
-        case OP_SEXT: R[0] = (uint64_t)sx(A[0], ta.bits) & msk(in->ty.bits); break;
+        case OP_TRUNC: case OP_ZEXT: R[0] = A[0] & msk(in->ty.bits); if (in->ty.bits == 128) R[1] = 0; break;
+        case OP_SEXT: R[0] = (uint64_t)sx(A[0], ta.bits) & msk(in->ty.bits); if (in->ty.bits == 128) R[1] = sx(A[0], ta.bits) < 0 ? ~0ull : 0; break;
         case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FDIV: {
             if (in->ty.bits == 32) {
                 float x = as_f32(A[0]), y = as_f32(B[0]), r = 0;
@@ -284,6 +359,7 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
             break;
         }
         case OP_ASSUME: break;
+        case OP_FENCE: break;   /* ordering barrier; no value semantics on one thread */
         case OP_ALLOCA: {
             uint64_t al = in->c > 0 ? (uint64_t)in->c : 1;
             it->bump = (it->bump + al - 1) & ~(al - 1);
@@ -298,7 +374,11 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
             R[0] = A[0] + (uint64_t)(i2 * (int64_t)mem_ty_size(in->ety));
             break;
         }
-        case OP_LOAD: {
+        case OP_LOAD: case OP_LOADV: {
+            /* volatile: in the single-threaded reference interpreter a
+             * volatile access has the same value semantics as a plain
+             * one; its ordering/non-elimination force applies to the
+             * optimizer and the backends, which treat it as opaque. */
             uint64_t addr = A[0];
             size_t n = mem_ty_size(in->ty);
             if (addr + n > MEM_SIZE) return ierr(it, "interp: load out of range");
@@ -308,18 +388,22 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
                     uint64_t v = 0; memcpy(&v, it->mem + addr + (size_t)i * eb, (size_t)eb);
                     R[i] = v;
                 }
+            } else if (n > 8) {
+                /* wide scalar (i128): copy lane-wise; a single u64
+                 * temporary would overflow (and did, latently) */
+                memcpy(R, it->mem + addr, n);
             } else {
                 uint64_t v = 0; memcpy(&v, it->mem + addr, n);
                 R[0] = in->ty.kind == TY_INT ? v & msk(in->ty.bits) : v;
             }
             break;
         }
-        case OP_STORE: {
+        case OP_STORE: case OP_STOREV: {
             uint64_t addr = A[0];
             size_t n = mem_ty_size(in->ty);
             if (addr + n > MEM_SIZE) return ierr(it, "interp: store out of range");
-            uint64_t v = B[0];
-            memcpy(it->mem + addr, &v, n);
+            if (n > 8) memcpy(it->mem + addr, B, n);
+            else { uint64_t v = B[0]; memcpy(it->mem + addr, &v, n); }
             break;
         }
         case OP_VLOAD: {
@@ -400,6 +484,69 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
             memcpy(it->mem + A[0], &nv, n);
             break;
         }
+        case OP_ACMPXCHG: {
+            /* strong cmpxchg: result is the old value; the cell takes
+             * the desired value iff old == expected (no spurious failure) */
+            size_t n = mem_ty_size(in->ty);
+            if (A[0] + n > MEM_SIZE) return ierr(it, "interp: acmpxchg out of range");
+            uint64_t v = 0; memcpy(&v, it->mem + A[0], n);
+            R[0] = v & msk(in->ty.bits);
+            if (R[0] == (B[0] & msk(in->ty.bits))) {
+                uint64_t nv = C[0] & msk(in->ty.bits);
+                memcpy(it->mem + A[0], &nv, n);
+            }
+            break;
+        }
+        case OP_AXCHG: case OP_ASUB: case OP_AAND: case OP_AOR: case OP_AXOR:
+        case OP_AMINS: case OP_AMAXS: case OP_AMINU: case OP_AMAXU: {
+            size_t n = mem_ty_size(in->ty);
+            if (A[0] + n > MEM_SIZE) return ierr(it, "interp: atomic rmw out of range");
+            uint64_t v = 0; memcpy(&v, it->mem + A[0], n);
+            uint64_t old = v & msk(in->ty.bits);
+            R[0] = old;
+            uint64_t b = B[0] & msk(in->ty.bits);
+            uint64_t nv;
+            switch (in->op) {
+            case OP_AXCHG: nv = b; break;
+            case OP_ASUB:  nv = (old - b) & msk(in->ty.bits); break;
+            case OP_AAND:  nv = old & b; break;
+            case OP_AOR:   nv = old | b; break;
+            case OP_AXOR:  nv = old ^ b; break;
+            case OP_AMINS: nv = sx(old, in->ty.bits) < sx(b, in->ty.bits) ? old : b; break;
+            case OP_AMAXS: nv = sx(old, in->ty.bits) > sx(b, in->ty.bits) ? old : b; break;
+            case OP_AMINU: nv = old < b ? old : b; break;
+            default:       nv = old > b ? old : b; break;   /* OP_AMAXU */
+            }
+            memcpy(it->mem + A[0], &nv, n);
+            break;
+        }
+        case OP_FUNCP:
+            R[0] = (in->callee_extern ? SYNTH_EX_BASE : SYNTH_FN_BASE) + 16ull * (uint64_t)in->callee;
+            break;
+        case OP_CALLI: {
+            int tc; bool tx;
+            const char *re = resolve_calli(it, A[0], in->callee, &tc, &tx);
+            if (re) return ierr(it, re);
+            IVal *cargs = malloc(sizeof(IVal) * (size_t)(in->nargs ? in->nargs : 1));
+            for (int i = 0; i < in->nargs; i++) cargs[i].lanes = fr->lanes[in->args[i]];
+            int rc;
+            if (tx) {
+                Extern *e = &it->m->exts[tc];
+                HostFn hf = NULL; void *ctx = NULL;
+                for (int h = 0; h < it->nhosts; h++)
+                    if (strcmp(it->hosts[h].name, e->name) == 0) { hf = it->hosts[h].fn; ctx = it->hosts[h].ctx; break; }
+                if (!hf) { free(cargs); return ierr(it, "interp: unresolved extern"); }
+                IVal rv; rv.lanes = R;
+                hf(it, ctx, cargs, in->nargs, &rv);
+                rc = 0;
+            } else {
+                IVal rv; rv.lanes = R;
+                rc = run_func(it, tc, cargs, in->nargs, in->ty.kind == TY_VOID ? NULL : &rv);
+            }
+            free(cargs);
+            if (rc) return rc;
+            break;
+        }
         case OP_CALL: {
             IVal *cargs = malloc(sizeof(IVal) * (size_t)(in->nargs ? in->nargs : 1));
             for (int i = 0; i < in->nargs; i++) cargs[i].lanes = fr->lanes[in->args[i]];
@@ -447,7 +594,7 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
             *done = true;
             return 0;
         }
-        case OP_TAILCALL: {
+        case OP_TAILCALL: case OP_TAILCALLI: {
             /* handled by run_func loop: signal via special state */
             *next_blk = -2;
             /* stash call info in pend: encode callee/args into static slots */
@@ -506,8 +653,13 @@ static int run_func(Interp *it, int fi, const IVal *args, int nargs, IVal *ret) 
             if (rc || done) break;
             if (next_blk == -2) {
                 Instr *in = (Instr *)pend;   /* the TAILCALL instruction */
-                if (in->callee_extern) {
-                    Extern *e = &it->m->exts[in->callee];
+                int tcal = in->callee; bool text = in->callee_extern != 0;
+                if (in->op == OP_TAILCALLI) {
+                    const char *re = resolve_calli(it, fr.lanes[in->a][0], in->callee, &tcal, &text);
+                    if (re) { rc = ierr(it, re); frame_free(&fr); break; }
+                }
+                if (text) {
+                    Extern *e = &it->m->exts[tcal];
                     HostFn hf = NULL; void *ctx = NULL;
                     for (int h = 0; h < it->nhosts; h++)
                         if (strcmp(it->hosts[h].name, e->name) == 0) { hf = it->hosts[h].fn; ctx = it->hosts[h].ctx; break; }
@@ -526,11 +678,11 @@ static int run_func(Interp *it, int fi, const IVal *args, int nargs, IVal *ret) 
                 /* snapshot the callee's arguments, release the frame, loop */
                 IVal *snap = malloc(sizeof(IVal) * (size_t)(in->nargs ? in->nargs : 1));
                 for (int i = 0; i < in->nargs; i++) snap[i].lanes = fr.lanes[in->args[i]];
-                IVal *na = args_copy(&it->m->funcs[in->callee], snap, in->nargs);
+                IVal *na = args_copy(&it->m->funcs[tcal], snap, in->nargs);
                 free(snap);
                 frame_free(&fr);
                 args_free(cur_args, cur_nargs);
-                cur_args = na; cur_nargs = in->nargs; cur_fi = in->callee;
+                cur_args = na; cur_nargs = in->nargs; cur_fi = tcal;
                 tailed = true;
                 break;
             }
