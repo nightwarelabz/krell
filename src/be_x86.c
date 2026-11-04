@@ -551,6 +551,49 @@ static bool is_span_blend(Ctx *c, Instr *in, int *out_px, int *out_light,
     return false;
 }
 
+/* Extract lane i of a vector operand into a GP register, from
+ * wherever the operand lives. xmm15 is the only shuffle scratch:
+ * it is outside the allocator's FP pool, so it can never hold a
+ * live value. (The shared vector path once read slot offsets
+ * unconditionally; a register-resident operand's offset is 0 and
+ * the accesses corrupted the saved frame.) */
+static void vec_lane_gp(Ctx *c, Loc *l, int i, Type et, const char *d64, const char *d32) {
+    int eb = et.bits / 8;
+    if (l->is_reg) {
+        if (et.bits == 64) {
+            if (i == 0) E(c, "  movq %s, xmm%d", d64, l->idx);
+            else { E(c, "  movhlps xmm15, xmm%d", l->idx); E(c, "  movq %s, xmm15", d64); }
+        } else if (et.bits == 32) {
+            if (i == 0) E(c, "  movd %s, xmm%d", d32, l->idx);
+            else { E(c, "  pshufd xmm15, xmm%d, %d", l->idx, i); E(c, "  movd %s, xmm15", d32); }
+        } else {
+            E(c, "  pextr%c %s, xmm%d, %d", et.bits == 16 ? 'w' : 'b', d32, l->idx, i);
+        }
+    } else {
+        const char *szp = eb == 1 ? "BYTE PTR" : eb == 2 ? "WORD PTR" : eb == 4 ? "DWORD PTR" : "QWORD PTR";
+        if (eb <= 2) E(c, "  movzx %s, %s [rbp - %d]", d32, szp, l->off - i * eb);
+        else if (eb == 4) E(c, "  mov %s, DWORD PTR [rbp - %d]", d32, l->off - i * eb);
+        else E(c, "  mov %s, QWORD PTR [rbp - %d]", d64, l->off - i * eb);
+    }
+}
+
+/* Extract lane i of a float vector operand into the low lane of
+ * xmm register `reg`, from wherever the operand lives. */
+static void vec_lane_fp(Ctx *c, Loc *l, int i, Type et, int reg) {
+    int eb = et.bits / 8;
+    if (l->is_reg) {
+        if (et.bits == 32) {
+            if (i == 0) E(c, "  movss xmm%d, xmm%d", reg, l->idx);
+            else E(c, "  pshufd xmm%d, xmm%d, %d", reg, l->idx, i);
+        } else {
+            if (i == 0) E(c, "  movsd xmm%d, xmm%d", reg, l->idx);
+            else E(c, "  movhlps xmm%d, xmm%d", reg, l->idx);
+        }
+    } else {
+        E(c, "  %s xmm%d, [rbp - %d]", et.bits == 32 ? "movss" : "movsd", reg, l->off - i * eb);
+    }
+}
+
 static void emit_instr(Ctx *c, int bi, int ii) {
     Func *f = c->f;
     Instr *in = &f->blocks[bi].ins[ii];
@@ -1140,7 +1183,11 @@ static void emit_instr(Ctx *c, int bi, int ii) {
             else {
                 nm = in->op == OP_VADD ? (et.bits == 64 ? "paddq" : et.bits == 32 ? "paddd" : et.bits == 16 ? "paddw" : "paddb") :
                      in->op == OP_VSUB ? (et.bits == 64 ? "psubq" : et.bits == 32 ? "psubd" : et.bits == 16 ? "psubw" : "psubb") :
-                     (et.bits == 32 ? "pmulld" : et.bits == 16 ? "pmullw" : NULL);
+                     in->op == OP_VMUL ? (et.bits == 32 ? "pmulld" : et.bits == 16 ? "pmullw" : NULL) : NULL;
+                /* OP_VUDIV deliberately has no packed form here: the
+                 * fallthrough above once mapped it onto pmulld/pmullw,
+                 * so a register-resident vudiv MULTIPLIED. It falls
+                 * through to the scalarized lane loop instead. */
             }
             if (nm) {
                 if (bl->is_reg) E(c, "  %s xmm%d, xmm%d", nm, dreg, bl->idx);
@@ -1149,7 +1196,14 @@ static void emit_instr(Ctx *c, int bi, int ii) {
             }
         }
         bool scalarize = in->op == OP_VUDIV || (in->op == OP_VMUL && et.kind == TY_INT && et.bits != 32 && et.bits != 16);
-        if (!scalarize) {
+        /* The packed slot-to-slot form reads all three operands
+         * through their slot offsets; it is only valid when every
+         * operand is actually slot-resident. A register-resident
+         * operand's offset field is meaningless (0), and the reads
+         * and writes landed on [rbp - 0] -- the saved frame -- for
+         * mixed-residency vector ops. Mixed residency takes the
+         * location-aware scalar lane loop below. */
+        if (!scalarize && !al->is_reg && !bl->is_reg && !dl->is_reg) {
             const char *nm = NULL;
             if (et.kind == TY_FLOAT) {
                 nm = in->op == OP_VFADD ? (et.bits == 32 ? "addps" : "addpd") :
@@ -1184,25 +1238,28 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                 break;
             }
         }
-        /* scalarized lane loop */
+        /* scalarized lane loop -- location-aware: each lane is
+         * extracted from wherever its operand lives and inserted
+         * wherever the result lives */
         int lanes = ty_lanes(t, c->vl);
         int eb = et.bits / 8;
         for (int i = 0; i < lanes; i++) {
             if (et.kind == TY_FLOAT) {
-                E(c, "  %s xmm15, [rbp - %d]", et.bits == 32 ? "movss" : "movsd", al->off - i * eb);
                 const char *nm = in->op == OP_VFADD ? "add" : in->op == OP_VFSUB ? "sub" : in->op == OP_VFMUL ? "mul" : "div";
-                E(c, "  %s%s xmm15, [rbp - %d]", nm, et.bits == 32 ? "ss" : "sd", bl->off - i * eb);
-                E(c, "  %s [rbp - %d], xmm15", et.bits == 32 ? "movss" : "movsd", dl->off - i * eb);
+                vec_lane_fp(c, al, i, et, 15);
+                vec_lane_fp(c, bl, i, et, 14);
+                E(c, "  %s%s xmm15, xmm14", nm, et.bits == 32 ? "ss" : "sd");
+                if (dl->is_reg) {
+                    if (et.bits == 32) { E(c, "  movd r11d, xmm15"); E(c, "  pinsrd xmm%d, r11d, %d", dl->idx, i); }
+                    else { E(c, "  movq r11, xmm15"); E(c, "  pinsrq xmm%d, r11, %d", dl->idx, i); }
+                } else {
+                    E(c, "  %s [rbp - %d], xmm15", et.bits == 32 ? "movss" : "movsd", dl->off - i * eb);
+                }
             } else {
-                const char *szp = eb == 1 ? "BYTE PTR" : eb == 2 ? "WORD PTR" : eb == 4 ? "DWORD PTR" : "QWORD PTR";
-                if (eb <= 2) E(c, "  movzx r11d, %s [rbp - %d]", szp, al->off - i * eb);
-                else if (eb == 4) E(c, "  mov r11d, DWORD PTR [rbp - %d]", al->off - i * eb);
-                else E(c, "  mov r11, QWORD PTR [rbp - %d]", al->off - i * eb);
+                vec_lane_gp(c, al, i, et, "r11", "r11d");
                 if (in->op == OP_VUDIV) {
                     int Ld = ++c->lbl, Ldone = ++c->lbl;
-                    if (eb <= 2) E(c, "  movzx eax, %s [rbp - %d]", szp, bl->off - i * eb);
-                    else if (eb == 4) E(c, "  mov eax, DWORD PTR [rbp - %d]", bl->off - i * eb);
-                    else E(c, "  mov rax, QWORD PTR [rbp - %d]", bl->off - i * eb);
+                    vec_lane_gp(c, bl, i, et, "rax", "eax");
                     E(c, "  test rax, rax");
                     E(c, "  jne .Lx%d_%d", c->fi, Ld);
                     E(c, "  xor r11d, r11d");
@@ -1218,14 +1275,19 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                     const char *nm = in->op == OP_VADD ? "add" : in->op == OP_VSUB ? "sub" :
                                      in->op == OP_VMUL ? "imul" : in->op == OP_VAND ? "and" :
                                      in->op == OP_VOR ? "or" : "xor";
-                    if (eb <= 2) E(c, "  movzx eax, %s [rbp - %d]", szp, bl->off - i * eb);
-                    else if (eb == 4) E(c, "  mov eax, DWORD PTR [rbp - %d]", bl->off - i * eb);
-                    else E(c, "  mov rax, QWORD PTR [rbp - %d]", bl->off - i * eb);
+                    vec_lane_gp(c, bl, i, et, "rax", "eax");
                     E(c, "  %s r11, rax", nm);
                 }
                 mask_r11(c, et);
-                const char *r = eb == 1 ? "r11b" : eb == 2 ? "r11w" : eb == 4 ? "r11d" : "r11";
-                E(c, "  mov [rbp - %d], %s", dl->off - i * eb, r);
+                if (dl->is_reg) {
+                    if (eb == 1) E(c, "  pinsrb xmm%d, r11d, %d", dl->idx, i);
+                    else if (eb == 2) E(c, "  pinsrw xmm%d, r11d, %d", dl->idx, i);
+                    else if (eb == 4) E(c, "  pinsrd xmm%d, r11d, %d", dl->idx, i);
+                    else E(c, "  pinsrq xmm%d, r11, %d", dl->idx, i);
+                } else {
+                    const char *r = eb == 1 ? "r11b" : eb == 2 ? "r11w" : eb == 4 ? "r11d" : "r11";
+                    E(c, "  mov [rbp - %d], %s", dl->off - i * eb, r);
+                }
             }
         }
         break;
@@ -1309,7 +1371,14 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                 if (imm == 0) store_fp(c, in->result, al->idx);
                 else {
                     if (et.bits == 32) {
-                        E(c, "  shufps xmm15, xmm%d, %d", al->idx, imm);
+                        /* pshufd, not shufps: shufps takes its low
+                         * lanes from the DESTINATION register, so the
+                         * old form extracted whatever xmm15 happened
+                         * to hold. pshufd selects every lane from the
+                         * source. (Shipped unnoticed: nothing in the
+                         * battery extracted an f32 lane >= 1 from a
+                         * register-resident vector.) */
+                        E(c, "  pshufd xmm15, xmm%d, %d", al->idx, imm);
                         store_fp(c, in->result, 15);
                     } else {
                         E(c, "  movhlps xmm15, xmm%d", al->idx);
@@ -1950,7 +2019,7 @@ static int emit_func(Ctx *c, int fi) {
         { RSI, 0 }, { RDI, 0 }, { R8, 0 }, { R9, 0 }, { R10, 0 },
         { RBX, 1 }, { R12, 1 }, { R13, 1 }, { R14, 1 }, { R15, 1 },
     };
-    Pools pools = { POOL_GP, 10, POOL_FP, 15 };
+    Pools pools = { POOL_GP, 10, POOL_FP, 15, 1 };
     BeFunc *bf = be_analyze_ext(m, f, &pools, c->folded_ins);
     if (!bf) { free(c->defins); c->defins = NULL; free(c->folded_ins); c->folded_ins = NULL; free(c->cmp_fuse); c->cmp_fuse = NULL; return -1; }
     c->bf = bf;
@@ -1961,11 +2030,47 @@ static int emit_func(Ctx *c, int fi) {
     E(c, "%s:", f->name);
     if (er.eligible) {
         early_lbl = ++c->lbl;
+        /* The fast-path compare reads the raw ABI registers, whose
+         * high bits the C ABI leaves unspecified for narrow int
+         * params (garbage there once sent narrow recursive guards
+         * into unbounded recursion under a C driver). Reproduce the
+         * normal OP_ICMP compare exactly: at 32 bits use the 32-bit
+         * register names; below 32 bits extend the operand into a
+         * scratch register first -- sign-extended for a signed
+         * predicate, zero-extended for an unsigned one. */
         const char *areg = G64[ARG_GP[er.a_arg_idx]];
+        Type aty = f->blocks[0].arg_types[er.a_arg_idx];
+        int bits = aty.bits;
+        bool sgn = er.pred >= IC_SLT;
+        if (aty.kind == TY_INT && bits == 32) {
+            areg = G32[ARG_GP[er.a_arg_idx]];
+        } else if (aty.kind == TY_INT && bits < 32) {
+            int k = 64 - bits;
+            E(c, "  mov r11, %s", areg);
+            E(c, "  shl r11, %d", k);
+            E(c, "  %s r11, %d", sgn ? "sar" : "shr", k);
+            areg = "r11";
+        }
         if (er.b_is_const) {
-            E(c, "  cmp %s, %lld", areg, (long long)er.b_const);
+            int64_t bimm = er.b_const;
+            if (aty.kind == TY_INT && bits < 32) {
+                uint64_t raw = (uint64_t)bimm & msk64(bits);
+                if (sgn && (raw >> (bits - 1)) & 1) bimm = (int64_t)(raw | ~msk64(bits));
+                else bimm = (int64_t)raw;
+            }
+            E(c, "  cmp %s, %lld", areg, (long long)bimm);
         } else {
-            E(c, "  cmp %s, %s", areg, G64[ARG_GP[er.b_arg_idx]]);
+            const char *breg = G64[ARG_GP[er.b_arg_idx]];
+            if (aty.kind == TY_INT && bits == 32) {
+                breg = G32[ARG_GP[er.b_arg_idx]];
+            } else if (aty.kind == TY_INT && bits < 32) {
+                int k = 64 - bits;
+                E(c, "  mov r10, %s", breg);
+                E(c, "  shl r10, %d", k);
+                E(c, "  %s r10, %d", sgn ? "sar" : "shr", k);
+                breg = "r10";
+            }
+            E(c, "  cmp %s, %s", areg, breg);
         }
         static const char *CC[10] = { "e","ne","b","be","a","ae","l","le","g","ge" };
         static const char *INV_CC[10] = { "ne","e","ae","a","be","b","ge","g","le","l" };
@@ -2038,12 +2143,29 @@ static int emit_func(Ctx *c, int fi) {
         }
     }
     if (er.eligible) {
+        /* Block 0 is never emitted on this path, so its iconsts would
+         * never be materialized -- yet the other edge's moves (and any
+         * later block using an entry-defined constant directly) read
+         * their locations. Emit the constants here, exactly as the
+         * normal block-0 emission would. Guards that pass constants
+         * as block args (the lowered-loop shape) miscompiled without
+         * this: the edge moves read registers nothing had loaded. */
+        for (int i = 0; i < f->blocks[0].nins; i++)
+            if (f->blocks[0].ins[i].op == OP_ICONST) emit_instr(c, 0, i);
         emit_branch(c, er.other_blk, er.other_args, er.other_nargs);
         E(c, ".Lx%d_%d:", fi, early_lbl);
         if (er.ret_is_void) {
             E(c, "  ret");
         } else if (er.ret_arg_idx >= 0) {
             if (ARG_GP[er.ret_arg_idx] != RAX) E(c, "  mov rax, %s", G64[ARG_GP[er.ret_arg_idx]]);
+            /* a narrow int param returned directly must go back in
+             * canonical (masked) form, like the normal path's home */
+            Type rty = f->blocks[0].arg_types[er.ret_arg_idx];
+            if (rty.kind == TY_INT && rty.bits < 64) {
+                int k = 64 - rty.bits;
+                E(c, "  shl rax, %d", k);
+                E(c, "  shr rax, %d", k);
+            }
             E(c, "  ret");
         } else {
             E(c, "  mov rax, %lld", (long long)er.ret_const);

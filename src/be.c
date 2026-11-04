@@ -74,6 +74,59 @@ BeFunc *be_analyze(Module *m, Func *f, const Pools *pools) {
     return be_analyze_ext(m, f, pools, NULL);
 }
 
+/* Folded-consumption liveness: when a backend folds an instruction
+ * into its consumer (a GEP into a load/store addressing mode, an
+ * arithmetic chain into a select, ...), the folded value gets no
+ * location, but its OPERANDS are read at the consumer, not at the
+ * folded instruction. Every use of a folded value therefore also
+ * counts as a use of its operands at the same position, recursively
+ * through folded chains. Without this, the allocator believes an
+ * operand dies at the folded instruction and hands its register to
+ * a value defined between the two -- the optimized fuzz corpus
+ * stored through a clobbered GEP index register this way (the
+ * store's constant landed in the index register first). */
+static void endpos_use(BeFunc *bf, const bool *folded, Instr **defi, int v, int p, int depth) {
+    if (v < 0) return;
+    if (p > bf->endpos[v]) bf->endpos[v] = p;
+    if (folded && folded[v] && defi && defi[v] && depth < 32) {
+        Instr *d = defi[v];
+        endpos_use(bf, folded, defi, d->a, p, depth + 1);
+        endpos_use(bf, folded, defi, d->b, p, depth + 1);
+        if (d->op != OP_ALLOCA) endpos_use(bf, folded, defi, d->c, p, depth + 1);
+    }
+}
+static void buse_use(uint64_t *buse, const uint64_t *bdef, int W, int b, const bool *folded, Instr **defi, int v, int depth) {
+    if (v < 0) return;
+    if (!((bdef[(size_t)b * (size_t)W + (size_t)(v >> 6)] >> (v & 63)) & 1ull))
+        buse[(size_t)b * (size_t)W + (size_t)(v >> 6)] |= (1ull << (v & 63));
+    if (folded && folded[v] && defi && defi[v] && depth < 32) {
+        Instr *d = defi[v];
+        buse_use(buse, bdef, W, b, folded, defi, d->a, depth + 1);
+        buse_use(buse, bdef, W, b, folded, defi, d->b, depth + 1);
+        if (d->op != OP_ALLOCA) buse_use(buse, bdef, W, b, folded, defi, d->c, depth + 1);
+    }
+}
+static void count_use(const bool *folded, Instr **defi, int *usecnt, int v, int depth) {
+    if (v < 0) return;
+    usecnt[v]++;
+    if (folded && folded[v] && defi && defi[v] && depth < 32) {
+        Instr *d = defi[v];
+        count_use(folded, defi, usecnt, d->a, depth + 1);
+        count_use(folded, defi, usecnt, d->b, depth + 1);
+        if (d->op != OP_ALLOCA) count_use(folded, defi, usecnt, d->c, depth + 1);
+    }
+}
+static void fill_use(const bool *folded, Instr **defi, int *usepos, int *usecur, const int *useoff, int v, int p, int depth) {
+    if (v < 0) return;
+    if (usecur[v] < useoff[v + 1]) usepos[usecur[v]++] = p;
+    if (folded && folded[v] && defi && defi[v] && depth < 32) {
+        Instr *d = defi[v];
+        fill_use(folded, defi, usepos, usecur, useoff, d->a, p, depth + 1);
+        fill_use(folded, defi, usepos, usecur, useoff, d->b, p, depth + 1);
+        if (d->op != OP_ALLOCA) fill_use(folded, defi, usepos, usecur, useoff, d->c, p, depth + 1);
+    }
+}
+
 BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folded) {
     (void)m;
     BeFunc *bf = calloc(1, sizeof(BeFunc));
@@ -90,6 +143,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
     for (int i = 0; i < f->nvalues; i++) {
         bf->loc[i].idx = -1;
         if (folded && folded[i]) bf->vclass[i] = -1;
+        else if (!pools->vec_regs && f->vtypes[i].kind == TY_VEC) bf->vclass[i] = BCLS_VEC;
         else bf->vclass[i] = (int8_t)be_class_of(f->vtypes[i]);
         bf->vec_off[i] = -1;
     }
@@ -123,16 +177,23 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
             }
         }
     }
-    #define USE(v, p) do { if ((v) >= 0 && (p) > bf->endpos[v]) bf->endpos[v] = (p); } while (0)
+    /* defining instruction per value, for folded-use expansion */
+    Instr **defi = calloc((size_t)nv, sizeof(Instr *));
+    for (int b = 0; b < f->nblocks; b++) {
+        Block *bl = &f->blocks[b];
+        for (int i = 0; i < bl->nins; i++)
+            if (bl->ins[i].result >= 0) defi[bl->ins[i].result] = &bl->ins[i];
+    }
     for (int b = 0; b < f->nblocks; b++) {
         Block *bl = &f->blocks[b];
         for (int i = 0; i < bl->nins; i++) {
             Instr *in = &bl->ins[i];
             int p = be_pos(bf, b, i);
-            USE(in->a, p); USE(in->b, p);
-            if (in->op != OP_ALLOCA) USE(in->c, p);
-            for (int k = 0; k < in->nargs; k++) USE(in->args[k], p);
-            for (int k = 0; k < in->nargs2; k++) USE(in->args2[k], p);
+            endpos_use(bf, folded, defi, in->a, p, 0);
+            endpos_use(bf, folded, defi, in->b, p, 0);
+            if (in->op != OP_ALLOCA) endpos_use(bf, folded, defi, in->c, p, 0);
+            for (int k = 0; k < in->nargs; k++) endpos_use(bf, folded, defi, in->args[k], p, 0);
+            for (int k = 0; k < in->nargs2; k++) endpos_use(bf, folded, defi, in->args2[k], p, 0);
         }
     }
     /* live-in / live-out per block (bitsets over values) */
@@ -152,11 +213,11 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
             Instr *in = &bl->ins[i];
             int32_t ops[3] = { in->a, in->b, in->op == OP_ALLOCA ? -1 : in->c };
             for (int k = 0; k < 3; k++)
-                if (ops[k] >= 0 && !GET(bdef, b, ops[k])) SET(buse, b, ops[k]);
+                buse_use(buse, bdef, W, b, folded, defi, ops[k], 0);
             for (int k = 0; k < in->nargs; k++)
-                if (!GET(bdef, b, in->args[k])) SET(buse, b, in->args[k]);
+                buse_use(buse, bdef, W, b, folded, defi, in->args[k], 0);
             for (int k = 0; k < in->nargs2; k++)
-                if (!GET(bdef, b, in->args2[k])) SET(buse, b, in->args2[k]);
+                buse_use(buse, bdef, W, b, folded, defi, in->args2[k], 0);
             if (in->result >= 0) SET(bdef, b, in->result);
         }
     }
@@ -250,15 +311,15 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
         Block *bl = &f->blocks[b];
         for (int i = 0; i < bl->nins; i++) {
             Instr *in = &bl->ins[i];
-            if (in->a >= 0) usecnt[in->a]++;
-            if (in->b >= 0) usecnt[in->b]++;
-            if (in->op != OP_ALLOCA && in->c >= 0) usecnt[in->c]++;
+            count_use(folded, defi, usecnt, in->a, 0);
+            count_use(folded, defi, usecnt, in->b, 0);
+            if (in->op != OP_ALLOCA) count_use(folded, defi, usecnt, in->c, 0);
             for (int k = 0; k < in->nargs; k++) {
-                int v = in->args[k]; if (v < 0) continue; usecnt[v]++;
+                int v = in->args[k]; if (v < 0) continue; count_use(folded, defi, usecnt, v, 0);
                 if (in->op == OP_BR || in->op == OP_CONDBR) { use_tgt[v] = in->blk; use_slot[v] = k; use_list[v] = 0; use_srcblk[v] = b; }
             }
             for (int k = 0; k < in->nargs2; k++) {
-                int v = in->args2[k]; if (v < 0) continue; usecnt[v]++;
+                int v = in->args2[k]; if (v < 0) continue; count_use(folded, defi, usecnt, v, 0);
                 if (in->op == OP_CONDBR) { use_tgt[v] = in->blk2; use_slot[v] = k; use_list[v] = 1; use_srcblk[v] = b; }
             }
         }
@@ -291,15 +352,16 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
             for (int i = 0; i < bl->nins; i++) {
                 Instr *in = &bl->ins[i];
                 int pos = be_pos(bf, b, i);
-                if (in->a >= 0 && usecur[in->a] < useoff[in->a + 1]) usepos[usecur[in->a]++] = pos;
-                if (in->b >= 0 && usecur[in->b] < useoff[in->b + 1]) usepos[usecur[in->b]++] = pos;
-                if (in->op != OP_ALLOCA && in->c >= 0 && usecur[in->c] < useoff[in->c + 1]) usepos[usecur[in->c]++] = pos;
-                for (int k = 0; k < in->nargs; k++) { int v = in->args[k]; if (v >= 0 && usecur[v] < useoff[v + 1]) usepos[usecur[v]++] = pos; }
-                for (int k = 0; k < in->nargs2; k++) { int v = in->args2[k]; if (v >= 0 && usecur[v] < useoff[v + 1]) usepos[usecur[v]++] = pos; }
+                fill_use(folded, defi, usepos, usecur, useoff, in->a, pos, 0);
+                fill_use(folded, defi, usepos, usecur, useoff, in->b, pos, 0);
+                if (in->op != OP_ALLOCA) fill_use(folded, defi, usepos, usecur, useoff, in->c, pos, 0);
+                for (int k = 0; k < in->nargs; k++) fill_use(folded, defi, usepos, usecur, useoff, in->args[k], pos, 0);
+                for (int k = 0; k < in->nargs2; k++) fill_use(folded, defi, usepos, usecur, useoff, in->args2[k], pos, 0);
             }
         }
         free(usecur);
     }
+    free(defi);
 
     /* Back edges in position space: a terminator target whose block
      * starts at or before the source block is a loop back edge; the

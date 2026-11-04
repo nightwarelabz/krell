@@ -287,6 +287,13 @@ static void emit_branch(Ctx *c, int tgt, const int32_t *args, int nargs) {
     int ng = 0, nf = 0;
     for (int i = 0; i < nargs; i++) {
         int sv = args[i], dv = tb->arg_vals[i];
+        /* a block arg that is dead on arrival has no home -- the
+         * allocator never assigned it one (its loc offset is 0) --
+         * so the edge move must be skipped, as the x86 backend has
+         * always done. Without this, branching to a block whose arg
+         * goes unused stored the incoming value over the saved
+         * frame pointer (the recursive fact case). */
+        if (c->bf->defpos[dv] == c->bf->endpos[dv]) continue;
         int cls = be_class_of(f->vtypes[sv]);
         if (cls == BCLS_GP) { gs[ng] = c->bf->loc[sv]; gd[ng] = c->bf->loc[dv]; ng++; }
         else if (cls == BCLS_FP) { fs[nf] = c->bf->loc[sv]; fd[nf] = c->bf->loc[dv]; nf++; }
@@ -299,11 +306,11 @@ static void emit_branch(Ctx *c, int tgt, const int32_t *args, int nargs) {
 }
 
 /* sized memory ops: eb = element bytes, FP = float access */
-static void lane_load_gp(Ctx *c, int reg, int eb) {   /* [x16] -> x<reg> */
-    if (eb == 1) E(c, "  ldrb w%d, [x16]", reg);
-    else if (eb == 2) E(c, "  ldrh w%d, [x16]", reg);
-    else if (eb == 4) E(c, "  ldr w%d, [x16]", reg);
-    else E(c, "  ldr x%d, [x16]", reg);
+static void lane_load_gp(Ctx *c, int reg, int addr_reg, int eb) {   /* [x<addr_reg>] -> x<reg> */
+    if (eb == 1) E(c, "  ldrb w%d, [x%d]", reg, addr_reg);
+    else if (eb == 2) E(c, "  ldrh w%d, [x%d]", reg, addr_reg);
+    else if (eb == 4) E(c, "  ldr w%d, [x%d]", reg, addr_reg);
+    else E(c, "  ldr x%d, [x%d]", reg, addr_reg);
 }
 static void lane_store_gp(Ctx *c, int reg, int addr_reg, int eb) {
     if (eb == 1) E(c, "  strb w%d, [x%d]", reg, addr_reg);
@@ -554,7 +561,7 @@ static void emit_instr(Ctx *c, int bi, int ii) {
             store_fp(c, in->result, 31);
         } else {
             int eb = t.bits == 64 || t.kind == TY_PTR ? 8 : t.bits / 8;
-            lane_load_gp(c, X17, eb);
+            lane_load_gp(c, X17, X16, eb);
             if (t.bits == 1) E(c, "  and x17, x17, #1");
             store_gp(c, in->result, X17);
         }
@@ -671,9 +678,9 @@ static void emit_instr(Ctx *c, int bi, int ii) {
             int eb = et.bits / 8;
             for (int i = 0; i < lanes; i++) {
                 addr_of(c, X16, al->off - i * eb);
-                lane_load_gp(c, X16, eb);
+                lane_load_gp(c, X16, X16, eb);
                 addr_of(c, X17, bl->off - i * eb);
-                lane_load_gp(c, X17, eb);
+                lane_load_gp(c, X17, X17, eb);
                 if (in->op == OP_VUDIV) E(c, "  udiv x16, x16, x17");
                 else if (in->op == OP_VLSHR) {
                     /* amount modulo the lane width (a power of two) */
@@ -697,7 +704,7 @@ static void emit_instr(Ctx *c, int bi, int ii) {
             E(c, "  ldr %c31, [x16]", et.bits == 32 ? 's' : 'd');
             store_fp(c, in->result, 31);
         } else {
-            lane_load_gp(c, X16, eb);
+            lane_load_gp(c, X16, X16, eb);
             store_gp(c, in->result, X16);
         }
         break;
@@ -823,7 +830,7 @@ static int emit_func(Ctx *c, int fi) {
     Module *m = c->m;
     Func *f = &m->funcs[fi];
     c->f = f; c->fi = fi; c->lbl = 0;
-    Pools pools = { POOL_GP, 17, POOL_FP, 16 };
+    Pools pools = { POOL_GP, 17, POOL_FP, 16, 0 };
     BeFunc *bf = be_analyze(m, f, &pools);
     if (!bf) return -1;
     c->bf = bf;
@@ -850,11 +857,15 @@ static int emit_func(Ctx *c, int fi) {
             int v = b0->arg_vals[i];
             int cls = be_class_of(b0->arg_types[i]);
             Loc dst = bf->loc[v];
-            if (cls == BCLS_GP && gi < 8) { gs[ng] = (Loc){ 1, BCLS_GP, ARG_GP[gi], 0 }; gd[ng] = dst; ng++; gi++; }
-            else if (cls == BCLS_FP && fi2 < 8) { fs[nf] = (Loc){ 1, BCLS_FP, fi2, 0 }; fd[nf] = dst; nf++; fi2++; }
+            /* dead params have no home; skip their moves (and count
+             * no ABI slot for them), as the x86 entry does */
+            bool dead = bf->defpos[v] == bf->endpos[v];
+            if (cls == BCLS_GP && gi < 8) { if (!dead) { gs[ng] = (Loc){ 1, BCLS_GP, ARG_GP[gi], 0 }; gd[ng] = dst; ng++; } gi++; }
+            else if (cls == BCLS_FP && fi2 < 8) { if (!dead) { fs[nf] = (Loc){ 1, BCLS_FP, fi2, 0 }; fd[nf] = dst; nf++; } fi2++; }
             else {
                 Loc src = { 0, (int8_t)cls, -1000 - stk, -(16 + 8 * stk) };
                 stk++;
+                if (dead) continue;
                 if (cls == BCLS_GP) { gs[ng] = src; gd[ng] = dst; ng++; }
                 else if (cls == BCLS_FP) { fs[nf] = src; fd[nf] = dst; nf++; }
             }
@@ -864,6 +875,7 @@ static int emit_func(Ctx *c, int fi) {
         free(gs); free(gd); free(fs); free(fd);
         /* canonical form: narrow integer params are masked in place */
         for (int i = 0; i < b0->nargs; i++) {
+            if (bf->defpos[b0->arg_vals[i]] == bf->endpos[b0->arg_vals[i]]) continue;
             Type pt = b0->arg_types[i];
             if (pt.kind == TY_INT && pt.bits < 64) {
                 Loc *l = &bf->loc[b0->arg_vals[i]];

@@ -1466,12 +1466,16 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
                         }
                         /* Two-stream i64 takes the scalar-unroll path, whose
                          * unrolled body keeps both pointers and all
-                         * accumulators live at once; the native allocator
-                         * spills it (measured +72.6% on the i64 bench
-                         * kernel), so the class fires only when real
-                         * vector lanes exist. */
-                        if (a_arg >= 0 && b_arg >= 0 &&
-                            !(c_geps[s0]->ety.kind == TY_INT && c_geps[s0]->ety.bits == 64)) {
+                         * accumulators live at once; the pre-Belady
+                         * allocator spilled it (measured +72.6% on the
+                         * i64 bench kernel), so the class used to fire
+                         * only when real vector lanes exist. WP15: the
+                         * Belady allocator holds the unrolled body
+                         * spill-free, so the class fires for i64 too
+                         * (dot: -26% native, -43% LLVM vs the scalar
+                         * loop; the v2i64 vector body was also measured
+                         * and lost to the unroll, +9%). */
+                        if (a_arg >= 0 && b_arg >= 0) {
                             is_dot = true;
                             is_reduce = true;
                             acc_arg_idx = acc_cand;

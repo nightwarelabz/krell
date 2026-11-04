@@ -327,6 +327,10 @@ static void emit_branch(Ctx *c, int tgt, const int32_t *args, int nargs) {
     int ng = 0, nf = 0;
     for (int i = 0; i < nargs; i++) {
         int sv = args[i], dv = tb->arg_vals[i];
+        /* dead-on-arrival block args have no home; skip their edge
+         * moves (see the aarch64 backend note -- the recursive fact
+         * case stored over the saved frame pointer without this) */
+        if (c->bf->defpos[dv] == c->bf->endpos[dv]) continue;
         int cls = be_class_of(f->vtypes[sv]);
         if (cls == BCLS_GP) { gs[ng] = c->bf->loc[sv]; gd[ng] = c->bf->loc[dv]; ng++; }
         else if (cls == BCLS_FP) { fs[nf] = c->bf->loc[sv]; fd[nf] = c->bf->loc[dv]; nf++; }
@@ -910,7 +914,7 @@ static int emit_func(Ctx *c, int fi) {
     Module *m = c->m;
     Func *f = &m->funcs[fi];
     c->f = f; c->fi = fi; c->lbl = 0;
-    Pools pools = { POOL_GP, 21, POOL_FP, 24 };
+    Pools pools = { POOL_GP, 21, POOL_FP, 24, 0 };
     BeFunc *bf = be_analyze(m, f, &pools);
     if (!bf) return -1;
     c->bf = bf;
@@ -939,11 +943,13 @@ static int emit_func(Ctx *c, int fi) {
             int v = b0->arg_vals[i];
             int cls = be_class_of(b0->arg_types[i]);
             Loc dst = bf->loc[v];
-            if (cls == BCLS_GP && gi < 8) { gs[ng] = (Loc){ 1, BCLS_GP, ARG_GP[gi], 0 }; gd[ng] = dst; ng++; gi++; }
-            else if (cls == BCLS_FP && fi2 < 8) { fs[nf] = (Loc){ 1, BCLS_FP, 10 + fi2, 0 }; fd[nf] = dst; nf++; fi2++; }
+            bool dead = bf->defpos[v] == bf->endpos[v];
+            if (cls == BCLS_GP && gi < 8) { if (!dead) { gs[ng] = (Loc){ 1, BCLS_GP, ARG_GP[gi], 0 }; gd[ng] = dst; ng++; } gi++; }
+            else if (cls == BCLS_FP && fi2 < 8) { if (!dead) { fs[nf] = (Loc){ 1, BCLS_FP, 10 + fi2, 0 }; fd[nf] = dst; nf++; } fi2++; }
             else {
                 Loc src = { 0, (int8_t)cls, -1000 - stk, -(16 + 8 * stk) };
                 stk++;
+                if (dead) continue;
                 if (cls == BCLS_GP) { gs[ng] = src; gd[ng] = dst; ng++; }
                 else if (cls == BCLS_FP) { fs[nf] = src; fd[nf] = dst; nf++; }
             }
@@ -953,6 +959,7 @@ static int emit_func(Ctx *c, int fi) {
         free(gs); free(gd); free(fs); free(fd);
         /* canonical form: narrow integer params are masked in place */
         for (int i = 0; i < b0->nargs; i++) {
+            if (bf->defpos[b0->arg_vals[i]] == bf->endpos[b0->arg_vals[i]]) continue;
             Type pt = b0->arg_types[i];
             if (pt.kind == TY_INT && pt.bits < 64) {
                 Loc *l = &bf->loc[b0->arg_vals[i]];
