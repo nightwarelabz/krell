@@ -1007,9 +1007,35 @@ static void emit_instr(Ctx *c, int bi, int ii) {
             locstr(c, sb, sizeof sb, in->b, t.bits == 64 ? 8 : 4);
         }
 
+        /* WP19: strength-reduce small constant multiplies. The LEA
+         * forms have 1-cycle latency against imul's 3, which shortens
+         * dependent chains (the parse kernel's cur = cur*10 + d is the
+         * measured case); a power-of-two multiplier is a shift. Low
+         * bits are identical to imul for every form. */
+        int mul_form = 0, mul_shift = 0;
+        if (in->op == OP_MUL && be_iconst_val(f, in->b, &imm)) {
+            if (imm == 3 || imm == 5 || imm == 9) mul_form = (int)imm;
+            else if (imm == 10) mul_form = 10;
+            else if (imm > 1 && (imm & (imm - 1)) == 0) {
+                mul_form = -1;
+                while ((1LL << mul_shift) < imm) mul_shift++;
+                if (mul_shift >= t.bits) mul_form = 0; /* shift count
+                    would meet or exceed the type width: keep imul */
+            }
+        }
+
         if (t.bits == 64) {
             load_gp(c, dreg_use, in->a);
-            E(c, "  %s %s, %s", nm, G64[dreg_use], sb);
+            if (mul_form == 3 || mul_form == 5 || mul_form == 9)
+                E(c, "  lea %s, [%s + %s*%d]", G64[dreg_use], G64[dreg_use], G64[dreg_use], mul_form - 1);
+            else if (mul_form == 10) {
+                E(c, "  lea %s, [%s + %s*4]", G64[dreg_use], G64[dreg_use], G64[dreg_use]);
+                E(c, "  lea %s, [%s + %s*1]", G64[dreg_use], G64[dreg_use], G64[dreg_use]);
+            }
+            else if (mul_form == -1)
+                E(c, "  shl %s, %d", G64[dreg_use], mul_shift);
+            else
+                E(c, "  %s %s, %s", nm, G64[dreg_use], sb);
         } else {
             Loc *al = &c->bf->loc[in->a];
             if (al->is_reg && al->cls == BCLS_GP && al->idx == dreg_use) {
@@ -1018,7 +1044,16 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                 char ab[64]; locstr(c, ab, sizeof ab, in->a, 4);
                 E(c, "  mov %s, %s", G32[dreg_use], ab);
             }
-            E(c, "  %s %s, %s", nm, G32[dreg_use], sb);
+            if (mul_form == 3 || mul_form == 5 || mul_form == 9)
+                E(c, "  lea %s, [%s + %s*%d]", G32[dreg_use], G32[dreg_use], G32[dreg_use], mul_form - 1);
+            else if (mul_form == 10) {
+                E(c, "  lea %s, [%s + %s*4]", G32[dreg_use], G32[dreg_use], G32[dreg_use]);
+                E(c, "  lea %s, [%s + %s*1]", G32[dreg_use], G32[dreg_use], G32[dreg_use]);
+            }
+            else if (mul_form == -1)
+                E(c, "  shl %s, %d", G32[dreg_use], mul_shift);
+            else
+                E(c, "  %s %s, %s", nm, G32[dreg_use], sb);
             if (t.bits < 32) {
                 int k = 64 - t.bits;
                 E(c, "  shl %s, %d", G64[dreg_use], k);
@@ -2278,6 +2313,7 @@ static bool emit_binary_recursion_specialization(Ctx *c, int fi) {
     /* Matched! Emit specialized tail-recursion elimination loop */
     E(c, ".globl %s", f->name);
     E(c, ".type %s, @function", f->name);
+    E(c, "  .p2align 4");
     E(c, "%s:", f->name);
     E(c, "  cmp rdi, 2");
     E(c, "  jl .Lx%d_base", fi);
@@ -2494,6 +2530,7 @@ static int emit_func(Ctx *c, int fi) {
     int early_lbl = 0;
     E(c, ".globl %s", f->name);
     E(c, ".type %s, @function", f->name);
+    E(c, "  .p2align 4");
     E(c, "%s:", f->name);
     if (er.eligible) {
         early_lbl = ++c->lbl;
@@ -2652,8 +2689,27 @@ static int emit_func(Ctx *c, int fi) {
             E(c, "  ret");
         }
     }
+    /* WP19: align loop heads to 16 bytes, as C compilers do
+     * (-falign-loops): a loop head landing just past a fetch
+     * boundary measurably loses on this class of host, and this
+     * emitter previously produced no alignment at all, leaving
+     * every loop's placement to link order. A block is a loop head
+     * when some block at or after it branches back to it. */
+    bool *loop_head = calloc((size_t)f->nblocks, sizeof(bool));
+    for (int q = 0; q < f->nblocks; q++) {
+        Block *qb = &f->blocks[q];
+        if (qb->nins < 1) continue;
+        Instr *t = &qb->ins[qb->nins - 1];
+        if (t->op == OP_BR) {
+            if (t->blk >= 0 && t->blk <= q) loop_head[t->blk] = true;
+        } else if (t->op == OP_CONDBR) {
+            if (t->blk >= 0 && t->blk <= q) loop_head[t->blk] = true;
+            if (t->blk2 >= 0 && t->blk2 <= q) loop_head[t->blk2] = true;
+        }
+    }
     for (int b = 0; b < f->nblocks; b++) {
         if (er.eligible && (b == 0 || b == er.early_blk)) continue;
+        if (loop_head[b]) E(c, "  .p2align 4");
         E(c, ".Lb%d_%d:", fi, b);
         /* A matched block whose light value is not the one splatted
          * in the prologue (a different block argument carrying the
@@ -2674,6 +2730,7 @@ static int emit_func(Ctx *c, int fi) {
         for (int i = 0; i < f->blocks[b].nins; i++)
             emit_instr(c, b, i);
     }
+    free(loop_head);
     E(c, ".size %s, .-%s", f->name, f->name);
     be_free(bf);
     c->bf = NULL;
