@@ -7,6 +7,7 @@
 #define U(f, blk, op, ty, a)    emit((f), (blk), ins_un((op), (ty), (a)))
 #define K(f, blk, ty, v)        emit((f), (blk), ins_iconst((ty), (v)))
 #define IC(F_, BLK, PRED, A, B)  ({ Instr _i = ins_make(OP_ICMP, ty_i1()); _i.a = (A); _i.b = (B); _i.pred = (PRED); emit((F_), (BLK), _i); })
+#define T3(F_, BLK, OP, TY, A, B, C) ({ Instr _i = ins_make((OP), (TY)); _i.a = (A); _i.b = (B); _i.c = (C); emit((F_), (BLK), _i); })
 #define FC(F_, BLK, PRED, A, B)  ({ Instr _i = ins_make(OP_FCMP, ty_i1()); _i.a = (A); _i.b = (B); _i.pred = (PRED); emit((F_), (BLK), _i); })
 #define ARG(f, blk, i)          ((f)->blocks[(blk)].arg_vals[(i)])
 
@@ -563,6 +564,184 @@ Module *build_battery(void) {
         for (int i = 0; i < 16; i++) r = B(f, b, OP_ADD, ty_i64(), r, vs[i]);
         emit(f, b, ins_ret(r));
     }
+    /* 36 clobx(i64 seed) -> i64 : register-pressure loop saturated
+     * with clobber-class operations -- twelve loop-carried values
+     * stay live across a variable shift (count is itself a carried
+     * value), a funnel shift, a division (divisor likewise), and a
+     * store/load round trip under pressure. Exercises the x86
+     * clobber-aware pool: homes in RAX/RCX/RDX are only sound where
+     * the clobber analysis proves the interval clear, and operands
+     * consumed by the clobbering instruction itself rely on the
+     * blessing rules. */
+    {
+        Func *f = mod_add_func(m, "clobx", ty_i64(), 0);
+        int b0 = func_add_block(f, (Type[]){ ty_i64() }, 1);
+        Type ht[14];
+        for (int i = 0; i < 14; i++) ht[i] = ty_i64();
+        int b1 = func_add_block(f, ht, 14);
+        int b2 = func_add_block(f, (Type[]){ ty_i64() }, 1);
+        int seed = ARG(f, b0, 0);
+        Instr al = ins_make(OP_ALLOCA, ty_ptr()); al.imm = 8; al.c = 8;
+        int cell = emit(f, b0, al);
+        int v0[12];
+        for (int i = 0; i < 12; i++)
+            v0[i] = B(f, b0, OP_ADD, ty_i64(), seed, K(f, b0, ty_i64(), i * 37 + 11));
+        emit(f, b0, ins_br(b1, ids_dup((int32_t[]){ v0[0], v0[1], v0[2], v0[3], v0[4], v0[5],
+                        v0[6], v0[7], v0[8], v0[9], v0[10], v0[11],
+                        K(f, b0, ty_i64(), 0), K(f, b0, ty_i64(), 0) }, 14), 14));
+        int v[12], it, acc;
+        for (int i = 0; i < 12; i++) v[i] = ARG(f, b1, i);
+        it = ARG(f, b1, 12); acc = ARG(f, b1, 13);
+        int t0 = B(f, b1, OP_SHL, ty_i64(), v[0], v[1]);
+        int t1 = T3(f, b1, OP_FSHL, ty_i64(), v[2], v[3], v[4]);
+        int dv = B(f, b1, OP_OR, ty_i64(), v[6], K(f, b1, ty_i64(), 1));
+        int t2 = B(f, b1, OP_SDIV, ty_i64(), v[5], dv);
+        Instr st = ins_make(OP_STORE, ty_i64()); st.a = cell; st.b = v[7];
+        emit(f, b1, st);
+        Instr ld = ins_make(OP_LOAD, ty_i64()); ld.a = cell;
+        int t3 = emit(f, b1, ld);
+        int n[12];
+        n[0] = B(f, b1, OP_ADD, ty_i64(), v[0], t0);
+        n[1] = B(f, b1, OP_XOR, ty_i64(), v[1], t1);
+        n[2] = B(f, b1, OP_ADD, ty_i64(), v[2], t2);
+        n[3] = B(f, b1, OP_ADD, ty_i64(), B(f, b1, OP_MUL, ty_i64(), v[3], K(f, b1, ty_i64(), 3)), t3);
+        n[4] = B(f, b1, OP_ADD, ty_i64(), v[4], v[8]);
+        n[5] = B(f, b1, OP_ADD, ty_i64(), v[5], v[9]);
+        n[6] = B(f, b1, OP_ADD, ty_i64(), v[6], v[10]);
+        n[7] = B(f, b1, OP_ADD, ty_i64(), v[7], v[11]);
+        n[8] = B(f, b1, OP_ADD, ty_i64(), v[8], t0);
+        n[9] = B(f, b1, OP_ADD, ty_i64(), v[9], t1);
+        n[10] = B(f, b1, OP_ADD, ty_i64(), v[10], t2);
+        n[11] = B(f, b1, OP_ADD, ty_i64(), v[11], t3);
+        int nacc = B(f, b1, OP_ADD, ty_i64(), acc, t2);
+        int nit = B(f, b1, OP_ADD, ty_i64(), it, K(f, b1, ty_i64(), 1));
+        int cnd = IC(f, b1, IC_SLT, nit, K(f, b1, ty_i64(), 24));
+        emit(f, b1, ins_condbr(cnd, b1, ids_dup((int32_t[]){ n[0], n[1], n[2], n[3], n[4], n[5],
+                        n[6], n[7], n[8], n[9], n[10], n[11], nit, nacc }, 14), 14,
+                                   b2, ids_dup((int32_t[]){ nacc }, 1), 1));
+        emit(f, b2, ins_ret(ARG(f, b2, 0)));
+    }
+    /* 37 clobcall(i64 seed) -> i64 : mixed intervals -- six long
+     * values live across two calls while a burst of short shift /
+     * funnel / divide temps churns between them. The long values
+     * must never sit in a caller-saved home; the temps may. */
+    {
+        Func *f = mod_add_func(m, "clobcall", ty_i64(), 0);
+        int fi_arith = mod_find_func(m, "arith64");
+        int b = func_add_block(f, (Type[]){ ty_i64() }, 1);
+        int x = ARG(f, b, 0);
+        int L[6];
+        for (int i = 0; i < 6; i++)
+            L[i] = B(f, b, OP_ADD, ty_i64(), B(f, b, OP_MUL, ty_i64(), x, K(f, b, ty_i64(), i + 2)),
+                     K(f, b, ty_i64(), i * 101 + 7));
+        int c1 = emit(f, b, ins_call(ty_i64(), fi_arith, false,
+                        ids_dup((int32_t[]){ L[0], L[1] }, 2), 2, false));
+        int ts = K(f, b, ty_i64(), 0);
+        for (int i = 0; i < 6; i++) {
+            int t = B(f, b, OP_SHL, ty_i64(), L[i], B(f, b, OP_AND, ty_i64(), L[(i + 2) % 6], K(f, b, ty_i64(), 63)));
+            t = T3(f, b, OP_FSHR, ty_i64(), t, L[(i + 1) % 6], B(f, b, OP_AND, ty_i64(), L[(i + 3) % 6], K(f, b, ty_i64(), 63)));
+            t = B(f, b, OP_ADD, ty_i64(), t, B(f, b, OP_SDIV, ty_i64(), L[(i + 4) % 6],
+                      B(f, b, OP_OR, ty_i64(), L[(i + 5) % 6], K(f, b, ty_i64(), 1))));
+            ts = B(f, b, OP_ADD, ty_i64(), ts, t);
+        }
+        int c2 = emit(f, b, ins_call(ty_i64(), fi_arith, false,
+                        ids_dup((int32_t[]){ L[2], L[3] }, 2), 2, false));
+        int r = B(f, b, OP_ADD, ty_i64(), c1, c2);
+        r = B(f, b, OP_ADD, ty_i64(), r, ts);
+        for (int i = 0; i < 6; i++) r = B(f, b, OP_ADD, ty_i64(), r, L[i]);
+        emit(f, b, ins_ret(r));
+    }
+    /* 38 selx(i64 seed) -> i64 : two-state interleave selects under
+     * register pressure -- state = turn ? s1 : s2, then s1/s2 are
+     * conditionally updated from the decoded value while six other
+     * values stay live. Witness for the x86 OP_SELECT emission
+     * hazard: when the allocator homes a select's result in its
+     * true arm's register, a false-arm-first copy order destroys
+     * the arm before the conditional copy reads it. */
+    {
+        Func *f = mod_add_func(m, "selx", ty_i64(), 0);
+        int b0 = func_add_block(f, (Type[]){ ty_i64() }, 1);
+        Type ht[11];
+        for (int i = 0; i < 11; i++) ht[i] = ty_i64();
+        int b1 = func_add_block(f, ht, 11);
+        int b2 = func_add_block(f, (Type[]){ ty_i64() }, 1);
+        int seed = ARG(f, b0, 0);
+        int iv[11];
+        for (int i = 0; i < 11; i++)
+            iv[i] = B(f, b0, OP_ADD, ty_i64(), seed, K(f, b0, ty_i64(), i * 53 + 3));
+        iv[2] = K(f, b0, ty_i64(), 0);   /* turn */
+        iv[9] = K(f, b0, ty_i64(), 0);   /* it */
+        iv[10] = K(f, b0, ty_i64(), 0);  /* acc */
+        emit(f, b0, ins_br(b1, ids_dup(iv, 11), 11));
+        int s1 = ARG(f, b1, 0), s2 = ARG(f, b1, 1), turn = ARG(f, b1, 2);
+        int p[6];
+        for (int i = 0; i < 6; i++) p[i] = ARG(f, b1, 3 + i);
+        int it = ARG(f, b1, 9), acc = ARG(f, b1, 10);
+        Instr eq = ins_make(OP_ICMP, ty_i1()); eq.a = turn; eq.b = K(f, b1, ty_i64(), 0); eq.pred = IC_EQ;
+        int ist1 = emit(f, b1, eq);
+        Instr sel0 = ins_make(OP_SELECT, ty_i64()); sel0.a = ist1; sel0.b = s1; sel0.c = s2;
+        int state = emit(f, b1, sel0);
+        int snew = B(f, b1, OP_ADD, ty_i64(), B(f, b1, OP_MUL, ty_i64(), state, K(f, b1, ty_i64(), 31)),
+                     B(f, b1, OP_XOR, ty_i64(), p[0], p[3]));
+        Instr sel1 = ins_make(OP_SELECT, ty_i64()); sel1.a = ist1; sel1.b = snew; sel1.c = s1;
+        int s1n = emit(f, b1, sel1);
+        Instr sel2 = ins_make(OP_SELECT, ty_i64()); sel2.a = ist1; sel2.b = s2; sel2.c = snew;
+        int s2n = emit(f, b1, sel2);
+        int np[6], nacc = acc;
+        for (int i = 0; i < 6; i++) {
+            np[i] = B(f, b1, OP_ADD, ty_i64(), p[i], B(f, b1, OP_SHL, ty_i64(), snew, K(f, b1, ty_i64(), i + 1)));
+            nacc = B(f, b1, OP_ADD, ty_i64(), nacc, np[i]);
+        }
+        int nit = B(f, b1, OP_ADD, ty_i64(), it, K(f, b1, ty_i64(), 1));
+        int nturn = B(f, b1, OP_XOR, ty_i64(), turn, K(f, b1, ty_i64(), 1));
+        int cnd = IC(f, b1, IC_SLT, nit, K(f, b1, ty_i64(), 30));
+        int b3 = func_add_block(f, ht, 11);
+        emit(f, b1, ins_condbr(cnd, b3, ids_dup((int32_t[]){ s1n, s2n, nturn, np[0], np[1], np[2],
+                        np[3], np[4], np[5], nit, nacc }, 11), 11,
+                                   b2, ids_dup((int32_t[]){ nacc }, 1), 1));
+        /* the body block returns to the header with an unconditional
+         * branch -- the shape under which the allocator hands the
+         * s2 select its true arm's home via block-arg coalescing */
+        int fwd[11];
+        for (int i = 0; i < 11; i++) fwd[i] = ARG(f, b3, i);
+        emit(f, b3, ins_br(b1, ids_dup(fwd, 11), 11));
+        emit(f, b2, ins_ret(ARG(f, b2, 0)));
+    }
+    /* 39 rotw(i64 w, i64 u0) -> i64 : loop-rotation witness. The
+     * header/body split passes every value through the body block,
+     * so identity block-argument elimination removes ALL of the
+     * body's parameters and its instructions end up referencing the
+     * header's parameters directly. Loop rotation rewrites the
+     * back edge into a self edge bound by the body's own parameter
+     * list; for this shape the carried values (i, u, acc) have no
+     * binding on that edge, so rotation must reject the loop --
+     * rotating it freezes the carried values at their entry values
+     * (the krellproof span kernel hangs on exactly this shape).
+     * Expected: acc = sum of u over w iterations, u stepping by 3. */
+    {
+        Func *f = mod_add_func(m, "rotw", ty_i64(), 0);
+        Type pt[5];
+        for (int i = 0; i < 5; i++) pt[i] = ty_i64();
+        int b0 = func_add_block(f, (Type[]){ ty_i64(), ty_i64() }, 2);
+        int b1 = func_add_block(f, pt, 5);
+        int b2 = func_add_block(f, pt, 5);
+        int b3 = func_add_block(f, (Type[]){ ty_i64() }, 1);
+        int w = ARG(f, b0, 0), u0 = ARG(f, b0, 1);
+        emit(f, b0, ins_br(b1, ids_dup((int32_t[]){ K(f, b0, ty_i64(), 0), u0,
+                        K(f, b0, ty_i64(), 0), w, K(f, b0, ty_i64(), 3) }, 5), 5));
+        int hi = ARG(f, b1, 0), hu = ARG(f, b1, 1), hacc = ARG(f, b1, 2);
+        int hw = ARG(f, b1, 3), hdu = ARG(f, b1, 4);
+        int c = IC(f, b1, IC_SLT, hi, hw);
+        emit(f, b1, ins_condbr(c, b2, ids_dup((int32_t[]){ hi, hu, hacc, hw, hdu }, 5), 5,
+                                  b3, ids_dup((int32_t[]){ hacc }, 1), 1));
+        int bi = ARG(f, b2, 0), bu = ARG(f, b2, 1), bacc = ARG(f, b2, 2);
+        int bw = ARG(f, b2, 3), bdu = ARG(f, b2, 4);
+        int nacc = B(f, b2, OP_ADD, ty_i64(), bacc, bu);
+        int nu = B(f, b2, OP_ADD, ty_i64(), bu, bdu);
+        int ni = B(f, b2, OP_ADD, ty_i64(), bi, K(f, b2, ty_i64(), 1));
+        emit(f, b2, ins_br(b1, ids_dup((int32_t[]){ ni, nu, nacc, bw, bdu }, 5), 5));
+        emit(f, b3, ins_ret(ARG(f, b3, 0)));
+    }
     /* 34 tadd/tmul: indirect-call targets (no driver cases of their own) */
     {
         Func *f = mod_add_func(m, "tadd", ty_i64(), 0);
@@ -631,6 +810,174 @@ Module *build_battery(void) {
         emit(f, b, ins_ret(emit(f, b, ins_call(ty_i64(),
             mod_find_extern(m, "alprobe"), true,
             ids_dup((int32_t[]){ ARG(f, b, 0) }, 1), 1, false))));
+    }
+    /* 38 fsh64(i64 a, i64 b, i64 s) -> i64 : funnel shifts at 64 bits,
+     * including the a == b rotate form */
+    {
+        Func *f = mod_add_func(m, "fsh64", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_i64(), ty_i64(), ty_i64() }, 3);
+        int a = ARG(f, b, 0), bb = ARG(f, b, 1), s = ARG(f, b, 2);
+        int l = T3(f, b, OP_FSHL, ty_i64(), a, bb, s);
+        int r = T3(f, b, OP_FSHR, ty_i64(), bb, a, s);
+        int rol = T3(f, b, OP_FSHL, ty_i64(), a, a, s);
+        int x = B(f, b, OP_XOR, ty_i64(), l, r);
+        x = B(f, b, OP_ADD, ty_i64(), x, rol);
+        emit(f, b, ins_ret(x));
+    }
+    /* 39 fsh32(i32 a, i32 b, i32 s) -> i32 */
+    {
+        Func *f = mod_add_func(m, "fsh32", ty_i32(), 0);
+        int b = func_add_block(f, (Type[]){ ty_i32(), ty_i32(), ty_i32() }, 3);
+        int a = ARG(f, b, 0), bb = ARG(f, b, 1), s = ARG(f, b, 2);
+        int l = T3(f, b, OP_FSHL, ty_i32(), a, bb, s);
+        int r = T3(f, b, OP_FSHR, ty_i32(), bb, a, s);
+        int rol = T3(f, b, OP_FSHL, ty_i32(), a, a, s);
+        int x = B(f, b, OP_XOR, ty_i32(), l, r);
+        x = B(f, b, OP_ADD, ty_i32(), x, rol);
+        emit(f, b, ins_ret(x));
+    }
+    /* 41 asmchk(i64 a, i64 b) -> i64 : assume-driven folds. nb is in
+     * 1..8 by construction, so the assertion always holds; the select
+     * and the branch must resolve to the nb-path in optimized code,
+     * exactly as the interpreter computes them honestly. */
+    {
+        Func *f = mod_add_func(m, "asmchk", ty_i64(), 0);
+        int b0 = func_add_block(f, (Type[]){ ty_i64(), ty_i64() }, 2);
+        int a = ARG(f, b0, 0), bb = ARG(f, b0, 1);
+        int m = B(f, b0, OP_AND, ty_i64(), a, K(f, b0, ty_i64(), 7));
+        int nb = B(f, b0, OP_OR, ty_i64(), m, K(f, b0, ty_i64(), 1));
+        int nz = IC(f, b0, IC_NE, nb, K(f, b0, ty_i64(), 0));
+        Instr as = ins_make(OP_ASSUME, ty_void()); as.a = nz; emit(f, b0, as);
+        int z = IC(f, b0, IC_EQ, nb, K(f, b0, ty_i64(), 0));
+        int big = B(f, b0, OP_ADD, ty_i64(), bb, K(f, b0, ty_i64(), 1000));
+        int t3 = B(f, b0, OP_MUL, ty_i64(), nb, K(f, b0, ty_i64(), 3));
+        Instr sl = ins_make(OP_SELECT, ty_i64()); sl.a = z; sl.b = big; sl.c = t3;
+        int v = emit(f, b0, sl);
+        int b1 = func_add_block(f, (Type[]){ ty_i64() }, 1);
+        int b2 = func_add_block(f, (Type[]){ ty_i64() }, 1);
+        emit(f, b0, ins_condbr(nz, b1, ids_dup((int32_t[]){ v }, 1), 1,
+                                   b2, ids_dup((int32_t[]){ v }, 1), 1));
+        int v1 = ARG(f, b1, 0);
+        emit(f, b1, ins_ret(B(f, b1, OP_ADD, ty_i64(), v1, K(f, b1, ty_i64(), 5))));
+        int v2 = ARG(f, b2, 0);
+        emit(f, b2, ins_ret(B(f, b2, OP_SUB, ty_i64(), v2, K(f, b2, ty_i64(), 5))));
+    }
+    /* 42 extch(i32 a, i32 b) -> i64 : field-extraction chains --
+     * zext of narrow lshr/and/or/xor results, trunc of shifted
+     * values; the interpreter computes them at face value while the
+     * optimizer and backends strength-reduce them */
+    {
+        Func *f = mod_add_func(m, "extch", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_i32(), ty_i32() }, 2);
+        int a = ARG(f, b, 0), bb = ARG(f, b, 1);
+        int f1 = B(f, b, OP_LSHR, ty_i32(), a, K(f, b, ty_i32(), 24));
+        int z1 = emit(f, b, ins_un(OP_ZEXT, ty_i64(), f1));
+        int f2 = B(f, b, OP_AND, ty_i32(), a, K(f, b, ty_i32(), 65535));
+        int z2 = emit(f, b, ins_un(OP_ZEXT, ty_i64(), f2));
+        int f3 = B(f, b, OP_XOR, ty_i32(), a, bb);
+        int f4 = B(f, b, OP_AND, ty_i32(), f3, K(f, b, ty_i32(), 255));
+        int z4 = emit(f, b, ins_un(OP_ZEXT, ty_i64(), f4));
+        int f5 = B(f, b, OP_LSHR, ty_i32(), a, K(f, b, ty_i32(), 16));
+        int t5 = emit(f, b, ins_un(OP_TRUNC, ty_i8(), f5));
+        int z5 = emit(f, b, ins_un(OP_ZEXT, ty_i64(), t5));
+        int r = B(f, b, OP_ADD, ty_i64(), z1, B(f, b, OP_MUL, ty_i64(), z2, K(f, b, ty_i64(), 3)));
+        r = B(f, b, OP_ADD, ty_i64(), r, B(f, b, OP_MUL, ty_i64(), z4, K(f, b, ty_i64(), 5)));
+        r = B(f, b, OP_ADD, ty_i64(), r, B(f, b, OP_MUL, ty_i64(), z5, K(f, b, ty_i64(), 7)));
+        emit(f, b, ins_ret(r));
+    }
+    /* 40 fsh16(i16 a, i16 b, i16 s) -> i16 */
+    {
+        Func *f = mod_add_func(m, "fsh16", ty_i16(), 0);
+        int b = func_add_block(f, (Type[]){ ty_i16(), ty_i16(), ty_i16() }, 3);
+        int a = ARG(f, b, 0), bb = ARG(f, b, 1), s = ARG(f, b, 2);
+        int l = T3(f, b, OP_FSHL, ty_i16(), a, bb, s);
+        int r = T3(f, b, OP_FSHR, ty_i16(), bb, a, s);
+        int rol = T3(f, b, OP_FSHL, ty_i16(), a, a, s);
+        int x = B(f, b, OP_XOR, ty_i16(), l, r);
+        x = B(f, b, OP_ADD, ty_i16(), x, rol);
+        emit(f, b, ins_ret(x));
+    }
+    /* 43 stx(ptr out, ptr tab, i64 n) -> i64 : store-through-folded-GEP
+     * pressure case, shaped like an entropy-decoder body: eight
+     * loop-carried block arguments, four interleaved rounds per
+     * iteration, each round loading a table entry, extracting three
+     * fields, and storing a byte through gep(out, i + k) while the
+     * index add and the stored byte are both live among a dozen other
+     * values. Regression guard: a backend that materializes the
+     * folded address and the stored value through one shared scratch
+     * register corrupts the store address as soon as the allocator
+     * spills either operand; the B-case image compare catches the
+     * misdirected stores byte for byte. States are masked to the
+     * 32-entry table inside the image. */
+    {
+        Func *f = mod_add_func(m, "stx", ty_i64(), 0);
+        Type hd[10] = { ty_i64(), ty_i64(), ty_i64(), ty_i64(), ty_i64(), ty_i64(), ty_ptr(), ty_ptr(), ty_i64(), ty_i64() };
+        int b0 = func_add_block(f, (Type[]){ ty_ptr(), ty_ptr(), ty_i64() }, 3);
+        int b1 = func_add_block(f, hd, 10);
+        int b2 = func_add_block(f, hd, 10);
+        int b3 = func_add_block(f, (Type[]){ ty_i64() }, 1);
+        int out = ARG(f, b0, 0), tab = ARG(f, b0, 1), n0 = ARG(f, b0, 2);
+        int z0 = K(f, b0, ty_i64(), 0), p0 = K(f, b0, ty_i64(), 100);
+        emit(f, b0, ins_br(b1, ids_dup((int32_t[]){ z0, z0, z0, z0, p0, z0, out, tab, n0, z0 }, 10), 10));
+        int hi = ARG(f, b1, 0);
+        int hout = ARG(f, b1, 6), htab = ARG(f, b1, 7), hn = ARG(f, b1, 8);
+        int hcont = ARG(f, b1, 3), hacc = ARG(f, b1, 9);
+        int hcnd = IC(f, b1, IC_SLT, hi, hn);
+        int htot = B(f, b1, OP_ADD, ty_i64(), hacc, hcont);
+        int hargs[10]; for (int q = 0; q < 10; q++) hargs[q] = ARG(f, b1, q);
+        emit(f, b1, ins_condbr(hcnd, b2, ids_dup(hargs, 10), 10,
+                                     b3, ids_dup((int32_t[]){ htot }, 1), 1));
+        (void)hout; (void)htab;
+        int i = ARG(f, b2, 0), s1 = ARG(f, b2, 1), s2 = ARG(f, b2, 2);
+        int cont = ARG(f, b2, 3), poff = ARG(f, b2, 4), cons = ARG(f, b2, 5);
+        int bout = ARG(f, b2, 6), btab = ARG(f, b2, 7), bn = ARG(f, b2, 8);
+        int acc = ARG(f, b2, 9);
+        int states[2] = { s1, s2 };
+        /* all four store indices computed up front: they stay live
+         * across every round, under the full carried state */
+        int idxs[4];
+        idxs[0] = i;
+        for (int k = 1; k < 4; k++) idxs[k] = B(f, b2, OP_ADD, ty_i64(), i, K(f, b2, ty_i64(), k));
+        for (int k = 0; k < 4; k++) {
+            int st = states[k & 1];
+            Instr g = ins_make(OP_GEP, ty_ptr()); g.a = btab; g.b = st; g.ety = ty_i32();
+            int gp = emit(f, b2, g);
+            Instr ld = ins_make(OP_LOAD, ty_i32()); ld.a = gp;
+            int e = emit(f, b2, ld);
+            int nb32 = B(f, b2, OP_LSHR, ty_i32(), e, K(f, b2, ty_i32(), 24));
+            int nb = emit(f, b2, ins_un(OP_ZEXT, ty_i64(), nb32));
+            nb = B(f, b2, OP_AND, ty_i64(), nb, K(f, b2, ty_i64(), 15));
+            int sy32 = B(f, b2, OP_LSHR, ty_i32(), e, K(f, b2, ty_i32(), 16));
+            int sy = emit(f, b2, ins_un(OP_TRUNC, ty_i8(), sy32));
+            int ns32 = B(f, b2, OP_AND, ty_i32(), e, K(f, b2, ty_i32(), 65535));
+            int ns = emit(f, b2, ins_un(OP_ZEXT, ty_i64(), ns32));
+            int sh = B(f, b2, OP_SHL, ty_i64(), cont, cons);
+            int rs = B(f, b2, OP_SUB, ty_i64(), K(f, b2, ty_i64(), 64), nb);
+            int lb0 = B(f, b2, OP_LSHR, ty_i64(), sh, rs);
+            Instr sel = ins_make(OP_SELECT, ty_i64());
+            sel.a = IC(f, b2, IC_EQ, nb, K(f, b2, ty_i64(), 0)); sel.b = K(f, b2, ty_i64(), 0); sel.c = lb0;
+            int lb = emit(f, b2, sel);
+            int nst = B(f, b2, OP_ADD, ty_i64(), ns, lb);
+            nst = B(f, b2, OP_AND, ty_i64(), nst, K(f, b2, ty_i64(), 31));
+            int idx = idxs[k];
+            Instr g2 = ins_make(OP_GEP, ty_ptr()); g2.a = bout; g2.b = idx; g2.ety = ty_i8();
+            int dp = emit(f, b2, g2);
+            Instr st8 = ins_make(OP_STORE, ty_i8()); st8.a = dp; st8.b = sy;
+            emit(f, b2, st8);
+            cons = B(f, b2, OP_ADD, ty_i64(), cons, nb);
+            acc = B(f, b2, OP_ADD, ty_i64(), acc, nst);
+            states[k & 1] = nst;
+        }
+        int nb8 = B(f, b2, OP_LSHR, ty_i64(), cons, K(f, b2, ty_i64(), 3));
+        int poffn = B(f, b2, OP_SUB, ty_i64(), poff, nb8);
+        int consn = B(f, b2, OP_AND, ty_i64(), cons, K(f, b2, ty_i64(), 7));
+        Instr g3 = ins_make(OP_GEP, ty_ptr()); g3.a = btab; g3.b = poffn; g3.ety = ty_i8();
+        int pp = emit(f, b2, g3);
+        Instr lc = ins_make(OP_LOAD, ty_i64()); lc.a = pp;
+        int contn = emit(f, b2, lc);
+        int inext = B(f, b2, OP_ADD, ty_i64(), i, K(f, b2, ty_i64(), 4));
+        emit(f, b2, ins_br(b1, ids_dup((int32_t[]){ inext, states[0], states[1], contn, poffn, consn, bout, btab, bn, acc }, 10), 10));
+        emit(f, b3, ins_ret(ARG(f, b3, 0)));
     }
     return m;
 }

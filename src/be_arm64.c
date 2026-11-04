@@ -13,13 +13,13 @@ enum { X16 = 16, X17 = 17 };
 static const int ARG_GP[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
 
 static const PoolReg POOL_GP[] = {
-    { 9,0 }, { 10,0 }, { 11,0 }, { 12,0 }, { 13,0 }, { 14,0 }, { 15,0 },
-    { 19,1 }, { 20,1 }, { 21,1 }, { 22,1 }, { 23,1 }, { 24,1 }, { 25,1 },
-    { 26,1 }, { 27,1 }, { 28,1 },
+    { 9, 0, 0 }, { 10, 0, 0 }, { 11, 0, 0 }, { 12, 0, 0 }, { 13, 0, 0 }, { 14, 0, 0 }, { 15, 0, 0 },
+    { 19, 1, 0 }, { 20, 1, 0 }, { 21, 1, 0 }, { 22, 1, 0 }, { 23, 1, 0 }, { 24, 1, 0 }, { 25, 1, 0 },
+    { 26, 1, 0 }, { 27, 1, 0 }, { 28, 1, 0 },
 };
 static const PoolReg POOL_FP[] = {
-    { 16,0 }, { 17,0 }, { 18,0 }, { 19,0 }, { 20,0 }, { 21,0 }, { 22,0 }, { 23,0 },
-    { 8,1 }, { 9,1 }, { 10,1 }, { 11,1 }, { 12,1 }, { 13,1 }, { 14,1 }, { 15,1 },
+    { 16, 0, 0 }, { 17, 0, 0 }, { 18, 0, 0 }, { 19, 0, 0 }, { 20, 0, 0 }, { 21, 0, 0 }, { 22, 0, 0 }, { 23, 0, 0 },
+    { 8, 1, 0 }, { 9, 1, 0 }, { 10, 1, 0 }, { 11, 1, 0 }, { 12, 1, 0 }, { 13, 1, 0 }, { 14, 1, 0 }, { 15, 1, 0 },
 };
 
 typedef struct {
@@ -688,6 +688,45 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         store_gp(c, in->result, X16);
         break;
     }
+    case OP_FSHL: case OP_FSHR: {
+        /* No variable-amount funnel instruction exists on AArch64
+         * (extr takes an immediate), so compose from the two shifts.
+         * The (x >> 1) >> (bits-1-s) form keeps the s == 0 edge exact:
+         * the unwanted part shifts entirely out instead of wrapping.
+         * The first part is parked in x8 (argument registers are never
+         * allocated homes; see the file header) while the second part
+         * is computed in x16/x17. */
+        int bits = t.bits;
+        if (in->op == OP_FSHL) {
+            load_gp(c, X16, in->a);
+            load_gp(c, X17, in->c);
+            E(c, "  and x17, x17, #%d", bits - 1);
+            E(c, "  lsl x16, x16, x17");
+            E(c, "  mov x8, x16");
+            load_gp(c, X16, in->b);
+            E(c, "  lsr x16, x16, #1");
+            E(c, "  sub x17, x17, #%d", bits - 1);
+            E(c, "  neg x17, x17");
+            E(c, "  lsr x16, x16, x17");
+        } else {
+            load_gp(c, X16, in->a);
+            E(c, "  lsl x16, x16, #1");
+            load_gp(c, X17, in->c);
+            E(c, "  and x17, x17, #%d", bits - 1);
+            E(c, "  sub x17, x17, #%d", bits - 1);
+            E(c, "  neg x17, x17");
+            E(c, "  lsl x16, x16, x17");
+            E(c, "  mov x8, x16");
+            load_gp(c, X16, in->b);
+            load_gp(c, X17, in->c);
+            E(c, "  and x17, x17, #%d", bits - 1);
+            E(c, "  lsr x16, x16, x17");
+        }
+        E(c, "  orr x16, x16, x8");
+        mask_reg(c, X16, t);
+        store_gp(c, in->result, X16);
+        break;
+    }
     case OP_SDIV: emit_div(c, in, true, false); break;
     case OP_SREM: emit_div(c, in, true, true); break;
     case OP_UDIV: emit_div(c, in, false, false); break;
@@ -745,7 +784,7 @@ static void emit_instr(Ctx *c, int bi, int ii) {
     case OP_TRUNC: case OP_ZEXT: case OP_SEXT: {
         load_gp(c, X16, in->a);
         if (in->op == OP_SEXT) sext_reg(c, X16, f->vtypes[in->a].bits);
-        else mask_reg(c, X16, t);
+        else if (t.bits < 64) E(c, "  and x16, x16, #%llu", (unsigned long long)((1ULL << t.bits) - 1ULL));
         store_gp(c, in->result, X16);
         break;
     }
@@ -1206,7 +1245,7 @@ static int emit_func(Ctx *c, int fi) {
     Module *m = c->m;
     Func *f = &m->funcs[fi];
     c->f = f; c->fi = fi; c->lbl = 0;
-    Pools pools = { POOL_GP, 17, POOL_FP, 16, 0, 0 };
+    Pools pools = { POOL_GP, 17, POOL_FP, 16, 0, 0, NULL, NULL, NULL, NULL, NULL };
     BeFunc *bf = be_analyze(m, f, &pools);
     if (!bf) return -1;
     c->bf = bf;

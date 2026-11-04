@@ -406,6 +406,17 @@ static bool parse_instr(P *p, Func *f, int blk) {
         result = emit(f, blk, in);
         break;
     }
+    case OP_FSHL: case OP_FSHR: {
+        if (!parse_type(p, &ty)) return false;
+        int a = parse_value(p, f, blk, ty);
+        if (!eat_ch(p, ',')) return false;
+        int b = parse_value(p, f, blk, ty);
+        if (!eat_ch(p, ',')) return false;
+        int cv = parse_value(p, f, blk, ty);
+        Instr in = ins_make((uint8_t)op, ty); in.a = a; in.b = b; in.c = cv;
+        result = emit(f, blk, in);
+        break;
+    }
     case OP_SELECT: {
         if (!parse_type(p, &ty)) return false;
         int cd = parse_value(p, f, blk, ty_i1());
@@ -586,6 +597,13 @@ static bool parse_instr(P *p, Func *f, int blk) {
     }
     case OP_FENCE: {
         Instr in = ins_make(OP_FENCE, ty_void()); in.aux = (uint8_t)parse_order(p, w);
+        emit(f, blk, in);
+        result = -1;
+        break;
+    }
+    case OP_ASSUME: {
+        int a = parse_value(p, f, blk, ty_i1());
+        Instr in = ins_make(OP_ASSUME, ty_void()); in.a = a;
         emit(f, blk, in);
         result = -1;
         break;

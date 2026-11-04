@@ -242,6 +242,13 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
             R[0] = (uint64_t)r & msk(bits); break;
         }
         case OP_SHL: if (in->ty.bits == 128) put128(R, val128(A) << (unsigned)(val128(B) % 128)); else R[0] = (A[0] << (B[0] % (uint64_t)in->ty.bits)) & msk(in->ty.bits); break;
+        case OP_FSHL: case OP_FSHR: {
+            int bits = in->ty.bits; uint64_t m = msk(bits);
+            uint64_t ua = A[0] & m, ub = B[0] & m, s = C[0] % (uint64_t)bits;
+            if (in->op == OP_FSHL) R[0] = (s ? ((ua << s) | (ub >> ((uint64_t)bits - s))) : ua) & m;
+            else                   R[0] = (s ? ((ua << ((uint64_t)bits - s)) | (ub >> s)) : ub) & m;
+            break;
+        }
         case OP_LSHR: if (in->ty.bits == 128) put128(R, val128(A) >> (unsigned)(val128(B) % 128)); else R[0] = (A[0] & msk(in->ty.bits)) >> (B[0] % (uint64_t)in->ty.bits); break;
         case OP_ASHR: if (in->ty.bits == 128) put128(R, (unsigned __int128)((__int128)val128(A) >> (unsigned)(val128(B) % 128))); else R[0] = (uint64_t)(sx(A[0], in->ty.bits) >> (B[0] % (uint64_t)in->ty.bits)) & msk(in->ty.bits); break;
         case OP_ICMP: {

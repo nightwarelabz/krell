@@ -51,8 +51,13 @@ static const FSpec FUNCS[] = {
     { "fround2", 1, { AK_F64 }, RK_F32 },
     { "manyargs", 10, { AK_GP, AK_GP, AK_GP, AK_GP, AK_GP, AK_GP, AK_GP, AK_GP, AK_F64, AK_F64 }, RK_GP },
     { "spills",  1, { AK_GP }, RK_GP },
+    { "clobx",   1, { AK_GP }, RK_GP },
+    { "clobcall", 1, { AK_GP }, RK_GP },
+    { "selx",    1, { AK_GP }, RK_GP },
+    { "rotw",    2, { AK_GP, AK_GP }, RK_GP },
     /* memory functions (B cases) */
     { "mem",     3, { AK_PTR, AK_GP, AK_GP }, RK_GP },
+    { "stx",     3, { AK_PTR, AK_PTR, AK_GP }, RK_GP },
     { "atomic",  2, { AK_PTR, AK_GP }, RK_GP },
     { "rmw",     2, { AK_PTR, AK_GP }, RK_GP },
     { "rmw32",   2, { AK_PTR, AK_GP }, RK_GP },
@@ -69,6 +74,11 @@ static const FSpec FUNCS[] = {
     { "alchk",   2, { AK_F64, AK_F64 }, RK_GP },
     { "alchk1",  1, { AK_F64 }, RK_GP },
     { "vtail",   2, { AK_GP, AK_GP }, RK_GP },
+    { "asmchk",  2, { AK_GP, AK_GP }, RK_GP },
+    { "extch",   2, { AK_GP, AK_GP }, RK_GP },
+    { "fsh64",   3, { AK_GP, AK_GP, AK_GP }, RK_GP },
+    { "fsh32",   3, { AK_GP, AK_GP, AK_GP }, RK_GP },
+    { "fsh16",   3, { AK_GP, AK_GP, AK_GP }, RK_GP },
 };
 #define NFUNC (sizeof(FUNCS) / sizeof(FUNCS[0]))
 static int func_index(const char *name) {
@@ -225,6 +235,34 @@ static void gen_cases(void) {
     for (int i = 0; i < 8; i++)
         for (int j = 0; j < 8; j++)
             push_scalar("fcmp64", (uint64_t[]){ dbits(DPOOL[i * 3]), dbits(DPOOL[j * 3 + 1]) });
+    /* asmchk pairs */
+    for (int i = 0; i < 120; i++)
+        push_scalar("asmchk", (uint64_t[]){ rnd(), rnd() });
+    /* extch pairs (32-bit inputs) */
+    for (int i = 0; i < 10; i++)
+        for (int j = 0; j < 10; j++)
+            push_scalar("extch", (uint64_t[]){ (uint64_t)(uint32_t)IPOOL[i], (uint64_t)(uint32_t)IPOOL[j] });
+    for (int i = 0; i < 100; i++)
+        push_scalar("extch", (uint64_t[]){ (uint64_t)(uint32_t)rnd(), (uint64_t)(uint32_t)rnd() });
+    /* funnel shifts: edge amounts (0, width-1, width, width+1, huge)
+     * crossed with pool parts, plus random triples */
+    { static const uint64_t ss[] = { 0, 1, 2, 7, 15, 16, 31, 32, 33, 63, 64, 65, 127, (uint64_t)-1 };
+      for (size_t i = 0; i < 8; i++)
+          for (size_t j = 0; j < 8; j++)
+              for (size_t k = 0; k < sizeof(ss) / 8; k++)
+                  push_scalar("fsh64", (uint64_t[]){ IPOOL[i], IPOOL[j], ss[k] });
+      for (int i = 0; i < 150; i++)
+          push_scalar("fsh64", (uint64_t[]){ rnd(), rnd(), rnd() });
+      for (size_t i = 0; i < 6; i++)
+          for (size_t j = 0; j < 6; j++)
+              for (size_t k = 0; k < sizeof(ss) / 8; k++) {
+                  push_scalar("fsh32", (uint64_t[]){ (uint64_t)(uint32_t)IPOOL[i], (uint64_t)(uint32_t)IPOOL[j], ss[k] });
+                  push_scalar("fsh16", (uint64_t[]){ (uint64_t)(uint16_t)IPOOL[i], (uint64_t)(uint16_t)IPOOL[j], ss[k] });
+              }
+      for (int i = 0; i < 100; i++) {
+          push_scalar("fsh32", (uint64_t[]){ (uint64_t)(uint32_t)rnd(), (uint64_t)(uint32_t)rnd(), rnd() });
+          push_scalar("fsh16", (uint64_t[]){ (uint64_t)(uint16_t)rnd(), (uint64_t)(uint16_t)rnd(), rnd() });
+      } }
     /* sel / branch / loops / recursion */
     for (int i = 0; i < 60; i++)
         push_scalar("sel", (uint64_t[]){ (uint64_t)(i % 3) - 1, rnd(), rnd() });
@@ -241,6 +279,10 @@ static void gen_cases(void) {
     for (int i = 0; i < 40; i++) push_scalar("alloca", (uint64_t[]){ (uint64_t)(uint32_t)rnd() });
     push_scalar("data_load", (uint64_t[]){ 0 });
     for (int i = 0; i < 40; i++) push_scalar("spills", (uint64_t[]){ rnd() });
+    for (int i = 0; i < 40; i++) push_scalar("clobx", (uint64_t[]){ rnd() });
+    for (int i = 0; i < 40; i++) push_scalar("clobcall", (uint64_t[]){ rnd() });
+    for (int i = 0; i < 30; i++) push_scalar("selx", (uint64_t[]){ rnd() });
+    for (int i = 0; i < 40; i++) push_scalar("rotw", (uint64_t[]){ (uint64_t)(rnd() % 40), rnd() });
     for (int i = 0; i < 30; i++) {
         uint64_t a[10];
         for (int k = 0; k < 8; k++) a[k] = (uint64_t)(int64_t)(int32_t)rnd();
@@ -251,6 +293,8 @@ static void gen_cases(void) {
     /* B cases */
     for (int i = 0; i < 12; i++)
         push_bcase("mem", (uint64_t[]){ 32, (uint64_t)(rnd() % 41), (uint64_t)(uint32_t)rnd() });
+    for (int i = 0; i < 12; i++)
+        push_bcase("stx", (uint64_t[]){ 32, 128, (uint64_t)(i % 7) * 4 });
     for (int i = 0; i < 12; i++)
         push_bcase("atomic", (uint64_t[]){ 0, rnd() });
     for (int i = 0; i < 12; i++)

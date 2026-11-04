@@ -327,6 +327,69 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
         }
     }
 
+    /* ---------- clobber analysis for scratch-shared pool registers --
+     * When the backend offers pool registers it also uses as emitter
+     * scratch (PoolReg.clob != 0), compute per value the clobber
+     * classes it may NOT be allocated into: a class forbids a value
+     * when an instruction strictly inside the value's interval may
+     * write that register, when the value's defining instruction
+     * forbids it for its own result, when the value's last use is at
+     * a clobbering instruction that does not bless this operand for
+     * that class, or when a prologue sequence bans it for entry
+     * arguments. Conservative by construction: an unrecognized
+     * pattern forbids, never permits. */
+    uint8_t *forbid = NULL;
+    if (pools->clob_mask) {
+        forbid = calloc((size_t)nv, 1);
+        int mp = bf->maxpos > 0 ? bf->maxpos : 1;
+        Instr **posins = calloc((size_t)mp, sizeof(Instr *));
+        uint8_t *posmask = calloc((size_t)mp, 1);
+        for (int b = 0; b < f->nblocks; b++) {
+            Block *bl = &f->blocks[b];
+            for (int i = 0; i < bl->nins; i++) {
+                int p = be_pos(bf, b, i);
+                posins[p] = &bl->ins[i];
+                posmask[p] = pools->clob_mask(pools->clob_ctx, &bl->ins[i]);
+            }
+        }
+        if (pools->clob_entrymask && f->nblocks > 0) {
+            uint8_t em = pools->clob_entrymask(pools->clob_ctx, f);
+            if (em) for (int i = 0; i < f->blocks[0].nargs; i++)
+                forbid[f->blocks[0].arg_vals[i]] |= em;
+        }
+        /* cost guard, ported from the WP21-C eligibility scan: the
+         * interval scan below is O(values x positions); on very
+         * large functions leave the scratch-shared pool off (every
+         * clobber class forbidden for every value) rather than pay
+         * a quadratic pass. */
+        uint8_t allclob = 0;
+        for (int r = 0; r < pools->ngp; r++) allclob |= (uint8_t)pools->gp[r].clob;
+        for (int r = 0; r < pools->nfp; r++) allclob |= (uint8_t)pools->fp[r].clob;
+        bool scan = (int64_t)nv * (int64_t)bf->maxpos <= (int64_t)64 * 1000 * 1000;
+        for (int v = 0; v < f->nvalues; v++) {
+            if (bf->vclass[v] < 0) continue;
+            if (!scan) { forbid[v] = allclob; continue; }
+            if (defins[v] && pools->clob_defmask)
+                forbid[v] |= pools->clob_defmask(pools->clob_ctx, defins[v]);
+            int s = bf->defpos[v], e = bf->endpos[v];
+            for (int p = s + 1; p <= e && p < bf->maxpos; p++) {
+                uint8_t cm = posmask[p];
+                if (!cm) continue;
+                if (p < e) { forbid[v] |= cm; continue; }
+                Instr *in = posins[p];
+                if (!in) continue;
+                for (int bit = 1; bit <= 4; bit <<= 1) {
+                    if (!(cm & bit)) continue;
+                    bool ok = pools->clob_bless &&
+                              pools->clob_bless(pools->clob_ctx, in, v, (uint8_t)bit);
+                    if (!ok) forbid[v] |= (uint8_t)bit;
+                }
+            }
+        }
+        free(posins); free(posmask);
+    }
+#define REG_FORBIDDEN(v, pe) ((pe).clob && forbid && (forbid[v] & (pe).clob))
+
     /* Per-value use positions in the allocator's global position
      * space -- be_pos (block start + 1 + instruction index), the
      * SAME space as defpos/endpos and the interval starts the spill
@@ -388,6 +451,177 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
                 nbe++;
             }
         }
+    }
+
+    /* Spill weights: an evicted interval pays a reload at EVERY
+     * remaining use (this allocator does not split intervals), so the
+     * victim choice must weigh total dynamic cost, not just the next
+     * use. A use inside a loop span counts LOOPW times -- a
+     * loop-carried pointer used four times per iteration outweighs a
+     * burst of one-shot temporaries even though its next single use
+     * is farther away than theirs (the failure mode of pure
+     * next-use Belady on wide loop state: the regulars are evicted
+     * one at a time, each at the moment its next use looks far).
+     * Constants weigh 0: they are rematerializable, most emitter
+     * sites fold them back into immediates, and the rest pay a
+     * single load -- always the cheapest victims. */
+    int *ivweight = malloc(sizeof(int) * (size_t)nv);
+    for (int v = 0; v < nv; v++) {
+        Instr *df = defins[v];
+        if (df && (df->op == OP_ICONST || df->op == OP_FCONST)) { ivweight[v] = 0; continue; }
+        int wsum = 0;
+        for (int k = useoff[v]; k < useoff[v + 1]; k++) {
+            int p = usepos[k], inl = 0;
+            for (int e = 0; e < nbe; e++) if (be_hp[e] <= p && p <= be_lp[e]) { inl = 1; break; }
+            wsum += inl ? 16 : 1;
+        }
+        ivweight[v] = wsum;
+    }
+
+    /* Spill weights, cycle form: a value on a def-use cycle -- the
+     * loop-carried shape: block parameter -> update chain -> back-edge
+     * argument -> the same parameter -- is one spill unit with its
+     * fellow cycle members, not an independent value. The per-value
+     * count above undercounts such chains: in an unrolled reduction
+     * every link has exactly one in-loop use (weight 16, no better
+     * than a one-shot temporary whose next use is two positions
+     * away), so the victim choice picks the links off one at a time,
+     * and a spilled link also breaks the register reuse (2-address
+     * and back-edge coalescing) the rest of the chain depends on.
+     * Give every member of a strongly connected component of the
+     * def-use graph the component's total weight. Edges: an operand
+     * value flows into the value its instruction defines; a branch
+     * argument flows into the target block's parameter. Weights only
+     * steer victim choice, so folded-value edges may be approximate. */
+    {
+        int *outdeg = calloc((size_t)nv, sizeof(int));
+        int *indeg = calloc((size_t)nv, sizeof(int));
+        for (int b = 0; b < f->nblocks; b++) {
+            Block *bl = &f->blocks[b];
+            for (int i = 0; i < bl->nins; i++) {
+                Instr *in = &bl->ins[i];
+                if (in->op == OP_BR || in->op == OP_CONDBR) {
+                    int tg[2] = { in->blk, in->op == OP_CONDBR ? in->blk2 : -1 };
+                    const int32_t *ea[2] = { in->args, in->args2 };
+                    const uint16_t en[2] = { in->nargs, in->nargs2 };
+                    for (int e = 0; e < 2; e++) {
+                        if (tg[e] < 0 || tg[e] >= f->nblocks) continue;
+                        Block *tb = &f->blocks[tg[e]];
+                        for (int k = 0; k < en[e] && k < tb->nargs; k++) {
+                            int x = ea[e][k];
+                            if (x < 0 || x >= nv) continue;
+                            outdeg[x]++; indeg[tb->arg_vals[k]]++;
+                        }
+                    }
+                    continue;
+                }
+                int r = in->result;
+                if (r < 0 || r >= nv) continue;
+                int ops[3] = { in->a, in->b, in->op == OP_ALLOCA ? -1 : in->c };
+                for (int k = 0; k < 3; k++) {
+                    int x = ops[k];
+                    if (x < 0 || x >= nv || x == r) continue;
+                    outdeg[x]++; indeg[r]++;
+                }
+                for (int k = 0; k < in->nargs; k++) {
+                    int x = in->args[k];
+                    if (x < 0 || x >= nv || x == r) continue;
+                    outdeg[x]++; indeg[r]++;
+                }
+            }
+        }
+        int ne2 = 0;
+        for (int v = 0; v < nv; v++) ne2 += outdeg[v];
+        int *eoff = malloc(sizeof(int) * (size_t)(nv + 1));
+        int *roff = malloc(sizeof(int) * (size_t)(nv + 1));
+        int *eadj = malloc(sizeof(int) * (size_t)(ne2 > 0 ? ne2 : 1));
+        int *radj = malloc(sizeof(int) * (size_t)(ne2 > 0 ? ne2 : 1));
+        eoff[0] = 0; roff[0] = 0;
+        for (int v = 0; v < nv; v++) { eoff[v + 1] = eoff[v] + outdeg[v]; roff[v + 1] = roff[v] + indeg[v]; }
+        {
+            int *ecur = malloc(sizeof(int) * (size_t)nv);
+            int *rcur = malloc(sizeof(int) * (size_t)nv);
+            for (int v = 0; v < nv; v++) { ecur[v] = eoff[v]; rcur[v] = roff[v]; }
+            for (int b = 0; b < f->nblocks; b++) {
+                Block *bl = &f->blocks[b];
+                for (int i = 0; i < bl->nins; i++) {
+                    Instr *in = &bl->ins[i];
+                    if (in->op == OP_BR || in->op == OP_CONDBR) {
+                        int tg[2] = { in->blk, in->op == OP_CONDBR ? in->blk2 : -1 };
+                        const int32_t *ea[2] = { in->args, in->args2 };
+                        const uint16_t en[2] = { in->nargs, in->nargs2 };
+                        for (int e = 0; e < 2; e++) {
+                            if (tg[e] < 0 || tg[e] >= f->nblocks) continue;
+                            Block *tb = &f->blocks[tg[e]];
+                            for (int k = 0; k < en[e] && k < tb->nargs; k++) {
+                                int x = ea[e][k];
+                                if (x < 0 || x >= nv) continue;
+                                int u = tb->arg_vals[k];
+                                eadj[ecur[x]++] = u; radj[rcur[u]++] = x;
+                            }
+                        }
+                        continue;
+                    }
+                    int r = in->result;
+                    if (r < 0 || r >= nv) continue;
+                    int ops[3] = { in->a, in->b, in->op == OP_ALLOCA ? -1 : in->c };
+                    for (int k = 0; k < 3; k++) {
+                        int x = ops[k];
+                        if (x < 0 || x >= nv || x == r) continue;
+                        eadj[ecur[x]++] = r; radj[rcur[r]++] = x;
+                    }
+                    for (int k = 0; k < in->nargs; k++) {
+                        int x = in->args[k];
+                        if (x < 0 || x >= nv || x == r) continue;
+                        eadj[ecur[x]++] = r; radj[rcur[r]++] = x;
+                    }
+                }
+            }
+            free(ecur); free(rcur);
+        }
+        /* Kosaraju, iterative: finish order on the user graph, then
+         * component assignment on the reversed graph. */
+        char *vis = calloc((size_t)nv, 1);
+        int *order = malloc(sizeof(int) * (size_t)(nv > 0 ? nv : 1));
+        int norder = 0;
+        int *dfs = malloc(sizeof(int) * (size_t)(nv > 0 ? nv : 1));
+        int *dit = malloc(sizeof(int) * (size_t)(nv > 0 ? nv : 1));
+        for (int s = 0; s < nv; s++) {
+            if (vis[s]) continue;
+            int sp = 0;
+            vis[s] = 1; dfs[sp] = s; dit[s] = eoff[s]; sp++;
+            while (sp > 0) {
+                int v = dfs[sp - 1];
+                if (dit[v] < eoff[v + 1]) {
+                    int u = eadj[dit[v]++];
+                    if (!vis[u]) { vis[u] = 1; dfs[sp++] = u; dit[u] = eoff[u]; }
+                } else {
+                    order[norder++] = v; sp--;
+                }
+            }
+        }
+        int *comp = malloc(sizeof(int) * (size_t)(nv > 0 ? nv : 1));
+        for (int v = 0; v < nv; v++) comp[v] = -1;
+        int ncomp = 0;
+        for (int oi = norder - 1; oi >= 0; oi--) {
+            int s = order[oi];
+            if (comp[s] >= 0) continue;
+            int sp = 0;
+            comp[s] = ncomp; dfs[sp++] = s;
+            while (sp > 0) {
+                int v = dfs[--sp];
+                for (int e = roff[v]; e < roff[v + 1]; e++) {
+                    int x = radj[e];
+                    if (comp[x] < 0) { comp[x] = ncomp; dfs[sp++] = x; }
+                }
+            }
+            ncomp++;
+        }
+        int *csum = calloc((size_t)(ncomp > 0 ? ncomp : 1), sizeof(int));
+        for (int v = 0; v < nv; v++) csum[comp[v]] += ivweight[v];
+        for (int v = 0; v < nv; v++) ivweight[v] = csum[comp[v]];
+        free(outdeg); free(indeg); free(eoff); free(roff); free(eadj); free(radj);
+        free(vis); free(order); free(dfs); free(dit); free(comp); free(csum);
     }
 
     int maxslots = 0;
@@ -508,6 +742,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
                         int pr = -1;
                         for (int r = 0; r < npool; r++) if (pool[r].reg == bf->loc[pv].idx) { pr = r; break; }
                         if (pr < 0) ok = false;
+                        if (ok && REG_FORBIDDEN(iv->v, pool[pr])) ok = false;
                         if (ok && iv->cross && !pool[pr].callee_saved) ok = false;
                         int aj = -1;
                         for (int j = 0; ok && j < na; j++) if (act[j].v == pv && act[j].reg == pr) { aj = j; break; }
@@ -556,7 +791,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
                     for (int r = 0; r < npool; r++) {
                         if (pool[r].reg == r_id) {
                             bool cs = pool[r].callee_saved != 0;
-                            if (!iv->cross || cs) {
+                            if ((!iv->cross || cs) && !REG_FORBIDDEN(iv->v, pool[r])) {
                                 for (int j = 0; j < na; j++) {
                                     if (act[j].reg == r) {
                                         act[j] = act[--na];
@@ -575,6 +810,7 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
             for (int pass = 0; pass < 2 && pick < 0; pass++) {
                 for (int r = 0; r < npool; r++) {
                     if (regused[r]) continue;
+                    if (REG_FORBIDDEN(iv->v, pool[r])) continue;
                     bool cs = pool[r].callee_saved != 0;
                     if (iv->cross && !cs) continue;
                     if (pass == 0 && !iv->cross && cs) continue; /* first pass: caller-saved */
@@ -589,44 +825,42 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
                 bf->loc[iv->v].cls = (int8_t)cls;
                 bf->loc[iv->v].idx = pool[pick].reg;
             } else {
-                /* SpillAtInterval, Belady form: among the eligible
-                 * active intervals, evict the one whose next use is
-                 * farthest from the current position; if the incoming
-                 * interval's own next use is farthest of all, spill
-                 * it instead. A use at the current position (an
-                 * operand of the defining instruction) is the
-                 * nearest possible and is never chosen. Coalesced
-                 * (prot) intervals and the call-crossing callee rule
-                 * remain hard constraints. */
+                /* SpillAtInterval, weight form: among the eligible
+                 * active intervals, evict the one with the lowest
+                 * spill weight (total dynamic use cost, loop uses
+                 * counted 16x, constants 0); ties break by Belady
+                 * next-use distance. If the incoming interval is
+                 * itself the cheapest, spill it instead. A use at
+                 * the current position (an operand of the defining
+                 * instruction) is never chosen unless the candidate
+                 * is a rematerializable constant. Coalesced (prot)
+                 * intervals and the call-crossing callee rule remain
+                 * hard constraints. */
                 int furthest = -1;
+                /* the incoming interval also counts the store its
+                 * own spill would pay at its definition (an evicted
+                 * interval pays only reloads), as one extra use at
+                 * the incoming interval's own loop depth */
+                int best_w = ivweight[iv->v];
+                {
+                    int inl = 0;
+                    for (int e = 0; e < nbe; e++) if (be_hp[e] <= iv->start && iv->start <= be_lp[e]) { inl = 1; break; }
+                    best_w += inl ? 16 : 1;
+                }
                 int best_next = nu_next_use(usepos, useoff[iv->v], useoff[iv->v + 1],
                                             iv->start, iv->start, iv->end,
                                             be_hp, be_lp, nbe);
                 for (int j = 0; j < na; j++) {
                     if (act[j].prot) continue;
+                    if (REG_FORBIDDEN(iv->v, pool[act[j].reg])) continue;
                     if (iv->cross && !act[j].callee) continue;
                     int nu = nu_next_use(usepos, useoff[act[j].v], useoff[act[j].v + 1],
                                          iv->start, act[j].start, act[j].end,
                                          be_hp, be_lp, nbe);
-                    /* Rematerializable values (constants) are the
-                     * cheapest possible victims: most emitter sites
-                     * fold them back into immediates via
-                     * be_iconst_val/be_fconst_val and never read the
-                     * slot, and the rest pay one load. The wrap-aware
-                     * next-use otherwise ranks a loop body's hot
-                     * pointer -- whose next use is next iteration's,
-                     * wrapped -- as "farther" than a constant used
-                     * once this iteration, and a one-instruction
-                     * temp's pressure point would spill the pointer
-                     * for its whole interval (the parse case: the
-                     * input pointer reloaded from its slot on every
-                     * byte). Prefer a constant victim over any
-                     * non-constant one; among constants, the first
-                     * eligible wins. */
-                    Instr *ad = defins[act[j].v];
-                    if (ad && (ad->op == OP_ICONST || ad->op == OP_FCONST))
-                        nu = nu < 0 ? nu : INT_MAX - 1;
-                    if (nu > best_next) {
+                    int wj = ivweight[act[j].v];
+                    if (wj > 0 && nu <= iv->start) continue;  /* operand of this instruction */
+                    if (wj < best_w || (wj == best_w && nu > best_next)) {
+                        best_w = wj;
                         best_next = nu;
                         furthest = j;
                     }
@@ -658,7 +892,8 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
         free(ivs); free(act); free(coal); free(regused); free(regowner_end);
     }
     free(defins); free(defblk); free(defidx); free(usecnt);
-    free(usepos); free(useoff);
+    free(forbid);
+    free(usepos); free(useoff); free(ivweight);
     free(be_hp); free(be_lp);
     free(use_tgt); free(use_slot); free(use_list); free(use_srcblk);
     bf->nspill_gp = 0; bf->nspill_fp = 0;

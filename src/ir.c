@@ -39,6 +39,7 @@ static const char *OPNAMES[OP_COUNT] = {
     [OP_AAND]="aand", [OP_AOR]="aor", [OP_AXOR]="axor",
     [OP_AMINS]="amins", [OP_AMAXS]="amaxs", [OP_AMINU]="aminu", [OP_AMAXU]="amaxu",
     [OP_FUNCP]="funcptr", [OP_CALLI]="calli", [OP_TAILCALLI]="tailcalli",
+    [OP_FSHL]="fshl", [OP_FSHR]="fshr",
 };
 const char *op_name(int op) {
     if (op <= 0 || op >= OP_COUNT || !OPNAMES[op]) return "?op";
@@ -552,6 +553,18 @@ static int try_fold(Func *f, int blk, Instr *in) {
             case OP_OR:  if ((av & m) == 0) return in->b; break;
             case OP_XOR: if ((av & m) == 0) return in->b; break;
             default: break;
+            }
+        }
+        if (op == OP_FSHL || op == OP_FSHR) {
+            bool cc = in->c >= 0 && f->isconst[in->c];
+            uint64_t cv = cc ? f->cval[in->c] : 0;
+            if (cc && (cv % (uint64_t)bits) == 0) return op == OP_FSHL ? in->a : in->b;
+            if (ac && bc && cc) {
+                uint64_t s = cv % (uint64_t)bits;
+                uint64_t ua = av & m, ub = bv & m, r;
+                if (op == OP_FSHL) r = s ? ((ua << s) | (ub >> ((uint64_t)bits - s))) : ua;
+                else               r = s ? ((ua << ((uint64_t)bits - s)) | (ub >> s)) : ub;
+                return emit_pure(f, blk, ins_iconst(t, (int64_t)(r & m)));
             }
         }
         if (ac && bc) {

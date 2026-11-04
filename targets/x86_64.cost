@@ -17,6 +17,8 @@ op xor.i lat 1 thr 1
 op not.i lat 1 thr 1
 op shl.i lat 1 thr 1
 op lshr.i lat 1 thr 1
+op fshl.i lat 3 thr 1
+op fshr.i lat 3 thr 1
 op ashr.i lat 1 thr 1
 op icmp.i lat 1 thr 1
 op popcount.i lat 3 thr 1

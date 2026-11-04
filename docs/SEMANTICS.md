@@ -46,6 +46,14 @@ Types: `void`, `iN` for N in {1, 8, 16, 32, 64}, `f32`, `f64`, `ptr`, and
 - `and, or, xor, not`: bitwise.
 - `shl, lshr, ashr`: the shift amount is taken modulo N (the bit width).
   `lshr` zero-fills, `ashr` sign-fills.
+- `fshl a b s`, `fshr a b s`: funnel shifts over the 2N-bit concatenation
+  of `a` (the high part) and `b` (the low part). The shift amount is
+  taken modulo N. `fshl` yields the N bits of `(a:b) << s` that end in
+  the high half — `(a << s) | (b >> (N - s))`, and exactly `a` when
+  `s mod N = 0`. `fshr` yields the low N bits of `(a:b) >> s` —
+  `(a << (N - s)) | (b >> s)`, and exactly `b` when `s mod N = 0`.
+  `fshl x x s` is a rotate-left of `x` by `s`; `fshr x x s` is a
+  rotate-right.
 - `icmp p a b`: compares as unsigned (`u*` predicates) or signed (`s*`).
   Result is `i1`.
 - `popcount, clz, ctz`: count over the N-bit pattern. `clz`/`ctz` of 0 yield N.
@@ -86,6 +94,15 @@ Types: `void`, `iN` for N in {1, 8, 16, 32, 64}, `f32`, `f64`, `ptr`, and
   assume as permission to have emitted anything — the only non-total corner
   of the semantics, deliberately fenced to this one op, and never emitted by
   the toolchain's own producers.
+  The optimizer uses `assume` block-locally: within the remainder of the
+  block that contains it, a select or branch whose condition the assertion
+  decides — the asserted value itself, its negation, or a comparison of
+  the same value against the same constant with the same or the
+  complementary predicate — resolves statically, as does a later
+  comparison the assertion pins. Facts never cross block boundaries.
+  This is the sanctioned way for a producer contract (for example "this
+  count is nonzero in this loop") to remove the defensive select that a
+  total-semantics op would otherwise force on a hot path.
 
 ## 5. Control and calls
 

@@ -28,6 +28,12 @@ static const char *check_instr(Module *m, Func *f, Block *b, Instr *in, int idx)
     case OP_NEG: case OP_NOT: case OP_POPCOUNT: case OP_CLZ: case OP_CTZ: case OP_BSWAP:
         NEED(ty_is_int(in->ty) && same_ty(VT(in->a), in->ty), "int unop type mismatch");
         break;
+    case OP_FSHL: case OP_FSHR:
+        NEED(ty_is_int(in->ty), "funnel shift result must be integer");
+        NEED(in->ty.bits != 128, "funnel shifts on i128 are not part of v3.0");
+        NEED(same_ty(VT(in->a), in->ty) && same_ty(VT(in->b), in->ty), "funnel shift part type mismatch");
+        NEED(ty_is_int(VT(in->c)) && VT(in->c).bits == in->ty.bits, "funnel shift amount must match the part width");
+        break;
     case OP_ICMP:
         NEED(in->ty.kind == TY_INT && in->ty.bits == 1, "icmp result must be i1");
         NEED(ty_is_int(VT(in->a)) && same_ty(VT(in->a), VT(in->b)), "icmp operand mismatch");
