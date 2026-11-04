@@ -26,6 +26,9 @@ typedef struct {
     BeFunc *bf;
     Instr **defins;
     bool *folded_ins;
+    bool *chain_skip;
+    int *chain_root;
+    int64_t *chain_off;
     bool *cmp_fuse;
     Instr *span_or[512];
     int span_px[512];
@@ -69,6 +72,48 @@ typedef struct {
     int disp;
 } X86Addr;
 
+/* WP20: peel a chain of i64 adds with one constant operand each
+ * (the shape the loop unroller leaves behind: one induction add
+ * per clone, each feeding the next clone's geps) off a value,
+ * returning the chain's root value and accumulated offset. The
+ * adds carry no other meaning, so an address or an arithmetic
+ * operand can use the root plus the offset directly. */
+static bool peel_chain(Ctx *c, int v, int *root_out, int64_t *off_out) {
+    int cur = v;
+    int64_t off = 0;
+    bool peeled = false;
+    for (int depth = 0; depth < 64; depth++) {
+        if (cur < 0 || cur >= c->f->nvalues || !c->defins) break;
+        Instr *d = c->defins[cur];
+        if (!d || d->op != OP_ADD) break;
+        if (c->f->vtypes[cur].kind != TY_INT || c->f->vtypes[cur].bits != 64) break;
+        int64_t k;
+        int nxt;
+        if (be_iconst_val(c->f, d->b, &k)) nxt = d->a;
+        else if (be_iconst_val(c->f, d->a, &k)) nxt = d->b;
+        else break;
+        if (nxt < 0) break;
+        off += k;
+        cur = nxt;
+        peeled = true;
+    }
+    if (!peeled) return false;
+    *root_out = cur;
+    *off_out = off;
+    return true;
+}
+
+static int peeled_idx(Ctx *c, int v, int esz, int64_t *disp_out) {
+    int r;
+    int64_t o;
+    *disp_out = 0;
+    if (esz < 1) return v;
+    if (!peel_chain(c, v, &r, &o)) return v;
+    if (o > INT32_MAX / esz || o < INT32_MIN / esz) return v;
+    *disp_out = o * (int64_t)esz;
+    return r;
+}
+
 static void resolve_x86_addr(Ctx *c, int ptr_v, X86Addr *out) {
     out->base_v = ptr_v;
     out->idx_v = -1;
@@ -81,30 +126,38 @@ static void resolve_x86_addr(Ctx *c, int ptr_v, X86Addr *out) {
 
     int esz = (int)mem_size_of(d->ety, c->vl);
     int64_t imm;
-    if (be_iconst_val(c->f, d->b, &imm)) {
-        out->disp += (int)(imm * esz);
+    int64_t pd = 0;
+    int idxv = peeled_idx(c, d->b, esz, &pd);
+    if (be_iconst_val(c->f, idxv, &imm)) {
+        out->disp += (int)(imm * esz + pd);
         out->base_v = d->a;
         if (d->a >= 0 && d->a < c->f->nvalues && c->defins[d->a] && c->defins[d->a]->op == OP_GEP) {
             Instr *d2 = c->defins[d->a];
             int esz2 = (int)mem_size_of(d2->ety, c->vl);
-            if (be_iconst_val(c->f, d2->b, &imm)) {
-                out->disp += (int)(imm * esz2);
+            int64_t pd2 = 0;
+            int idxv2 = peeled_idx(c, d2->b, esz2, &pd2);
+            if (be_iconst_val(c->f, idxv2, &imm)) {
+                out->disp += (int)(imm * esz2 + pd2);
                 out->base_v = d2->a;
             } else if (esz2 == 1 || esz2 == 2 || esz2 == 4 || esz2 == 8) {
-                out->idx_v = d2->b;
+                out->idx_v = idxv2;
                 out->scale = esz2;
                 out->base_v = d2->a;
+                out->disp += (int)pd2;
             }
         }
     } else if (esz == 1 || esz == 2 || esz == 4 || esz == 8) {
         out->base_v = d->a;
-        out->idx_v = d->b;
+        out->idx_v = idxv;
         out->scale = esz;
+        out->disp += (int)pd;
         if (d->a >= 0 && d->a < c->f->nvalues && c->defins[d->a] && c->defins[d->a]->op == OP_GEP) {
             Instr *d2 = c->defins[d->a];
-            if (be_iconst_val(c->f, d2->b, &imm)) {
-                int esz2 = (int)mem_size_of(d2->ety, c->vl);
-                out->disp += (int)(imm * esz2);
+            int esz2 = (int)mem_size_of(d2->ety, c->vl);
+            int64_t pd2 = 0;
+            int idxv2 = peeled_idx(c, d2->b, esz2, &pd2);
+            if (be_iconst_val(c->f, idxv2, &imm)) {
+                out->disp += (int)(imm * esz2 + pd2);
                 out->base_v = d2->a;
             }
         }
@@ -928,6 +981,7 @@ static void emit_instr(Ctx *c, int bi, int ii) {
     Func *f = c->f;
     Instr *in = &f->blocks[bi].ins[ii];
     if (in->result >= 0 && c->folded_ins && c->folded_ins[in->result]) return;
+    if (in->result >= 0 && c->chain_skip && c->chain_skip[in->result]) return;
     if (ty128(in->ty) || ty128(in->ety) ||
         (in->a >= 0 && ty128(f->vtypes[in->a])) || (in->b >= 0 && ty128(f->vtypes[in->b])))
         if (emit_i128(c, in)) return;
@@ -1000,11 +1054,28 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         Loc *dl = &c->bf->loc[in->result];
         int dreg = (dl->is_reg && dl->cls == BCLS_GP) ? dl->idx : -1;
         int dreg_use = (dreg >= 0) ? dreg : R11;
+        bool a_skip = c->chain_skip && in->a >= 0 && in->a < f->nvalues && c->chain_skip[in->a];
+        bool b_skip = c->chain_skip && in->b >= 0 && in->b < f->nvalues && c->chain_skip[in->b];
         int64_t imm;
         if (be_iconst_val(f, in->b, &imm) && imm >= -2147483648LL && imm <= 2147483647LL) {
             snprintf(sb, sizeof sb, "%lld", (long long)imm);
         } else {
             locstr(c, sb, sizeof sb, in->b, t.bits == 64 ? 8 : 4);
+        }
+        /* WP20: a skipped chain add used as operand b is
+         * materialized from its root into a scratch register
+         * before the operation (operand a is loaded afterwards,
+         * so clobbering the root's register there is safe). */
+        int b_scr = (dreg_use == R11) ? RAX : R11;
+        if (b_skip && t.bits == 64) {
+            load_gp(c, b_scr, c->chain_root[in->b]);
+            if (c->chain_off[in->b]) E(c, "  add %s, %lld", G64[b_scr], (long long)c->chain_off[in->b]);
+            snprintf(sb, sizeof sb, "%s", G64[b_scr]);
+        } else if (b_skip) {
+            char rb[64]; locstr(c, rb, sizeof rb, c->chain_root[in->b], 4);
+            E(c, "  mov %s, %s", G32[b_scr], rb);
+            if (c->chain_off[in->b]) E(c, "  add %s, %lld", G32[b_scr], (long long)c->chain_off[in->b]);
+            snprintf(sb, sizeof sb, "%s", G32[b_scr]);
         }
 
         /* WP19: strength-reduce small constant multiplies. The LEA
@@ -1025,7 +1096,12 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         }
 
         if (t.bits == 64) {
-            load_gp(c, dreg_use, in->a);
+            if (a_skip) {
+                load_gp(c, dreg_use, c->chain_root[in->a]);
+                if (c->chain_off[in->a]) E(c, "  add %s, %lld", G64[dreg_use], (long long)c->chain_off[in->a]);
+            } else {
+                load_gp(c, dreg_use, in->a);
+            }
             if (mul_form == 3 || mul_form == 5 || mul_form == 9)
                 E(c, "  lea %s, [%s + %s*%d]", G64[dreg_use], G64[dreg_use], G64[dreg_use], mul_form - 1);
             else if (mul_form == 10) {
@@ -1038,7 +1114,11 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                 E(c, "  %s %s, %s", nm, G64[dreg_use], sb);
         } else {
             Loc *al = &c->bf->loc[in->a];
-            if (al->is_reg && al->cls == BCLS_GP && al->idx == dreg_use) {
+            if (a_skip) {
+                char ab[64]; locstr(c, ab, sizeof ab, c->chain_root[in->a], 4);
+                E(c, "  mov %s, %s", G32[dreg_use], ab);
+                if (c->chain_off[in->a]) E(c, "  add %s, %lld", G32[dreg_use], (long long)c->chain_off[in->a]);
+            } else if (al->is_reg && al->cls == BCLS_GP && al->idx == dreg_use) {
                 /* already in dreg_use */
             } else {
                 char ab[64]; locstr(c, ab, sizeof ab, in->a, 4);
@@ -1334,7 +1414,12 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         if (be_iconst_val(f, in->b, &imm)) {
             if (imm * esz != 0) E(c, "  add r11, %lld", (long long)(imm * esz));
         } else {
-            load_gp(c, RAX, in->b);
+            if (c->chain_skip && in->b >= 0 && in->b < f->nvalues && c->chain_skip[in->b]) {
+                load_gp(c, RAX, c->chain_root[in->b]);
+                if (c->chain_off[in->b]) E(c, "  add rax, %lld", (long long)c->chain_off[in->b]);
+            } else {
+                load_gp(c, RAX, in->b);
+            }
             Type it2 = f->vtypes[in->b];
             if (it2.bits < 64) { E(c, "  shl rax, %d", 64 - it2.bits); E(c, "  sar rax, %d", 64 - it2.bits); }
             if (esz == 1 || esz == 2 || esz == 4 || esz == 8) {
@@ -2522,8 +2607,65 @@ static int emit_func(Ctx *c, int fi) {
         { RSI, 0 }, { RDI, 0 }, { R8, 0 }, { R9, 0 }, { R10, 0 },
         { RBX, 1 }, { R12, 1 }, { R13, 1 }, { R14, 1 }, { R15, 1 },
     };
+    /* WP20: mark i64 adds that sit on an unroller-style index
+     * chain and have no use other than feeding geps or other
+     * adds. Their emission is skipped; addressing resolution and
+     * arithmetic operands reach through them to the chain root
+     * (see peel_chain). Register allocation is deliberately left
+     * exactly as it was without this pass. A non-negative local
+     * copy of the value count is used for the array sizes: gcc's
+     * alloc-size range analysis cannot otherwise prove the
+     * count non-negative inside this large function. */
+    {
+        int nv = f->nvalues > 0 ? f->nvalues : 0;
+        uint8_t *other = calloc((size_t)nv, 1);
+        c->chain_skip = calloc((size_t)nv, sizeof(bool));
+        c->chain_root = calloc((size_t)nv, sizeof(int));
+        c->chain_off = calloc((size_t)nv, sizeof(int64_t));
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            Block *b = &f->blocks[bi];
+            for (int ii = 0; ii < b->nins; ii++) {
+                Instr *in = &b->ins[ii];
+                if (in->a >= 0 && in->a < nv && in->op != OP_ADD) other[in->a] = 1;
+                if (in->b >= 0 && in->b < nv && in->op != OP_ADD && in->op != OP_GEP) other[in->b] = 1;
+                if (in->c >= 0 && in->c < nv && in->op != OP_ALLOCA) other[in->c] = 1;
+                for (int k = 0; k < in->nargs; k++) if (in->args[k] >= 0 && in->args[k] < nv) other[in->args[k]] = 1;
+                for (int k = 0; k < in->nargs2; k++) if (in->args2[k] >= 0 && in->args2[k] < nv) other[in->args2[k]] = 1;
+            }
+        }
+        for (int v = 0; v < nv; v++) {
+            if (!c->defins[v] || c->defins[v]->op != OP_ADD) continue;
+            if (f->vtypes[v].kind != TY_INT || f->vtypes[v].bits != 64) continue;
+            if (other[v]) continue;
+            int r;
+            int64_t o;
+            if (!peel_chain(c, v, &r, &o)) continue;
+            if (o >= (1LL << 28) || o <= -(1LL << 28)) continue;
+            c->chain_skip[v] = true;
+            c->chain_root[v] = r;
+            c->chain_off[v] = o;
+        }
+        free(other);
+    }
+    /* the allocator must see chain adds as folded so the chain
+     * roots' live ranges extend to the consumption points (the
+     * folded-use walk in be.c); the emitter's own folded_ins is
+     * left untouched. */
+    bool *alloc_folded = c->folded_ins;
+    bool merged_folded = false;
+    if (c->chain_skip) {
+        bool any = false;
+        for (int v = 0; v < f->nvalues; v++) if (c->chain_skip[v]) { any = true; break; }
+        if (any) {
+            alloc_folded = malloc((size_t)(f->nvalues > 0 ? f->nvalues : 1) * sizeof(bool));
+            for (int v = 0; v < f->nvalues; v++)
+                alloc_folded[v] = (c->folded_ins && c->folded_ins[v]) || c->chain_skip[v];
+            merged_folded = true;
+        }
+    }
     Pools pools = { POOL_GP, 10, POOL_FP, 15, 1 };
-    BeFunc *bf = be_analyze_ext(m, f, &pools, c->folded_ins);
+    BeFunc *bf = be_analyze_ext(m, f, &pools, alloc_folded);
+    if (merged_folded) free(alloc_folded);
     if (!bf) { free(c->defins); c->defins = NULL; free(c->folded_ins); c->folded_ins = NULL; free(c->cmp_fuse); c->cmp_fuse = NULL; return -1; }
     c->bf = bf;
     EarlyReturn er = detect_early_return(f);
@@ -2738,6 +2880,12 @@ static int emit_func(Ctx *c, int fi) {
     c->defins = NULL;
     free(c->folded_ins);
     c->folded_ins = NULL;
+    free(c->chain_skip);
+    c->chain_skip = NULL;
+    free(c->chain_root);
+    c->chain_root = NULL;
+    free(c->chain_off);
+    c->chain_off = NULL;
     free(c->cmp_fuse);
     c->cmp_fuse = NULL;
     return 0;
