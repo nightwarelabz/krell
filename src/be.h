@@ -7,7 +7,7 @@
 #include "krell.h"
 
 /* value classes for allocation */
-enum { BCLS_GP = 0, BCLS_FP = 1, BCLS_VEC = 2 };
+enum { BCLS_GP = 0, BCLS_FP = 1, BCLS_VEC = 2, BCLS_MEM128 = 3 };
 
 /* a location: a register (target numbering) or a stack slot */
 typedef struct {

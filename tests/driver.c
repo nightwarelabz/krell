@@ -92,6 +92,8 @@ static uint64_t sh_manyargs(const uint64_t *a) {
     return manyargs(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], dfrom(a[8]), dfrom(a[9]));
 }
 static uint64_t sh_spills(const uint64_t *a) { return spills(a[0]); }
+extern uint64_t w128(uint64_t, uint64_t);
+static uint64_t sh_w128(const uint64_t *a) { return w128(a[0], a[1]); }
 
 typedef struct { const char *name; Shim shim; } SEntry;
 static const SEntry SCALARS[] = {
@@ -105,6 +107,7 @@ static const SEntry SCALARS[] = {
     { "bitcast_df", sh_bitcast_df }, { "bitcast_id", sh_bitcast_id },
     { "fround", sh_fround }, { "fround2", sh_fround2 },
     { "manyargs", sh_manyargs }, { "spills", sh_spills },
+    { "w128", sh_w128 },
 };
 
 static int failures = 0, total = 0;

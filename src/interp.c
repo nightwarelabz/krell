@@ -239,13 +239,13 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
             }
             R[0] = r ? 1 : 0; break;
         }
-        case OP_POPCOUNT: { int c = 0; if (in->ty.bits == 128) { uint64_t x0 = A[0], x1 = A[1]; while (x0) { x0 &= x0 - 1; c++; } while (x1) { x1 &= x1 - 1; c++; } } else { uint64_t x = A[0] & msk(in->ty.bits); while (x) { x &= x - 1; c++; } } R[0] = (uint64_t)c; break; }
+        case OP_POPCOUNT: { int c = 0; if (in->ty.bits == 128) { uint64_t x0 = A[0], x1 = A[1]; while (x0) { x0 &= x0 - 1; c++; } while (x1) { x1 &= x1 - 1; c++; } } else { uint64_t x = A[0] & msk(in->ty.bits); while (x) { x &= x - 1; c++; } } R[0] = (uint64_t)c; if (in->ty.bits == 128) R[1] = 0; break; }
         case OP_CLZ: { int bits = in->ty.bits, c = 0;
                        if (bits == 128) { if (A[1]) { uint64_t x = A[1]; for (int i = 63; i >= 0; i--) { if ((x >> i) & 1) break; c++; } } else { c = 64; uint64_t x = A[0]; for (int i = 63; i >= 0; i--) { if ((x >> i) & 1) break; c++; } } }
-                       else { uint64_t x = A[0] & msk(bits); for (int i = bits - 1; i >= 0; i--) { if ((x >> i) & 1) break; c++; } } R[0] = (uint64_t)c; break; }
+                       else { uint64_t x = A[0] & msk(bits); for (int i = bits - 1; i >= 0; i--) { if ((x >> i) & 1) break; c++; } } R[0] = (uint64_t)c; if (bits == 128) R[1] = 0; break; }
         case OP_CTZ: { int bits = in->ty.bits, c = 0;
                        if (bits == 128) { if (A[0]) { uint64_t x = A[0]; for (int i = 0; i < 64; i++) { if ((x >> i) & 1) break; c++; } } else { c = 64; uint64_t x = A[1]; for (int i = 0; i < 64; i++) { if ((x >> i) & 1) break; c++; } } }
-                       else { uint64_t x = A[0] & msk(bits); for (int i = 0; i < bits; i++) { if ((x >> i) & 1) break; c++; } } R[0] = (uint64_t)c; break; }
+                       else { uint64_t x = A[0] & msk(bits); for (int i = 0; i < bits; i++) { if ((x >> i) & 1) break; c++; } } R[0] = (uint64_t)c; if (bits == 128) R[1] = 0; break; }
         case OP_BSWAP: {
             if (in->ty.bits == 128) {
                 put128(R, ((unsigned __int128)__builtin_bswap64(A[0]) << 64) | (unsigned __int128)__builtin_bswap64(A[1]));

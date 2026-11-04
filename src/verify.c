@@ -327,14 +327,6 @@ const char *mod_verify_target(Module *m, const char *target) {
     if (!c) return fail("verifier: cost file for target not found");
     for (int fi = 0; fi < m->nfuncs; fi++) {
         Func *f = &m->funcs[fi];
-        /* v3.0 step 5 gate: i128 semantics, encoding and the interpreter
-         * exist, but no backend lowers it yet, so every target rejects
-         * i128 modules uniformly. The next step replaces this blanket
-         * rejection with per-op cost rows (admitted ops priced, division
-         * and remainder cliff-gated). */
-        for (int vi = 0; vi < f->nvalues; vi++)
-            if (f->vtypes[vi].kind == TY_INT && f->vtypes[vi].bits == 128)
-                { cost_free(c); return fail("verifier: i128 has no backend lowering yet (v3.0 gate)"); }
         for (int bi = 0; bi < f->nblocks; bi++) {
             Block *b = &f->blocks[bi];
             for (int ii = 0; ii < b->nins; ii++) {
@@ -347,6 +339,16 @@ const char *mod_verify_target(Module *m, const char *target) {
                 }
                 Type t = in->ty;
                 if (in->op == OP_STORE || in->op == OP_VSTORE || in->op == OP_STOREV) t = f->vtypes[in->b];
+                /* i128 involvement prices the op by its .i128 width row:
+                 * admitted ops carry realistic rows on every target,
+                 * udiv/sdiv/urem/srem carry cliff 1 (v3.0 keeps i128
+                 * division out of every backend's efficient set). */
+                if ((in->ty.kind == TY_INT && in->ty.bits == 128) ||
+                    (in->ety.kind == TY_INT && in->ety.bits == 128) ||
+                    (in->a >= 0 && f->vtypes[in->a].kind == TY_INT && f->vtypes[in->a].bits == 128) ||
+                    (in->b >= 0 && f->vtypes[in->b].kind == TY_INT && f->vtypes[in->b].bits == 128) ||
+                    (in->c >= 0 && f->vtypes[in->c].kind == TY_INT && f->vtypes[in->c].bits == 128))
+                    t = ty_i128();
                 if (cost_lat(c, in->op, t) < 0)
                      { cost_free(c); return failf("verifier: op %s has no cost entry for target (no-cliff gate)", op_name(in->op), 0); }
                 if (cost_cliff(c, in->op, t))

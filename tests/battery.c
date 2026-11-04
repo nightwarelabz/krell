@@ -379,6 +379,42 @@ Module *build_battery(void) {
         }
         emit(f, b, ins_ret(r));
     }
+    /* 26 w128(i64 a, i64 b) -> i64 : i128 arithmetic end to end -
+     * zext, shl into the high word, add (carry), mul by 3, lshr,
+     * icmp, popcount, and an alloca store/load round trip - folded
+     * into an i64 checksum the driver can compare */
+    {
+        Func *f = mod_add_func(m, "w128", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_i64(), ty_i64() }, 2);
+        int a = ARG(f, b, 0), bb = ARG(f, b, 1);
+        Type W = ty_i128();
+        int x = U(f, b, OP_ZEXT, W, a);
+        int y = U(f, b, OP_ZEXT, W, bb);
+        y = B(f, b, OP_SHL, W, y, K(f, b, W, 64));
+        int v = B(f, b, OP_ADD, W, x, y);
+        int w = B(f, b, OP_MUL, W, v, K(f, b, W, 3));
+        int sh = B(f, b, OP_LSHR, W, w, K(f, b, W, 37));
+        int pc = U(f, b, OP_POPCOUNT, W, sh);
+        Instr cmp = ins_make(OP_ICMP, ty_i1()); cmp.a = sh; cmp.b = K(f, b, W, 1000); cmp.pred = IC_UGT;
+        int gt = emit(f, b, cmp);
+        int g1 = U(f, b, OP_ZEXT, ty_i64(), gt);
+        Instr al = ins_make(OP_ALLOCA, ty_ptr()); al.imm = 16; al.c = 16;
+        int cell = emit(f, b, al);
+        Instr st = ins_make(OP_STORE, W); st.a = cell; st.b = v;
+        emit(f, b, st);
+        Instr ld = ins_make(OP_LOAD, W); ld.a = cell;
+        int back = emit(f, b, ld);
+        back = B(f, b, OP_ADD, W, back, K(f, b, W, 1));
+        int lo = U(f, b, OP_TRUNC, ty_i64(), sh);
+        int hi = U(f, b, OP_TRUNC, ty_i64(), B(f, b, OP_LSHR, W, sh, K(f, b, W, 64)));
+        int mlo = U(f, b, OP_TRUNC, ty_i64(), back);
+        int pclo = U(f, b, OP_TRUNC, ty_i64(), pc);
+        int r = B(f, b, OP_ADD, ty_i64(), B(f, b, OP_MUL, ty_i64(), lo, K(f, b, ty_i64(), 31)), hi);
+        r = B(f, b, OP_ADD, ty_i64(), B(f, b, OP_MUL, ty_i64(), r, K(f, b, ty_i64(), 31)), mlo);
+        r = B(f, b, OP_ADD, ty_i64(), B(f, b, OP_MUL, ty_i64(), r, K(f, b, ty_i64(), 31)), pclo);
+        r = B(f, b, OP_ADD, ty_i64(), r, g1);
+        emit(f, b, ins_ret(r));
+    }
     /* 25 vecadd(ptr dst, ptr src) */
     {
         Func *f = mod_add_func(m, "vecadd", ty_void(), 0);

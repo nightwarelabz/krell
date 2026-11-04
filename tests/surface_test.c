@@ -285,9 +285,14 @@ int main(void) {
         else {
             const char *wve = mod_verify(wm);
             if (wve) { printf("FAIL w128 verify: %s\n", wve); failures++; }
-            /* backend gate: no target accepts i128 yet */
+            /* target gate: the admitted i128 ops carry cost rows on
+             * every target, so this module verifies everywhere */
             const char *tg = mod_verify_target(wm, "x86_64");
-            if (!tg) { printf("FAIL w128 gate: x86_64 accepted i128\n"); failures++; }
+            if (tg) { printf("FAIL w128 gate: x86_64 rejected i128: %s\n", tg); failures++; }
+            tg = mod_verify_target(wm, "aarch64");
+            if (tg) { printf("FAIL w128 gate: aarch64 rejected i128: %s\n", tg); failures++; }
+            tg = mod_verify_target(wm, "riscv64");
+            if (tg) { printf("FAIL w128 gate: riscv64 rejected i128: %s\n", tg); failures++; }
             size_t wl; uint8_t *wb = mod_encode(wm, &wl);
             if (!wb || wb[4] != 2) { printf("FAIL w128: encoding version is not 2\n"); failures++; }
             Module *wm2 = wb ? mod_decode(wb, wl, err, sizeof err) : NULL;
@@ -322,6 +327,25 @@ int main(void) {
             if (wm2) mod_free(wm2);
             free(wb);
             mod_free(wm);
+        }
+    }
+    /* i128 division is cliff-gated on every target in v3.0 */
+    {
+        static const char *D128 =
+        "fn div128(i128, i128) -> i128 {\n"
+        "  entry(a: i128, b: i128):\n"
+        "    %q = udiv i128 a, b\n"
+        "    ret %q\n"
+        "}\n";
+        Module *dm = surface_parse(D128, err, sizeof err);
+        if (!dm) { printf("FAIL div128 parse: %s\n", err); failures++; }
+        else {
+            if (mod_verify(dm)) { printf("FAIL div128 structural verify\n"); failures++; }
+            const char *tg = mod_verify_target(dm, "x86_64");
+            if (!tg) { printf("FAIL div128 gate: x86_64 accepted i128 udiv\n"); failures++; }
+            tg = mod_verify_target(dm, "riscv64");
+            if (!tg) { printf("FAIL div128 gate: riscv64 accepted i128 udiv\n"); failures++; }
+            mod_free(dm);
         }
     }
     /* binary round-trip (the main PROG uses no v2 feature: version 1) */

@@ -60,6 +60,9 @@ static void addr_of(Ctx *c, int reg, int delta) {
     else { E(c, "  li x%d, %d", reg, delta); E(c, "  sub x%d, s0, x%d", reg, reg); }
 }
 static int sp_imm(Ctx *c, Loc *l) { return c->bf->frame_bytes - l->off; }
+static int sp128(Ctx *c, int v, int half);
+static void load128_half(Ctx *c, int reg, int v, int half);
+static void store128_half(Ctx *c, int v, int reg, int half);
 
 /* slot load/store with the deep-frame fallback through a scratch reg */
 static void load_gp(Ctx *c, int reg, int v) {
@@ -117,6 +120,17 @@ static void copy_value(Ctx *c, int dst, int src) {
     int cls = be_class_of(t);
     if (cls == BCLS_GP) { load_gp(c, T0, src); store_gp(c, dst, T0); }
     else if (cls == BCLS_FP) { load_fp(c, 31, src); store_fp(c, dst, 31); }
+    else if (cls == BCLS_MEM128) {
+        if (c->f->isconst[src]) {
+            E(c, "  li x%d, %lld", T0, (long long)c->f->cval[src]);
+            store128_half(c, dst, T0, 0);
+            E(c, "  li x%d, %lld", T0, (long long)c->f->cval_hi[src]);
+            store128_half(c, dst, T0, 1);
+        } else if (c->bf->loc[dst].off != c->bf->loc[src].off) {
+            load128_half(c, T0, src, 0); store128_half(c, dst, T0, 0);
+            load128_half(c, T0, src, 1); store128_half(c, dst, T0, 1);
+        }
+    }
     else {
         Loc *dl = &c->bf->loc[dst], *sl = &c->bf->loc[src];
         int bytes = 16 * t.n;
@@ -292,18 +306,30 @@ static void emit_call_args(Ctx *c, Instr *in, const Type *params, bool tail) {
             nf++; fi2++;
         } else if (cls == BCLS_GP || cls == BCLS_FP) {
             sa[nsa].v = v; sa[nsa].slot = stk++; nsa++;
+        } else if (cls == BCLS_MEM128) {
+            sa[nsa].v = v; sa[nsa].slot = stk; stk += 2; nsa++;
         }
     }
     for (int i = 0; i < nsa; i++) {
         int v = sa[i].v;
         int cls = be_class_of(c->f->vtypes[v]);
-        if (cls == BCLS_GP) { load_gp(c, T0, v); E(c, "  sd x%d, %d(sp)", T0, 8 * sa[i].slot); }
+        if (cls == BCLS_MEM128) {
+            load128_half(c, T0, v, 0); E(c, "  sd x%d, %d(sp)", T0, 8 * sa[i].slot);
+            load128_half(c, T0, v, 1); E(c, "  sd x%d, %d(sp)", T0, 8 * sa[i].slot + 8);
+        }
+        else if (cls == BCLS_GP) { load_gp(c, T0, v); E(c, "  sd x%d, %d(sp)", T0, 8 * sa[i].slot); }
         else { load_fp(c, 31, v); E(c, "  fsd f31, %d(sp)", 8 * sa[i].slot); }
     }
     if (tail) {
         for (int i = 0; i < nsa; i++) {
             int cls = be_class_of(c->f->vtypes[sa[i].v]);
-            if (cls == BCLS_GP) {
+            if (cls == BCLS_MEM128) {
+                E(c, "  ld x%d, %d(sp)", T0, 8 * sa[i].slot);
+                E(c, "  sd x%d, %d(s0)", T0, 16 + 8 * sa[i].slot);
+                E(c, "  ld x%d, %d(sp)", T0, 8 * sa[i].slot + 8);
+                E(c, "  sd x%d, %d(s0)", T0, 16 + 8 * sa[i].slot + 8);
+            }
+            else if (cls == BCLS_GP) {
                 E(c, "  ld x%d, %d(sp)", T0, 8 * i);
                 E(c, "  sd x%d, %d(s0)", T0, 16 + 8 * sa[i].slot);
             } else {
@@ -355,10 +381,312 @@ static void lane_store_from(Ctx *c, int reg, int addr, int eb) {
     else E(c, "  sd x%d, 0(x%d)", reg, addr);
 }
 
+/* ---- i128 (v3.0): memory-resident (lo, hi) pairs; scratch t0/t1/t2.
+ * Return: a0 = lo, a1 = hi. Arguments: two consecutive 8-byte stack
+ * slots, the same convention as the other native lanes. ---- */
+static bool ty128(Type t) { return t.kind == TY_INT && t.bits == 128; }
+static int sp128(Ctx *c, int v, int half) { return c->bf->frame_bytes - c->bf->loc[v].off + 8 * half; }
+static void load128_half(Ctx *c, int reg, int v, int half) {
+    if (v >= 0 && v < c->f->nvalues && c->f->isconst[v]) {
+        E(c, "  li x%d, %lld", reg, (long long)(half ? c->f->cval_hi[v] : c->f->cval[v]));
+        return;
+    }
+    int imm = sp128(c, v, half);
+    if (imm <= 2047) { E(c, "  ld x%d, %d(sp)", reg, imm); return; }
+    int as = reg == T0 ? T1 : T0;
+    E(c, "  li x%d, %d", as, imm);
+    E(c, "  add x%d, sp, x%d", as, as);
+    E(c, "  ld x%d, 0(x%d)", reg, as);
+}
+static void store128_half(Ctx *c, int v, int reg, int half) {
+    if (v >= 0 && v < c->f->nvalues && c->bf->defpos[v] == c->bf->endpos[v]) return;
+    int imm = sp128(c, v, half);
+    if (imm <= 2047) { E(c, "  sd x%d, %d(sp)", reg, imm); return; }
+    int as = reg == T0 ? T1 : T0;
+    E(c, "  li x%d, %d", as, imm);
+    E(c, "  add x%d, sp, x%d", as, as);
+    E(c, "  sd x%d, 0(x%d)", reg, as);
+}
+static void store128_zero(Ctx *c, int v, int half) { store128_half(c, v, 0, half); }
+static bool emit_i128(Ctx *c, Instr *in) {
+    Func *f = c->f;
+    switch (in->op) {
+    case OP_ICONST:
+        E(c, "  li x%d, %lld", T0, (long long)in->imm); store128_half(c, in->result, T0, 0);
+        E(c, "  li x%d, %lld", T0, (long long)in->imm2); store128_half(c, in->result, T0, 1);
+        return true;
+    case OP_ADD:
+        load128_half(c, T0, in->a, 0); load128_half(c, T1, in->b, 0);
+        E(c, "  add x%d, x%d, x%d", T2, T0, T1);
+        E(c, "  sltu x%d, x%d, x%d", T0, T2, T0);
+        store128_half(c, in->result, T2, 0);
+        load128_half(c, T1, in->a, 1); load128_half(c, T2, in->b, 1);
+        E(c, "  add x%d, x%d, x%d", T1, T1, T2);
+        E(c, "  add x%d, x%d, x%d", T1, T1, T0);
+        store128_half(c, in->result, T1, 1);
+        return true;
+    case OP_SUB:
+        load128_half(c, T0, in->a, 0); load128_half(c, T1, in->b, 0);
+        E(c, "  sltu x%d, x%d, x%d", T2, T0, T1);
+        E(c, "  sub x%d, x%d, x%d", T0, T0, T1);
+        store128_half(c, in->result, T0, 0);
+        load128_half(c, T0, in->a, 1); load128_half(c, T1, in->b, 1);
+        E(c, "  sub x%d, x%d, x%d", T0, T0, T1);
+        E(c, "  sub x%d, x%d, x%d", T0, T0, T2);
+        store128_half(c, in->result, T0, 1);
+        return true;
+    case OP_AND: case OP_OR: case OP_XOR: {
+        const char *nm = in->op == OP_AND ? "and" : in->op == OP_OR ? "or" : "xor";
+        for (int h = 0; h < 2; h++) {
+            load128_half(c, T0, in->a, h); load128_half(c, T1, in->b, h);
+            E(c, "  %s x%d, x%d, x%d", nm, T0, T0, T1);
+            store128_half(c, in->result, T0, h);
+        }
+        return true;
+    }
+    case OP_NEG:
+        load128_half(c, T0, in->a, 0);
+        E(c, "  sltu x%d, x0, x%d", T2, T0);
+        E(c, "  sub x%d, x0, x%d", T0, T0);
+        store128_half(c, in->result, T0, 0);
+        load128_half(c, T0, in->a, 1);
+        E(c, "  sub x%d, x0, x%d", T0, T0);
+        E(c, "  sub x%d, x%d, x%d", T0, T0, T2);
+        store128_half(c, in->result, T0, 1);
+        return true;
+    case OP_NOT:
+        for (int h = 0; h < 2; h++) {
+            load128_half(c, T0, in->a, h);
+            E(c, "  not x%d, x%d", T0, T0);
+            store128_half(c, in->result, T0, h);
+        }
+        return true;
+    case OP_MUL:
+        load128_half(c, T0, in->a, 0); load128_half(c, T1, in->b, 0);
+        E(c, "  mul x%d, x%d, x%d", T2, T0, T1); store128_half(c, in->result, T2, 0);
+        E(c, "  mulhu x%d, x%d, x%d", T2, T0, T1); store128_half(c, in->result, T2, 1);
+        for (int h = 0; h < 2; h++) {
+            load128_half(c, T0, in->a, h); load128_half(c, T1, in->b, 1 - h);
+            E(c, "  mul x%d, x%d, x%d", T0, T0, T1);
+            if (!(in->result >= 0 && c->bf->defpos[in->result] == c->bf->endpos[in->result])) {
+                load128_half(c, T1, in->result, 1);
+                E(c, "  add x%d, x%d, x%d", T1, T1, T0);
+                store128_half(c, in->result, T1, 1);
+            }
+        }
+        return true;
+    case OP_SHL: case OP_LSHR: case OP_ASHR: {
+        int64_t kc;
+        bool isc = be_iconst_val(f, in->b, &kc) || (in->b >= 0 && f->isconst[in->b]);
+        if (isc) {
+            int k = (int)((in->b >= 0 && f->isconst[in->b] ? (int64_t)f->cval[in->b] : kc) & 127);
+            if (k == 0) { copy_value(c, in->result, in->a); return true; }
+            if (k < 64) {
+                if (in->op == OP_SHL) {
+                    load128_half(c, T0, in->a, 0); load128_half(c, T1, in->a, 1);
+                    E(c, "  srli x%d, x%d, %d", T0, T0, 64 - k); E(c, "  slli x%d, x%d, %d", T1, T1, k);
+                    E(c, "  or x%d, x%d, x%d", T0, T0, T1); store128_half(c, in->result, T0, 1);
+                    load128_half(c, T0, in->a, 0); E(c, "  slli x%d, x%d, %d", T0, T0, k);
+                    store128_half(c, in->result, T0, 0);
+                } else {
+                    load128_half(c, T0, in->a, 1); load128_half(c, T1, in->a, 0);
+                    E(c, "  slli x%d, x%d, %d", T0, T0, 64 - k); E(c, "  srli x%d, x%d, %d", T1, T1, k);
+                    E(c, "  or x%d, x%d, x%d", T0, T0, T1); store128_half(c, in->result, T0, 0);
+                    load128_half(c, T0, in->a, 1);
+                    E(c, "  %s x%d, x%d, %d", in->op == OP_LSHR ? "srli" : "srai", T0, T0, k);
+                    store128_half(c, in->result, T0, 1);
+                }
+            } else {
+                int k2 = k - 64;
+                if (in->op == OP_SHL) {
+                    load128_half(c, T0, in->a, 0); if (k2) E(c, "  slli x%d, x%d, %d", T0, T0, k2);
+                    store128_half(c, in->result, T0, 1); store128_zero(c, in->result, 0);
+                } else if (in->op == OP_LSHR) {
+                    load128_half(c, T0, in->a, 1); if (k2) E(c, "  srli x%d, x%d, %d", T0, T0, k2);
+                    store128_half(c, in->result, T0, 0); store128_zero(c, in->result, 1);
+                } else {
+                    load128_half(c, T0, in->a, 1); if (k2) E(c, "  srai x%d, x%d, %d", T0, T0, k2);
+                    store128_half(c, in->result, T0, 0);
+                    load128_half(c, T0, in->a, 1); E(c, "  srai x%d, x%d, 63", T0, T0);
+                    store128_half(c, in->result, T0, 1);
+                }
+            }
+            return true;
+        }
+        /* variable amount: t0 = k (mod 128), t2 = 64 - k on the small path */
+        int Lz = ++c->lbl, Lbig = ++c->lbl, Ldone = ++c->lbl;
+        load128_half(c, T0, in->b, 0);
+        E(c, "  andi x%d, x%d, 127", T0, T0);
+        E(c, "  beqz x%d, .Lx%d_%d", T0, c->fi, Lz);
+        E(c, "  li x%d, 64", T2);
+        E(c, "  bltu x%d, x%d, .Lx%d_%d", T0, T2, Lbig + 100000);
+        E(c, "  j .Lx%d_%d", c->fi, Lbig);
+        E(c, ".Lx%d_%d:", c->fi, Lbig + 100000);
+        E(c, "  sub x%d, x%d, x%d", T2, T2, T0);
+        if (in->op == OP_SHL) {
+            load128_half(c, T1, in->a, 0); E(c, "  srl x%d, x%d, x%d", T1, T1, T2); store128_half(c, in->result, T1, 1);
+            load128_half(c, T1, in->a, 1); E(c, "  sll x%d, x%d, x%d", T1, T1, T0);
+            if (!(in->result >= 0 && c->bf->defpos[in->result] == c->bf->endpos[in->result])) {
+                load128_half(c, T2, in->result, 1);
+                E(c, "  or x%d, x%d, x%d", T1, T1, T2);
+                store128_half(c, in->result, T1, 1);
+            }
+            load128_half(c, T1, in->a, 0); E(c, "  sll x%d, x%d, x%d", T1, T1, T0); store128_half(c, in->result, T1, 0);
+        } else {
+            load128_half(c, T1, in->a, 1); E(c, "  sll x%d, x%d, x%d", T1, T1, T2); store128_half(c, in->result, T1, 0);
+            load128_half(c, T1, in->a, 0); E(c, "  srl x%d, x%d, x%d", T1, T1, T0);
+            if (!(in->result >= 0 && c->bf->defpos[in->result] == c->bf->endpos[in->result])) {
+                load128_half(c, T2, in->result, 0);
+                E(c, "  or x%d, x%d, x%d", T1, T1, T2);
+                store128_half(c, in->result, T1, 0);
+            }
+            load128_half(c, T1, in->a, 1);
+            E(c, "  %s x%d, x%d, x%d", in->op == OP_LSHR ? "srl" : "sra", T1, T1, T0);
+            store128_half(c, in->result, T1, 1);
+        }
+        E(c, "  j .Lx%d_%d", c->fi, Ldone);
+        E(c, ".Lx%d_%d:", c->fi, Lz);
+        copy_value(c, in->result, in->a);
+        E(c, "  j .Lx%d_%d", c->fi, Ldone);
+        E(c, ".Lx%d_%d:", c->fi, Lbig);
+        E(c, "  addi x%d, x%d, -64", T0, T0);
+        if (in->op == OP_SHL) {
+            load128_half(c, T1, in->a, 0); E(c, "  sll x%d, x%d, x%d", T1, T1, T0);
+            store128_half(c, in->result, T1, 1); store128_zero(c, in->result, 0);
+        } else if (in->op == OP_LSHR) {
+            load128_half(c, T1, in->a, 1); E(c, "  srl x%d, x%d, x%d", T1, T1, T0);
+            store128_half(c, in->result, T1, 0); store128_zero(c, in->result, 1);
+        } else {
+            load128_half(c, T1, in->a, 1); E(c, "  sra x%d, x%d, x%d", T1, T1, T0);
+            store128_half(c, in->result, T1, 0);
+            load128_half(c, T1, in->a, 1); E(c, "  srai x%d, x%d, 63", T1, T1);
+            store128_half(c, in->result, T1, 1);
+        }
+        E(c, ".Lx%d_%d:", c->fi, Ldone);
+        return true;
+    }
+    case OP_ICMP: {
+        if (in->pred == IC_EQ || in->pred == IC_NE) {
+            load128_half(c, T0, in->a, 0); load128_half(c, T1, in->b, 0);
+            E(c, "  xor x%d, x%d, x%d", T0, T0, T1);
+            load128_half(c, T1, in->a, 1); load128_half(c, T2, in->b, 1);
+            E(c, "  xor x%d, x%d, x%d", T1, T1, T2);
+            E(c, "  or x%d, x%d, x%d", T0, T0, T1);
+            E(c, "  %s x%d, x%d", in->pred == IC_EQ ? "seqz" : "snez", T0, T0);
+            store_gp(c, in->result, T0);
+            return true;
+        }
+        /* hi decides unless equal; lo always compares unsigned */
+        int Llo = ++c->lbl, Ldone = ++c->lbl;
+        load128_half(c, T0, in->a, 1); load128_half(c, T1, in->b, 1);
+        E(c, "  beq x%d, x%d, .Lx%d_%d", T0, T1, c->fi, Llo);
+        switch (in->pred) {
+        case IC_ULT: E(c, "  sltu x%d, x%d, x%d", T0, T0, T1); break;
+        case IC_ULE: E(c, "  sltu x%d, x%d, x%d", T0, T1, T0); E(c, "  xori x%d, x%d, 1", T0, T0); break;
+        case IC_UGT: E(c, "  sltu x%d, x%d, x%d", T0, T1, T0); break;
+        case IC_UGE: E(c, "  sltu x%d, x%d, x%d", T0, T0, T1); E(c, "  xori x%d, x%d, 1", T0, T0); break;
+        case IC_SLT: E(c, "  slt x%d, x%d, x%d", T0, T0, T1); break;
+        case IC_SLE: E(c, "  slt x%d, x%d, x%d", T0, T1, T0); E(c, "  xori x%d, x%d, 1", T0, T0); break;
+        case IC_SGT: E(c, "  slt x%d, x%d, x%d", T0, T1, T0); break;
+        case IC_SGE: E(c, "  slt x%d, x%d, x%d", T0, T0, T1); E(c, "  xori x%d, x%d, 1", T0, T0); break;
+        default: break;
+        }
+        E(c, "  j .Lx%d_%d", c->fi, Ldone);
+        E(c, ".Lx%d_%d:", c->fi, Llo);
+        load128_half(c, T0, in->a, 0); load128_half(c, T1, in->b, 0);
+        switch (in->pred) {
+        case IC_ULT: case IC_SLT: E(c, "  sltu x%d, x%d, x%d", T0, T0, T1); break;
+        case IC_ULE: case IC_SLE: E(c, "  sltu x%d, x%d, x%d", T0, T1, T0); E(c, "  xori x%d, x%d, 1", T0, T0); break;
+        case IC_UGT: case IC_SGT: E(c, "  sltu x%d, x%d, x%d", T0, T1, T0); break;
+        case IC_UGE: case IC_SGE: E(c, "  sltu x%d, x%d, x%d", T0, T0, T1); E(c, "  xori x%d, x%d, 1", T0, T0); break;
+        default: break;
+        }
+        E(c, ".Lx%d_%d:", c->fi, Ldone);
+        store_gp(c, in->result, T0);
+        return true;
+    }
+    case OP_POPCOUNT:
+        load128_half(c, T0, in->a, 0); E(c, "  cpop x%d, x%d", T0, T0);
+        load128_half(c, T1, in->a, 1); E(c, "  cpop x%d, x%d", T1, T1);
+        E(c, "  add x%d, x%d, x%d", T0, T0, T1);
+        store128_half(c, in->result, T0, 0); store128_zero(c, in->result, 1);
+        return true;
+    case OP_CLZ: {
+        int Ld = ++c->lbl;
+        load128_half(c, T0, in->a, 1);
+        E(c, "  clz x%d, x%d", T1, T0);
+        E(c, "  bnez x%d, .Lx%d_%d", T0, c->fi, Ld);
+        load128_half(c, T0, in->a, 0);
+        E(c, "  clz x%d, x%d", T1, T0);
+        E(c, "  addi x%d, x%d, 64", T1, T1);
+        E(c, ".Lx%d_%d:", c->fi, Ld);
+        store128_half(c, in->result, T1, 0); store128_zero(c, in->result, 1);
+        return true;
+    }
+    case OP_CTZ: {
+        int Ld = ++c->lbl;
+        load128_half(c, T0, in->a, 0);
+        E(c, "  ctz x%d, x%d", T1, T0);
+        E(c, "  bnez x%d, .Lx%d_%d", T0, c->fi, Ld);
+        load128_half(c, T0, in->a, 1);
+        E(c, "  ctz x%d, x%d", T1, T0);
+        E(c, "  addi x%d, x%d, 64", T1, T1);
+        E(c, ".Lx%d_%d:", c->fi, Ld);
+        store128_half(c, in->result, T1, 0); store128_zero(c, in->result, 1);
+        return true;
+    }
+    case OP_BSWAP:
+        load128_half(c, T0, in->a, 0); E(c, "  rev8 x%d, x%d", T0, T0);
+        load128_half(c, T1, in->a, 1); E(c, "  rev8 x%d, x%d", T1, T1);
+        store128_half(c, in->result, T1, 0); store128_half(c, in->result, T0, 1);
+        return true;
+    case OP_ZEXT:
+        load_gp(c, T0, in->a);
+        store128_half(c, in->result, T0, 0); store128_zero(c, in->result, 1);
+        return true;
+    case OP_SEXT: {
+        Type ta = f->vtypes[in->a];
+        load_gp(c, T0, in->a);
+        sext_reg(c, T0, ta.bits);
+        store128_half(c, in->result, T0, 0);
+        E(c, "  srai x%d, x%d, 63", T1, T0);
+        store128_half(c, in->result, T1, 1);
+        return true;
+    }
+    case OP_TRUNC:
+        load128_half(c, T0, in->a, 0);
+        mask_reg(c, T0, in->ty);
+        store_gp(c, in->result, T0);
+        return true;
+    case OP_LOAD: case OP_LOADV:
+        load_gp(c, T0, in->a);
+        E(c, "  ld x%d, 0(x%d)", T1, T0); store128_half(c, in->result, T1, 0);
+        E(c, "  ld x%d, 8(x%d)", T1, T0); store128_half(c, in->result, T1, 1);
+        return true;
+    case OP_STORE: case OP_STOREV:
+        load_gp(c, T0, in->a);
+        load128_half(c, T1, in->b, 0); E(c, "  sd x%d, 0(x%d)", T1, T0);
+        load128_half(c, T1, in->b, 1); E(c, "  sd x%d, 8(x%d)", T1, T0);
+        return true;
+    case OP_RET:
+        if (in->a >= 0) {
+            load128_half(c, 10, in->a, 0);
+            load128_half(c, 11, in->a, 1);
+        }
+        emit_epilogue(c);
+        E(c, "  ret");
+        return true;
+    default: return false;
+    }
+}
+
 static void emit_instr(Ctx *c, int bi, int ii) {
     Func *f = c->f;
     Instr *in = &f->blocks[bi].ins[ii];
     Type t = in->ty;
+    if (ty128(in->ty) || ty128(in->ety) ||
+        (in->a >= 0 && ty128(f->vtypes[in->a])) || (in->b >= 0 && ty128(f->vtypes[in->b])))
+        if (emit_i128(c, in)) return;
     switch (in->op) {
     case OP_ICONST: {
         E(c, "  li x%d, %lld", T0, (long long)in->imm);
@@ -788,6 +1116,10 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         E(c, "  call %s", name);
         if (t.kind != TY_VOID) {
             if (be_class_of(t) == BCLS_FP) store_fp(c, in->result, 10);
+            else if (be_class_of(t) == BCLS_MEM128) {
+                store128_half(c, in->result, 10, 0);
+                store128_half(c, in->result, 11, 1);
+            }
             else store_gp(c, in->result, 10);
         }
         break;
@@ -1074,6 +1406,7 @@ static int emit_func(Ctx *c, int fi) {
         Loc *fs = malloc(sizeof(Loc) * (size_t)(b0->nargs ? b0->nargs : 1));
         Loc *fd = malloc(sizeof(Loc) * (size_t)(b0->nargs ? b0->nargs : 1));
         int ng = 0, nf = 0, gi = 0, fi2 = 0, stk = 0;
+        int wv[64], wstk[64], nw = 0;
         for (int i = 0; i < b0->nargs; i++) {
             int v = b0->arg_vals[i];
             int cls = be_class_of(b0->arg_types[i]);
@@ -1083,6 +1416,11 @@ static int emit_func(Ctx *c, int fi) {
             else if (cls == BCLS_FP && fi2 < 8) { if (!dead) { fs[nf] = (Loc){ 1, BCLS_FP, 10 + fi2, 0 }; fd[nf] = dst; nf++; } fi2++; }
             else {
                 Loc src = { 0, (int8_t)cls, -1000 - stk, -(16 + 8 * stk) };
+                if (cls == BCLS_MEM128) {
+                    if (!dead) { wv[nw] = v; wstk[nw] = stk; nw++; }
+                    stk += 2;
+                    continue;
+                }
                 stk++;
                 if (dead) continue;
                 if (cls == BCLS_GP) { gs[ng] = src; gd[ng] = dst; ng++; }
@@ -1091,6 +1429,13 @@ static int emit_func(Ctx *c, int fi) {
         }
         parallel_moves(c, gs, gd, ng, BCLS_GP);
         parallel_moves(c, fs, fd, nf, BCLS_FP);
+        /* i128 params arrive as two stack slots; copy both halves home */
+        for (int i = 0; i < nw; i++) {
+            E(c, "  ld x%d, %d(s0)", T0, 16 + 8 * wstk[i]);
+            store128_half(c, wv[i], T0, 0);
+            E(c, "  ld x%d, %d(s0)", T0, 16 + 8 * wstk[i] + 8);
+            store128_half(c, wv[i], T0, 1);
+        }
         free(gs); free(gd); free(fs); free(fd);
         /* canonical form: narrow integer params are masked in place */
         for (int i = 0; i < b0->nargs; i++) {
