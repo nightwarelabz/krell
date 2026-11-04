@@ -1,0 +1,1229 @@
+; SYNCHRONY
+; Four Lorenz butterflies, released together.
+;
+; Four copies of the Lorenz system (sigma 10, rho 28, beta 8/3)
+; start at (1, 1, 20), offset in x by 0, 1e-9, 2e-9 and 3e-9.
+; Integrated with RK4 at dt 0.0008 after a 10,000-step settle,
+; each frame draws the trailing 3,400 steps as additive light
+; in f64 RGB buffers. Chaos amplifies the offsets until the
+; single white trace separates into four coloured butterflies.
+;
+; The program uses no host mathematics: externs are write,
+; malloc, free, atoi. Sine and cosine are Taylor polynomials
+; derived in the program, the tone map is the rational function
+; v/(1+v), and no fma is used anywhere, so the output bits are
+; identical on every Krell backend (verified on x86_64, AArch64,
+; RISC-V 64 and the LLVM lane).
+;
+; Output is one PPM (P6) frame on stdout.
+; Args: [frame] [total] [size]   defaults 0, 1728, 960.
+
+extern write(i32, ptr, i64) -> i64
+extern malloc(i64) -> ptr
+extern free(ptr) -> void
+extern atoi(ptr) -> i32
+
+data dh1: i8 = { 80, 54, 10 }
+data dsp: i8 = { 32 }
+data dh2: i8 = { 10, 50, 53, 53, 10 }
+
+fn wh1() -> void {
+  entry():
+    %_s0 = iconst i64 0
+    %_s1 = iconst i32 0
+    %_s2 = iconst i8 0
+    %_s3 = iconst i64 1
+    %_s4 = iconst i32 1
+    %_s5 = iconst i8 1
+    %_s6 = iconst i64 3
+    %_s7 = iconst i32 3
+    %_s8 = iconst i8 3
+    %p = dataptr 0
+    %r = call i64 write(1, %p, 3)
+    ret
+}
+fn wsp() -> void {
+  entry():
+    %_s0 = iconst i64 1
+    %_s1 = iconst i32 1
+    %_s2 = iconst i8 1
+    %p = dataptr 1
+    %r = call i64 write(1, %p, 1)
+    ret
+}
+fn wh2() -> void {
+  entry():
+    %_s0 = iconst i64 1
+    %_s1 = iconst i32 1
+    %_s2 = iconst i8 1
+    %_s3 = iconst i64 2
+    %_s4 = iconst i32 2
+    %_s5 = iconst i8 2
+    %_s6 = iconst i64 5
+    %_s7 = iconst i32 5
+    %_s8 = iconst i8 5
+    %p = dataptr 2
+    %r = call i64 write(1, %p, 5)
+    ret
+}
+
+fn print_u64(i64) -> void {
+  entry(x: i64):
+    %_s0 = iconst i64 0
+    %_s1 = iconst i32 0
+    %_s2 = iconst i8 0
+    %_s3 = iconst i64 1
+    %_s4 = iconst i32 1
+    %_s5 = iconst i8 1
+    %_s6 = iconst i64 10
+    %_s7 = iconst i32 10
+    %_s8 = iconst i8 10
+    %_s9 = iconst i64 24
+    %_s10 = iconst i32 24
+    %_s11 = iconst i8 24
+    %_s12 = iconst i64 32
+    %_s13 = iconst i32 32
+    %_s14 = iconst i8 32
+    %_s15 = iconst i64 48
+    %_s16 = iconst i32 48
+    %_s17 = iconst i8 48
+    %buf = call ptr malloc(32)
+    %z = icmp.eq i64 x, 0
+    condbr %z, zero(%buf), loop(24, x, %buf)
+  zero(buf: ptr):
+    %p = gep i8 buf, 0
+    store i8 %p, 48
+    %w = call i64 write(1, buf, 1)
+    ret
+  loop(pos: i64, x: i64, buf: ptr):
+    %done = icmp.sle i64 x, 0
+    condbr %done, dump(pos, buf), body(pos, x, buf)
+  body(pos: i64, x: i64, buf: ptr):
+    %d = urem i64 x, 10
+    %ch = add i64 %d, 48
+    %ch8 = trunc i8 %ch
+    %p2 = sub i64 pos, 1
+    %pp = gep i8 buf, %p2
+    store i8 %pp, %ch8
+    %x2 = udiv i64 x, 10
+    br loop(%p2, %x2, buf)
+  dump(pos: i64, buf: ptr):
+    %pp = gep i8 buf, pos
+    %len = sub i64 24, pos
+    %w = call i64 write(1, %pp, %len)
+    ret
+}
+
+fn zero_canvas(ptr, i64) -> void {
+  entry(buf: ptr, n: i64):
+    %_s0 = iconst i64 0
+    %_s1 = iconst i32 0
+    %_s2 = iconst i8 0
+    %_s3 = iconst i64 1
+    %_s4 = iconst i32 1
+    %_s5 = iconst i8 1
+    %_s6 = fconst f64 0.0
+    br loop(0, buf, n)
+  loop(i: i64, buf: ptr, n: i64):
+    %done = icmp.sge i64 i, n
+    condbr %done, fin(), body(i, buf, n)
+  body(i: i64, buf: ptr, n: i64):
+    %p = gep f64 buf, i
+    store f64 %p, 0.0
+    %i2 = add i64 i, 1
+    br loop(%i2, buf, n)
+  fin():
+    ret
+}
+
+
+fn clamp01(f64) -> f64 {
+  entry(v: f64):
+    %_s0 = fconst f64 0.0
+    %_s1 = fconst f64 1.0
+    %lo = fcmp.olt f64 v, 0.0
+    %a = select f64 %lo, 0.0, v
+    %hi = fcmp.ogt f64 %a, 1.0
+    %b = select f64 %hi, 1.0, %a
+    ret %b
+}
+
+fn clamp255(f64) -> f64 {
+  entry(v: f64):
+    %_s0 = fconst f64 0.0
+    %_s1 = fconst f64 255.0
+    %lo = fcmp.olt f64 v, 0.0
+    %a = select f64 %lo, 0.0, v
+    %hi = fcmp.ogt f64 %a, 255.0
+    %b = select f64 %hi, 255.0, %a
+    ret %b
+}
+
+; Sine on [-pi, pi], Taylor polynomial, Horner form with plain
+; fmul/fadd only (no fma op anywhere in these programs).
+fn ksin(f64) -> f64 {
+  entry(x: f64):
+    %_s0 = fconst f64 -0.00019841269841269842
+    %_s1 = fconst f64 -0.16666666666666666
+    %_s2 = fconst f64 0.0000027557319223985893
+    %_s3 = fconst f64 0.008333333333333334
+    %_s4 = fconst f64 1.0
+    %x2 = fmul f64 x, x
+    %c0 = fmul f64 0.0000027557319223985893, %x2
+    %c0b = fadd f64 %c0, -0.00019841269841269842
+    %c1 = fmul f64 %c0b, %x2
+    %c1b = fadd f64 %c1, 0.008333333333333334
+    %c2 = fmul f64 %c1b, %x2
+    %c2b = fadd f64 %c2, -0.16666666666666666
+    %c3 = fmul f64 %c2b, %x2
+    %c3b = fadd f64 %c3, 1.0
+    %r = fmul f64 %c3b, x
+    ret %r
+}
+
+fn kcos(f64) -> f64 {
+  entry(x: f64):
+    %_s0 = fconst f64 1.5707963267948966
+    %s = fadd f64 x, 1.5707963267948966
+    %r = call f64 ksin(%s)
+    ret %r
+}
+
+; Lorenz derivative: sigma 10, rho 28, beta 8/3. Pure fadd/fmul/fsub.
+fn deriv(f64, f64, f64, ptr) -> void {
+  entry(x: f64, y: f64, z: f64, out: ptr):
+    %_s0 = iconst i64 0
+    %_s1 = iconst i32 0
+    %_s2 = iconst i8 0
+    %_s3 = iconst i64 1
+    %_s4 = iconst i32 1
+    %_s5 = iconst i8 1
+    %_s6 = iconst i64 2
+    %_s7 = iconst i32 2
+    %_s8 = iconst i8 2
+    %_s9 = fconst f64 10.0
+    %_s10 = fconst f64 2.6666666666666665
+    %_s11 = fconst f64 28.0
+    %d0 = fsub f64 y, x
+    %dx = fmul f64 10.0, %d0
+    %z0 = fsub f64 28.0, z
+    %m0 = fmul f64 x, %z0
+    %dy = fsub f64 %m0, y
+    %m1 = fmul f64 x, y
+    %m2 = fmul f64 2.6666666666666665, z
+    %dz = fsub f64 %m1, %m2
+    %p0 = gep f64 out, 0
+    store f64 %p0, %dx
+    %p1 = gep f64 out, 1
+    store f64 %p1, %dy
+    %p2 = gep f64 out, 2
+    store f64 %p2, %dz
+    ret
+}
+
+; One RK4 step, in place on s[0..2]; w is 15 f64 of scratch:
+; k1 at 0..2, k2 at 3..5, k3 at 6..8, k4 at 9..11, temp state at 12..14.
+fn lstep(ptr, ptr, f64) -> void {
+  entry(s: ptr, w: ptr, dt: f64):
+    %_s0 = iconst i64 0
+    %_s1 = iconst i32 0
+    %_s2 = iconst i8 0
+    %_s3 = iconst i64 1
+    %_s4 = iconst i32 1
+    %_s5 = iconst i8 1
+    %_s6 = iconst i64 2
+    %_s7 = iconst i32 2
+    %_s8 = iconst i8 2
+    %_s9 = iconst i64 3
+    %_s10 = iconst i32 3
+    %_s11 = iconst i8 3
+    %_s12 = iconst i64 4
+    %_s13 = iconst i32 4
+    %_s14 = iconst i8 4
+    %_s15 = iconst i64 5
+    %_s16 = iconst i32 5
+    %_s17 = iconst i8 5
+    %_s18 = iconst i64 6
+    %_s19 = iconst i32 6
+    %_s20 = iconst i8 6
+    %_s21 = iconst i64 7
+    %_s22 = iconst i32 7
+    %_s23 = iconst i8 7
+    %_s24 = iconst i64 8
+    %_s25 = iconst i32 8
+    %_s26 = iconst i8 8
+    %_s27 = iconst i64 9
+    %_s28 = iconst i32 9
+    %_s29 = iconst i8 9
+    %_s30 = iconst i64 10
+    %_s31 = iconst i32 10
+    %_s32 = iconst i8 10
+    %_s33 = iconst i64 11
+    %_s34 = iconst i32 11
+    %_s35 = iconst i8 11
+    %_s36 = iconst i64 12
+    %_s37 = iconst i32 12
+    %_s38 = iconst i8 12
+    %_s39 = iconst i64 13
+    %_s40 = iconst i32 13
+    %_s41 = iconst i8 13
+    %_s42 = iconst i64 14
+    %_s43 = iconst i32 14
+    %_s44 = iconst i8 14
+    %_s45 = fconst f64 0.5
+    %_s46 = fconst f64 2.0
+    %_s47 = fconst f64 6.0
+    %h = fmul f64 dt, 0.5
+    %d6 = fdiv f64 dt, 6.0
+    %sx = gep f64 s, 0
+    %x = load f64, %sx
+    %sy = gep f64 s, 1
+    %y = load f64, %sy
+    %sz = gep f64 s, 2
+    %z = load f64, %sz
+    call void deriv(%x, %y, %z, w)
+    %k10 = gep f64 w, 0
+    %k1x = load f64, %k10
+    %k11 = gep f64 w, 1
+    %k1y = load f64, %k11
+    %k12 = gep f64 w, 2
+    %k1z = load f64, %k12
+    %a0 = fmul f64 %h, %k1x
+    %tx = fadd f64 %x, %a0
+    %a1 = fmul f64 %h, %k1y
+    %ty = fadd f64 %y, %a1
+    %a2 = fmul f64 %h, %k1z
+    %tz = fadd f64 %z, %a2
+    %tp = gep f64 w, 12
+    store f64 %tp, %tx
+    %tp1 = gep f64 w, 13
+    store f64 %tp1, %ty
+    %tp2 = gep f64 w, 14
+    store f64 %tp2, %tz
+    %w3 = gep f64 w, 3
+    call void deriv(%tx, %ty, %tz, %w3)
+    %k23 = gep f64 w, 3
+    %k2x = load f64, %k23
+    %k24 = gep f64 w, 4
+    %k2y = load f64, %k24
+    %k25 = gep f64 w, 5
+    %k2z = load f64, %k25
+    %b0 = fmul f64 %h, %k2x
+    %ux = fadd f64 %x, %b0
+    %b1 = fmul f64 %h, %k2y
+    %uy = fadd f64 %y, %b1
+    %b2 = fmul f64 %h, %k2z
+    %uz = fadd f64 %z, %b2
+    store f64 %tp, %ux
+    store f64 %tp1, %uy
+    store f64 %tp2, %uz
+    %w6 = gep f64 w, 6
+    call void deriv(%ux, %uy, %uz, %w6)
+    %k36 = gep f64 w, 6
+    %k3x = load f64, %k36
+    %k37 = gep f64 w, 7
+    %k3y = load f64, %k37
+    %k38 = gep f64 w, 8
+    %k3z = load f64, %k38
+    %c0 = fmul f64 dt, %k3x
+    %vx = fadd f64 %x, %c0
+    %c1 = fmul f64 dt, %k3y
+    %vy = fadd f64 %y, %c1
+    %c2 = fmul f64 dt, %k3z
+    %vz = fadd f64 %z, %c2
+    store f64 %tp, %vx
+    store f64 %tp1, %vy
+    store f64 %tp2, %vz
+    %w9 = gep f64 w, 9
+    call void deriv(%vx, %vy, %vz, %w9)
+    %k49 = gep f64 w, 9
+    %k4x = load f64, %k49
+    %k410 = gep f64 w, 10
+    %k4y = load f64, %k410
+    %k411 = gep f64 w, 11
+    %k4z = load f64, %k411
+    %e0 = fmul f64 2.0, %k2x
+    %e1 = fadd f64 %k1x, %e0
+    %e2 = fmul f64 2.0, %k3x
+    %e3 = fadd f64 %e1, %e2
+    %e4 = fadd f64 %e3, %k4x
+    %e5 = fmul f64 %d6, %e4
+    %nx = fadd f64 %x, %e5
+    %f0 = fmul f64 2.0, %k2y
+    %f1 = fadd f64 %k1y, %f0
+    %f2 = fmul f64 2.0, %k3y
+    %f3 = fadd f64 %f1, %f2
+    %f4 = fadd f64 %f3, %k4y
+    %f5 = fmul f64 %d6, %f4
+    %ny = fadd f64 %y, %f5
+    %g0 = fmul f64 2.0, %k2z
+    %g1 = fadd f64 %k1z, %g0
+    %g2 = fmul f64 2.0, %k3z
+    %g3 = fadd f64 %g1, %g2
+    %g4 = fadd f64 %g3, %k4z
+    %g5 = fmul f64 %d6, %g4
+    %nz = fadd f64 %z, %g5
+    store f64 %sx, %nx
+    store f64 %sy, %ny
+    store f64 %sz, %nz
+    ret
+}
+
+
+; Bounds-checked stamp: does nothing unless the full
+; 3x3 kernel fits inside the canvas.
+fn try_splat(ptr, ptr, ptr, i64, i64, i64, f64, f64, f64) -> void {
+  entry(R: ptr, G: ptr, B: ptr, S: i64, ix: i64, iy: i64, wr: f64, wg: f64, wb: f64):
+    %_s0 = iconst i64 2
+    %_s1 = iconst i32 2
+    %_s2 = iconst i8 2
+    %_s3 = iconst i64 3
+    %_s4 = iconst i32 3
+    %_s5 = iconst i8 3
+    %lo = icmp.sge i64 ix, 2
+    %sm3 = sub i64 S, 3
+    %hi = icmp.sle i64 ix, %sm3
+    %okx = and i1 %lo, %hi
+    condbr %okx, ky(R, G, B, S, ix, iy, wr, wg, wb), fin()
+  ky(R: ptr, G: ptr, B: ptr, S: i64, ix: i64, iy: i64, wr: f64, wg: f64, wb: f64):
+    %lo = icmp.sge i64 iy, 2
+    %sm3 = sub i64 S, 3
+    %hi = icmp.sle i64 iy, %sm3
+    %oky = and i1 %lo, %hi
+    condbr %oky, go(R, G, B, S, ix, iy, wr, wg, wb), fin()
+  go(R: ptr, G: ptr, B: ptr, S: i64, ix: i64, iy: i64, wr: f64, wg: f64, wb: f64):
+    call void splat3(R, G, B, S, ix, iy, wr, wg, wb)
+    br fin()
+  fin():
+    ret
+}
+
+fn splat3(ptr, ptr, ptr, i64, i64, i64, f64, f64, f64) -> void {
+  entry(R: ptr, G: ptr, B: ptr, S: i64, ix: i64, iy: i64, wr: f64, wg: f64, wb: f64):
+    %_s0 = iconst i64 1
+    %_s1 = iconst i32 1
+    %_s2 = iconst i8 1
+    %_s3 = iconst i64 2
+    %_s4 = iconst i32 2
+    %_s5 = iconst i8 2
+    %_s6 = fconst f64 0.03
+    %_s7 = fconst f64 0.045
+    %_s8 = fconst f64 0.1
+    %_s9 = fconst f64 0.42
+    %row = mul i64 iy, S
+    %c = add i64 %row, ix
+    %s2v = mul i64 S, 2
+    %rm2 = sub i64 %c, %s2v
+    %rm1 = sub i64 %c, S
+    %rp1 = add i64 %c, S
+    %rp2 = add i64 %c, %s2v
+    %wR0 = fmul f64 wr, 0.42
+    %aR0 = gep f64 R, %c
+    %vR0 = load f64, %aR0
+    %nR0 = fadd f64 %vR0, %wR0
+    store f64 %aR0, %nR0
+    %wG0 = fmul f64 wg, 0.42
+    %aG0 = gep f64 G, %c
+    %vG0 = load f64, %aG0
+    %nG0 = fadd f64 %vG0, %wG0
+    store f64 %aG0, %nG0
+    %wB0 = fmul f64 wb, 0.42
+    %aB0 = gep f64 B, %c
+    %vB0 = load f64, %aB0
+    %nB0 = fadd f64 %vB0, %wB0
+    store f64 %aB0, %nB0
+    %t1 = add i64 %c, 1
+    %wR1 = fmul f64 wr, 0.1
+    %aR1 = gep f64 R, %t1
+    %vR1 = load f64, %aR1
+    %nR1 = fadd f64 %vR1, %wR1
+    store f64 %aR1, %nR1
+    %wG1 = fmul f64 wg, 0.1
+    %aG1 = gep f64 G, %t1
+    %vG1 = load f64, %aG1
+    %nG1 = fadd f64 %vG1, %wG1
+    store f64 %aG1, %nG1
+    %wB1 = fmul f64 wb, 0.1
+    %aB1 = gep f64 B, %t1
+    %vB1 = load f64, %aB1
+    %nB1 = fadd f64 %vB1, %wB1
+    store f64 %aB1, %nB1
+    %t2 = sub i64 %c, 1
+    %wR2 = fmul f64 wr, 0.1
+    %aR2 = gep f64 R, %t2
+    %vR2 = load f64, %aR2
+    %nR2 = fadd f64 %vR2, %wR2
+    store f64 %aR2, %nR2
+    %wG2 = fmul f64 wg, 0.1
+    %aG2 = gep f64 G, %t2
+    %vG2 = load f64, %aG2
+    %nG2 = fadd f64 %vG2, %wG2
+    store f64 %aG2, %nG2
+    %wB2 = fmul f64 wb, 0.1
+    %aB2 = gep f64 B, %t2
+    %vB2 = load f64, %aB2
+    %nB2 = fadd f64 %vB2, %wB2
+    store f64 %aB2, %nB2
+    %wR3 = fmul f64 wr, 0.1
+    %aR3 = gep f64 R, %rp1
+    %vR3 = load f64, %aR3
+    %nR3 = fadd f64 %vR3, %wR3
+    store f64 %aR3, %nR3
+    %wG3 = fmul f64 wg, 0.1
+    %aG3 = gep f64 G, %rp1
+    %vG3 = load f64, %aG3
+    %nG3 = fadd f64 %vG3, %wG3
+    store f64 %aG3, %nG3
+    %wB3 = fmul f64 wb, 0.1
+    %aB3 = gep f64 B, %rp1
+    %vB3 = load f64, %aB3
+    %nB3 = fadd f64 %vB3, %wB3
+    store f64 %aB3, %nB3
+    %wR4 = fmul f64 wr, 0.1
+    %aR4 = gep f64 R, %rm1
+    %vR4 = load f64, %aR4
+    %nR4 = fadd f64 %vR4, %wR4
+    store f64 %aR4, %nR4
+    %wG4 = fmul f64 wg, 0.1
+    %aG4 = gep f64 G, %rm1
+    %vG4 = load f64, %aG4
+    %nG4 = fadd f64 %vG4, %wG4
+    store f64 %aG4, %nG4
+    %wB4 = fmul f64 wb, 0.1
+    %aB4 = gep f64 B, %rm1
+    %vB4 = load f64, %aB4
+    %nB4 = fadd f64 %vB4, %wB4
+    store f64 %aB4, %nB4
+    %t5 = add i64 %rp1, 1
+    %wR5 = fmul f64 wr, 0.045
+    %aR5 = gep f64 R, %t5
+    %vR5 = load f64, %aR5
+    %nR5 = fadd f64 %vR5, %wR5
+    store f64 %aR5, %nR5
+    %wG5 = fmul f64 wg, 0.045
+    %aG5 = gep f64 G, %t5
+    %vG5 = load f64, %aG5
+    %nG5 = fadd f64 %vG5, %wG5
+    store f64 %aG5, %nG5
+    %wB5 = fmul f64 wb, 0.045
+    %aB5 = gep f64 B, %t5
+    %vB5 = load f64, %aB5
+    %nB5 = fadd f64 %vB5, %wB5
+    store f64 %aB5, %nB5
+    %t6 = add i64 %rm1, 1
+    %wR6 = fmul f64 wr, 0.045
+    %aR6 = gep f64 R, %t6
+    %vR6 = load f64, %aR6
+    %nR6 = fadd f64 %vR6, %wR6
+    store f64 %aR6, %nR6
+    %wG6 = fmul f64 wg, 0.045
+    %aG6 = gep f64 G, %t6
+    %vG6 = load f64, %aG6
+    %nG6 = fadd f64 %vG6, %wG6
+    store f64 %aG6, %nG6
+    %wB6 = fmul f64 wb, 0.045
+    %aB6 = gep f64 B, %t6
+    %vB6 = load f64, %aB6
+    %nB6 = fadd f64 %vB6, %wB6
+    store f64 %aB6, %nB6
+    %t7 = sub i64 %rp1, 1
+    %wR7 = fmul f64 wr, 0.045
+    %aR7 = gep f64 R, %t7
+    %vR7 = load f64, %aR7
+    %nR7 = fadd f64 %vR7, %wR7
+    store f64 %aR7, %nR7
+    %wG7 = fmul f64 wg, 0.045
+    %aG7 = gep f64 G, %t7
+    %vG7 = load f64, %aG7
+    %nG7 = fadd f64 %vG7, %wG7
+    store f64 %aG7, %nG7
+    %wB7 = fmul f64 wb, 0.045
+    %aB7 = gep f64 B, %t7
+    %vB7 = load f64, %aB7
+    %nB7 = fadd f64 %vB7, %wB7
+    store f64 %aB7, %nB7
+    %t8 = sub i64 %rm1, 1
+    %wR8 = fmul f64 wr, 0.045
+    %aR8 = gep f64 R, %t8
+    %vR8 = load f64, %aR8
+    %nR8 = fadd f64 %vR8, %wR8
+    store f64 %aR8, %nR8
+    %wG8 = fmul f64 wg, 0.045
+    %aG8 = gep f64 G, %t8
+    %vG8 = load f64, %aG8
+    %nG8 = fadd f64 %vG8, %wG8
+    store f64 %aG8, %nG8
+    %wB8 = fmul f64 wb, 0.045
+    %aB8 = gep f64 B, %t8
+    %vB8 = load f64, %aB8
+    %nB8 = fadd f64 %vB8, %wB8
+    store f64 %aB8, %nB8
+    %t9 = add i64 %c, 2
+    %wR9 = fmul f64 wr, 0.03
+    %aR9 = gep f64 R, %t9
+    %vR9 = load f64, %aR9
+    %nR9 = fadd f64 %vR9, %wR9
+    store f64 %aR9, %nR9
+    %wG9 = fmul f64 wg, 0.03
+    %aG9 = gep f64 G, %t9
+    %vG9 = load f64, %aG9
+    %nG9 = fadd f64 %vG9, %wG9
+    store f64 %aG9, %nG9
+    %wB9 = fmul f64 wb, 0.03
+    %aB9 = gep f64 B, %t9
+    %vB9 = load f64, %aB9
+    %nB9 = fadd f64 %vB9, %wB9
+    store f64 %aB9, %nB9
+    %t10 = sub i64 %c, 2
+    %wR10 = fmul f64 wr, 0.03
+    %aR10 = gep f64 R, %t10
+    %vR10 = load f64, %aR10
+    %nR10 = fadd f64 %vR10, %wR10
+    store f64 %aR10, %nR10
+    %wG10 = fmul f64 wg, 0.03
+    %aG10 = gep f64 G, %t10
+    %vG10 = load f64, %aG10
+    %nG10 = fadd f64 %vG10, %wG10
+    store f64 %aG10, %nG10
+    %wB10 = fmul f64 wb, 0.03
+    %aB10 = gep f64 B, %t10
+    %vB10 = load f64, %aB10
+    %nB10 = fadd f64 %vB10, %wB10
+    store f64 %aB10, %nB10
+    %wR11 = fmul f64 wr, 0.03
+    %aR11 = gep f64 R, %rp2
+    %vR11 = load f64, %aR11
+    %nR11 = fadd f64 %vR11, %wR11
+    store f64 %aR11, %nR11
+    %wG11 = fmul f64 wg, 0.03
+    %aG11 = gep f64 G, %rp2
+    %vG11 = load f64, %aG11
+    %nG11 = fadd f64 %vG11, %wG11
+    store f64 %aG11, %nG11
+    %wB11 = fmul f64 wb, 0.03
+    %aB11 = gep f64 B, %rp2
+    %vB11 = load f64, %aB11
+    %nB11 = fadd f64 %vB11, %wB11
+    store f64 %aB11, %nB11
+    %wR12 = fmul f64 wr, 0.03
+    %aR12 = gep f64 R, %rm2
+    %vR12 = load f64, %aR12
+    %nR12 = fadd f64 %vR12, %wR12
+    store f64 %aR12, %nR12
+    %wG12 = fmul f64 wg, 0.03
+    %aG12 = gep f64 G, %rm2
+    %vG12 = load f64, %aG12
+    %nG12 = fadd f64 %vG12, %wG12
+    store f64 %aG12, %nG12
+    %wB12 = fmul f64 wb, 0.03
+    %aB12 = gep f64 B, %rm2
+    %vB12 = load f64, %aB12
+    %nB12 = fadd f64 %vB12, %wB12
+    store f64 %aB12, %nB12
+    ret
+}
+
+; Advance all four systems n steps without drawing.
+fn advance(ptr, ptr, i64) -> void {
+  entry(st: ptr, w: ptr, n: i64):
+    %_s0 = iconst i64 0
+    %_s1 = iconst i32 0
+    %_s2 = iconst i8 0
+    %_s3 = iconst i64 1
+    %_s4 = iconst i32 1
+    %_s5 = iconst i8 1
+    %_s6 = iconst i64 3
+    %_s7 = iconst i32 3
+    %_s8 = iconst i8 3
+    %_s9 = iconst i64 6
+    %_s10 = iconst i32 6
+    %_s11 = iconst i8 6
+    %_s12 = iconst i64 9
+    %_s13 = iconst i32 9
+    %_s14 = iconst i8 9
+    %_s15 = fconst f64 0.0008
+    br loop(0, st, w, n)
+  loop(i: i64, st: ptr, w: ptr, n: i64):
+    %done = icmp.sge i64 i, n
+    condbr %done, fin(), body(i, st, w, n)
+  body(i: i64, st: ptr, w: ptr, n: i64):
+    %s0 = gep f64 st, 0
+    call void lstep(%s0, w, 0.0008)
+    %s1 = gep f64 st, 3
+    call void lstep(%s1, w, 0.0008)
+    %s2 = gep f64 st, 6
+    call void lstep(%s2, w, 0.0008)
+    %s3 = gep f64 st, 9
+    call void lstep(%s3, w, 0.0008)
+    %i2 = add i64 i, 1
+    br loop(%i2, st, w, n)
+  fin():
+    ret
+}
+
+; Draw the trailing window: 3400 steps (2.72 time units). Each step
+; advances all four systems and stamps each one's projected point
+; three times (two interpolated sub-points plus the endpoint) so
+; the trace stays dense and continuous at full frame size. Older
+; stamps dim, newest bright. Projection: u = x*cosA + y*sinA
+; horizontally, z vertical.
+fn draw(ptr, ptr, ptr, i64, ptr, ptr, f64, f64, f64, f64, f64, f64) -> void {
+  entry(R: ptr, G: ptr, B: ptr, S: i64, st: ptr, w: ptr, cA: f64, sA: f64, cx: f64, top: f64, sc: f64, vs: f64):
+    %_s0 = iconst i64 0
+    %_s1 = iconst i32 0
+    %_s2 = iconst i8 0
+    %_s3 = iconst i64 1
+    %_s4 = iconst i32 1
+    %_s5 = iconst i8 1
+    %_s6 = iconst i64 2
+    %_s7 = iconst i32 2
+    %_s8 = iconst i8 2
+    %_s9 = iconst i64 3
+    %_s10 = iconst i32 3
+    %_s11 = iconst i8 3
+    %_s12 = iconst i64 4
+    %_s13 = iconst i32 4
+    %_s14 = iconst i8 4
+    %_s15 = iconst i64 5
+    %_s16 = iconst i32 5
+    %_s17 = iconst i8 5
+    %_s18 = iconst i64 6
+    %_s19 = iconst i32 6
+    %_s20 = iconst i8 6
+    %_s21 = iconst i64 7
+    %_s22 = iconst i32 7
+    %_s23 = iconst i8 7
+    %_s24 = iconst i64 8
+    %_s25 = iconst i32 8
+    %_s26 = iconst i8 8
+    %_s27 = iconst i64 9
+    %_s28 = iconst i32 9
+    %_s29 = iconst i8 9
+    %_s30 = iconst i64 10
+    %_s31 = iconst i32 10
+    %_s32 = iconst i8 10
+    %_s33 = iconst i64 11
+    %_s34 = iconst i32 11
+    %_s35 = iconst i8 11
+    %_s36 = iconst i64 3400
+    %_s37 = iconst i32 3400
+    %_s38 = iconst i8 3400
+    %_s39 = fconst f64 0.0008
+    %_s40 = fconst f64 0.16
+    %_s41 = fconst f64 0.25
+    %_s42 = fconst f64 0.3333333333333333
+    %_s43 = fconst f64 0.43
+    %_s44 = fconst f64 0.50
+    %_s45 = fconst f64 0.59
+    %_s46 = fconst f64 0.6666666666666666
+    %_s47 = fconst f64 0.82
+    %_s48 = fconst f64 0.88
+    %_s49 = fconst f64 0.89
+    %_s50 = fconst f64 1.0
+    %_s51 = fconst f64 1.5
+    %_s52 = fconst f64 3400.0
+    br loop(0, R, G, B, S, st, w, cA, sA, cx, top, sc, vs)
+  loop(j: i64, R: ptr, G: ptr, B: ptr, S: i64, st: ptr, w: ptr, cA: f64, sA: f64, cx: f64, top: f64, sc: f64, vs: f64):
+    %done = icmp.sge i64 j, 3400
+    condbr %done, fin(), body(j, R, G, B, S, st, w, cA, sA, cx, top, sc, vs)
+  body(j: i64, R: ptr, G: ptr, B: ptr, S: i64, st: ptr, w: ptr, cA: f64, sA: f64, cx: f64, top: f64, sc: f64, vs: f64):
+    %jf = sitofp f64 j
+    %fr = fdiv f64 %jf, 3400.0
+    %fr2 = fmul f64 %fr, %fr
+    %w0 = fmul f64 %fr2, 1.5
+    %wf = fadd f64 %w0, 0.16
+    %s0 = gep f64 st, 0
+    %qx0p = gep f64 st, 0
+    %qx0 = load f64, %qx0p
+    %qy0p = gep f64 st, 1
+    %qy0 = load f64, %qy0p
+    %qz0p = gep f64 st, 2
+    %qz0 = load f64, %qz0p
+    %qu0a = fmul f64 %qx0, cA
+    %qu0b = fmul f64 %qy0, sA
+    %qu0 = fadd f64 %qu0a, %qu0b
+    %qpx0a = fmul f64 %qu0, sc
+    %qpx0 = fadd f64 cx, %qpx0a
+    %qpy0a = fmul f64 %qz0, vs
+    %qpy0 = fsub f64 top, %qpy0a
+    call void lstep(%s0, w, 0.0008)
+    %px0p = gep f64 st, 0
+    %px0v = load f64, %px0p
+    %py0p = gep f64 st, 1
+    %py0v = load f64, %py0p
+    %pz0p = gep f64 st, 2
+    %pz0v = load f64, %pz0p
+    %pu0a = fmul f64 %px0v, cA
+    %pu0b = fmul f64 %py0v, sA
+    %pu0 = fadd f64 %pu0a, %pu0b
+    %ppx0a = fmul f64 %pu0, sc
+    %ppx0 = fadd f64 cx, %ppx0a
+    %ppy0a = fmul f64 %pz0v, vs
+    %ppy0 = fsub f64 top, %ppy0a
+    %r0 = fmul f64 %wf, 0.82
+    %g0 = fmul f64 %wf, 0.89
+    %b0 = fmul f64 %wf, 1.0
+    %mx0_0a = fsub f64 %ppx0, %qpx0
+    %mx0_0b = fmul f64 %mx0_0a, 0.3333333333333333
+    %mx0_0 = fadd f64 %qpx0, %mx0_0b
+    %my0_0a = fsub f64 %ppy0, %qpy0
+    %my0_0b = fmul f64 %my0_0a, 0.3333333333333333
+    %my0_0 = fadd f64 %qpy0, %my0_0b
+    %ix0_0 = fptosi i64 %mx0_0
+    %iy0_0 = fptosi i64 %my0_0
+    call void try_splat(R, G, B, S, %ix0_0, %iy0_0, %r0, %g0, %b0)
+    %mx0_1a = fsub f64 %ppx0, %qpx0
+    %mx0_1b = fmul f64 %mx0_1a, 0.6666666666666666
+    %mx0_1 = fadd f64 %qpx0, %mx0_1b
+    %my0_1a = fsub f64 %ppy0, %qpy0
+    %my0_1b = fmul f64 %my0_1a, 0.6666666666666666
+    %my0_1 = fadd f64 %qpy0, %my0_1b
+    %ix0_1 = fptosi i64 %mx0_1
+    %iy0_1 = fptosi i64 %my0_1
+    call void try_splat(R, G, B, S, %ix0_1, %iy0_1, %r0, %g0, %b0)
+    %ix0 = fptosi i64 %ppx0
+    %iy0 = fptosi i64 %ppy0
+    call void try_splat(R, G, B, S, %ix0, %iy0, %r0, %g0, %b0)
+    %s1 = gep f64 st, 3
+    %qx1p = gep f64 st, 3
+    %qx1 = load f64, %qx1p
+    %qy1p = gep f64 st, 4
+    %qy1 = load f64, %qy1p
+    %qz1p = gep f64 st, 5
+    %qz1 = load f64, %qz1p
+    %qu1a = fmul f64 %qx1, cA
+    %qu1b = fmul f64 %qy1, sA
+    %qu1 = fadd f64 %qu1a, %qu1b
+    %qpx1a = fmul f64 %qu1, sc
+    %qpx1 = fadd f64 cx, %qpx1a
+    %qpy1a = fmul f64 %qz1, vs
+    %qpy1 = fsub f64 top, %qpy1a
+    call void lstep(%s1, w, 0.0008)
+    %px1p = gep f64 st, 3
+    %px1v = load f64, %px1p
+    %py1p = gep f64 st, 4
+    %py1v = load f64, %py1p
+    %pz1p = gep f64 st, 5
+    %pz1v = load f64, %pz1p
+    %pu1a = fmul f64 %px1v, cA
+    %pu1b = fmul f64 %py1v, sA
+    %pu1 = fadd f64 %pu1a, %pu1b
+    %ppx1a = fmul f64 %pu1, sc
+    %ppx1 = fadd f64 cx, %ppx1a
+    %ppy1a = fmul f64 %pz1v, vs
+    %ppy1 = fsub f64 top, %ppy1a
+    %r1 = fmul f64 %wf, 0.25
+    %g1 = fmul f64 %wf, 0.50
+    %b1 = fmul f64 %wf, 1.0
+    %mx1_0a = fsub f64 %ppx1, %qpx1
+    %mx1_0b = fmul f64 %mx1_0a, 0.3333333333333333
+    %mx1_0 = fadd f64 %qpx1, %mx1_0b
+    %my1_0a = fsub f64 %ppy1, %qpy1
+    %my1_0b = fmul f64 %my1_0a, 0.3333333333333333
+    %my1_0 = fadd f64 %qpy1, %my1_0b
+    %ix1_0 = fptosi i64 %mx1_0
+    %iy1_0 = fptosi i64 %my1_0
+    call void try_splat(R, G, B, S, %ix1_0, %iy1_0, %r1, %g1, %b1)
+    %mx1_1a = fsub f64 %ppx1, %qpx1
+    %mx1_1b = fmul f64 %mx1_1a, 0.6666666666666666
+    %mx1_1 = fadd f64 %qpx1, %mx1_1b
+    %my1_1a = fsub f64 %ppy1, %qpy1
+    %my1_1b = fmul f64 %my1_1a, 0.6666666666666666
+    %my1_1 = fadd f64 %qpy1, %my1_1b
+    %ix1_1 = fptosi i64 %mx1_1
+    %iy1_1 = fptosi i64 %my1_1
+    call void try_splat(R, G, B, S, %ix1_1, %iy1_1, %r1, %g1, %b1)
+    %ix1 = fptosi i64 %ppx1
+    %iy1 = fptosi i64 %ppy1
+    call void try_splat(R, G, B, S, %ix1, %iy1, %r1, %g1, %b1)
+    %s2 = gep f64 st, 6
+    %qx2p = gep f64 st, 6
+    %qx2 = load f64, %qx2p
+    %qy2p = gep f64 st, 7
+    %qy2 = load f64, %qy2p
+    %qz2p = gep f64 st, 8
+    %qz2 = load f64, %qz2p
+    %qu2a = fmul f64 %qx2, cA
+    %qu2b = fmul f64 %qy2, sA
+    %qu2 = fadd f64 %qu2a, %qu2b
+    %qpx2a = fmul f64 %qu2, sc
+    %qpx2 = fadd f64 cx, %qpx2a
+    %qpy2a = fmul f64 %qz2, vs
+    %qpy2 = fsub f64 top, %qpy2a
+    call void lstep(%s2, w, 0.0008)
+    %px2p = gep f64 st, 6
+    %px2v = load f64, %px2p
+    %py2p = gep f64 st, 7
+    %py2v = load f64, %py2p
+    %pz2p = gep f64 st, 8
+    %pz2v = load f64, %pz2p
+    %pu2a = fmul f64 %px2v, cA
+    %pu2b = fmul f64 %py2v, sA
+    %pu2 = fadd f64 %pu2a, %pu2b
+    %ppx2a = fmul f64 %pu2, sc
+    %ppx2 = fadd f64 cx, %ppx2a
+    %ppy2a = fmul f64 %pz2v, vs
+    %ppy2 = fsub f64 top, %ppy2a
+    %r2 = fmul f64 %wf, 0.25
+    %g2 = fmul f64 %wf, 0.88
+    %b2 = fmul f64 %wf, 1.0
+    %mx2_0a = fsub f64 %ppx2, %qpx2
+    %mx2_0b = fmul f64 %mx2_0a, 0.3333333333333333
+    %mx2_0 = fadd f64 %qpx2, %mx2_0b
+    %my2_0a = fsub f64 %ppy2, %qpy2
+    %my2_0b = fmul f64 %my2_0a, 0.3333333333333333
+    %my2_0 = fadd f64 %qpy2, %my2_0b
+    %ix2_0 = fptosi i64 %mx2_0
+    %iy2_0 = fptosi i64 %my2_0
+    call void try_splat(R, G, B, S, %ix2_0, %iy2_0, %r2, %g2, %b2)
+    %mx2_1a = fsub f64 %ppx2, %qpx2
+    %mx2_1b = fmul f64 %mx2_1a, 0.6666666666666666
+    %mx2_1 = fadd f64 %qpx2, %mx2_1b
+    %my2_1a = fsub f64 %ppy2, %qpy2
+    %my2_1b = fmul f64 %my2_1a, 0.6666666666666666
+    %my2_1 = fadd f64 %qpy2, %my2_1b
+    %ix2_1 = fptosi i64 %mx2_1
+    %iy2_1 = fptosi i64 %my2_1
+    call void try_splat(R, G, B, S, %ix2_1, %iy2_1, %r2, %g2, %b2)
+    %ix2 = fptosi i64 %ppx2
+    %iy2 = fptosi i64 %ppy2
+    call void try_splat(R, G, B, S, %ix2, %iy2, %r2, %g2, %b2)
+    %s3 = gep f64 st, 9
+    %qx3p = gep f64 st, 9
+    %qx3 = load f64, %qx3p
+    %qy3p = gep f64 st, 10
+    %qy3 = load f64, %qy3p
+    %qz3p = gep f64 st, 11
+    %qz3 = load f64, %qz3p
+    %qu3a = fmul f64 %qx3, cA
+    %qu3b = fmul f64 %qy3, sA
+    %qu3 = fadd f64 %qu3a, %qu3b
+    %qpx3a = fmul f64 %qu3, sc
+    %qpx3 = fadd f64 cx, %qpx3a
+    %qpy3a = fmul f64 %qz3, vs
+    %qpy3 = fsub f64 top, %qpy3a
+    call void lstep(%s3, w, 0.0008)
+    %px3p = gep f64 st, 9
+    %px3v = load f64, %px3p
+    %py3p = gep f64 st, 10
+    %py3v = load f64, %py3p
+    %pz3p = gep f64 st, 11
+    %pz3v = load f64, %pz3p
+    %pu3a = fmul f64 %px3v, cA
+    %pu3b = fmul f64 %py3v, sA
+    %pu3 = fadd f64 %pu3a, %pu3b
+    %ppx3a = fmul f64 %pu3, sc
+    %ppx3 = fadd f64 cx, %ppx3a
+    %ppy3a = fmul f64 %pz3v, vs
+    %ppy3 = fsub f64 top, %ppy3a
+    %r3 = fmul f64 %wf, 0.59
+    %g3 = fmul f64 %wf, 0.43
+    %b3 = fmul f64 %wf, 1.0
+    %mx3_0a = fsub f64 %ppx3, %qpx3
+    %mx3_0b = fmul f64 %mx3_0a, 0.3333333333333333
+    %mx3_0 = fadd f64 %qpx3, %mx3_0b
+    %my3_0a = fsub f64 %ppy3, %qpy3
+    %my3_0b = fmul f64 %my3_0a, 0.3333333333333333
+    %my3_0 = fadd f64 %qpy3, %my3_0b
+    %ix3_0 = fptosi i64 %mx3_0
+    %iy3_0 = fptosi i64 %my3_0
+    call void try_splat(R, G, B, S, %ix3_0, %iy3_0, %r3, %g3, %b3)
+    %mx3_1a = fsub f64 %ppx3, %qpx3
+    %mx3_1b = fmul f64 %mx3_1a, 0.6666666666666666
+    %mx3_1 = fadd f64 %qpx3, %mx3_1b
+    %my3_1a = fsub f64 %ppy3, %qpy3
+    %my3_1b = fmul f64 %my3_1a, 0.6666666666666666
+    %my3_1 = fadd f64 %qpy3, %my3_1b
+    %ix3_1 = fptosi i64 %mx3_1
+    %iy3_1 = fptosi i64 %my3_1
+    call void try_splat(R, G, B, S, %ix3_1, %iy3_1, %r3, %g3, %b3)
+    %ix3 = fptosi i64 %ppx3
+    %iy3 = fptosi i64 %ppy3
+    call void try_splat(R, G, B, S, %ix3, %iy3, %r3, %g3, %b3)
+    %j2 = add i64 j, 1
+    br loop(%j2, R, G, B, S, st, w, cA, sA, cx, top, sc, vs)
+  fin():
+    ret
+}
+
+; Tone map one pixel: deep blue radial field + rational tone map
+; v/(1+v) of the accumulated light + white-hot core from g^2.
+fn shade(ptr, ptr, ptr, i64, i64, i64, ptr) -> void {
+  entry(R: ptr, G: ptr, B: ptr, S: i64, x: i64, y: i64, row: ptr):
+    %_s0 = iconst i64 1
+    %_s1 = iconst i32 1
+    %_s2 = iconst i8 1
+    %_s3 = iconst i64 2
+    %_s4 = iconst i32 2
+    %_s5 = iconst i8 2
+    %_s6 = iconst i64 3
+    %_s7 = iconst i32 3
+    %_s8 = iconst i8 3
+    %_s9 = fconst f64 0.22
+    %_s10 = fconst f64 0.28
+    %_s11 = fconst f64 0.5
+    %_s12 = fconst f64 1.0
+    %_s13 = fconst f64 10.0
+    %_s14 = fconst f64 16.0
+    %_s15 = fconst f64 22.0
+    %_s16 = fconst f64 225.0
+    %_s17 = fconst f64 235.0
+    %_s18 = fconst f64 255.0
+    %_s19 = fconst f64 3.0
+    %_s20 = fconst f64 34.0
+    %_s21 = fconst f64 42.0
+    %_s22 = fconst f64 6.0
+    %idx0 = mul i64 y, S
+    %idx = add i64 %idx0, x
+    %rp = gep f64 R, %idx
+    %vr = load f64, %rp
+    %gp = gep f64 G, %idx
+    %vg = load f64, %gp
+    %bp = gep f64 B, %idx
+    %vb = load f64, %bp
+    %sf = sitofp f64 S
+    %half = fmul f64 %sf, 0.5
+    %xf = sitofp f64 x
+    %yf = sitofp f64 y
+    %dx0 = fsub f64 %xf, %half
+    %dx = fdiv f64 %dx0, %half
+    %dy0 = fsub f64 %yf, %half
+    %dy = fdiv f64 %dy0, %half
+    %dx2 = fmul f64 %dx, %dx
+    %dy2 = fmul f64 %dy, %dy
+    %d2 = fadd f64 %dx2, %dy2
+    %t0 = fsub f64 1.0, %d2
+    %t = call f64 clamp01(%t0)
+    %t2 = fmul f64 %t, %t
+    %bgr0 = fmul f64 %t2, 10.0
+    %bgr = fadd f64 %bgr0, 3.0
+    %bgg0 = fmul f64 %t2, 16.0
+    %bgg = fadd f64 %bgg0, 6.0
+    %bgb0 = fmul f64 %t2, 34.0
+    %bgb = fadd f64 %bgb0, 22.0
+    %sr = fmul f64 %vr, 0.22
+    %sg = fmul f64 %vg, 0.22
+    %sb = fmul f64 %vb, 0.22
+    %dr = fadd f64 %sr, 1.0
+    %gr = fdiv f64 %sr, %dr
+    %dg = fadd f64 %sg, 1.0
+    %gg = fdiv f64 %sg, %dg
+    %db = fadd f64 %sb, 1.0
+    %gb = fdiv f64 %sb, %db
+    %ar = fmul f64 %gr, 235.0
+    %ag = fmul f64 %gg, 225.0
+    %ab = fmul f64 %gb, 255.0
+    %hr0 = fmul f64 %gr, %gr
+    %hr = fmul f64 %hr0, 42.0
+    %hg0 = fmul f64 %gg, %gg
+    %hg = fmul f64 %hg0, 42.0
+    %hb0 = fmul f64 %gb, %gb
+    %hb = fmul f64 %hb0, 42.0
+    %vg0 = fmul f64 %d2, 0.28
+    %vgn = fsub f64 1.0, %vg0
+    %rr0 = fadd f64 %bgr, %ar
+    %rr1 = fadd f64 %rr0, %hr
+    %rr = fmul f64 %rr1, %vgn
+    %gg0 = fadd f64 %bgg, %ag
+    %gg1 = fadd f64 %gg0, %hg
+    %ggv = fmul f64 %gg1, %vgn
+    %bb0 = fadd f64 %bgb, %ab
+    %bb1 = fadd f64 %bb0, %hb
+    %bb = fmul f64 %bb1, %vgn
+    %rc = call f64 clamp255(%rr)
+    %gc = call f64 clamp255(%ggv)
+    %bc = call f64 clamp255(%bb)
+    %ri = fptosi i64 %rc
+    %gi = fptosi i64 %gc
+    %bi = fptosi i64 %bc
+    %o0 = mul i64 x, 3
+    %op = gep i8 row, %o0
+    %r8 = trunc i8 %ri
+    store i8 %op, %r8
+    %o1 = add i64 %o0, 1
+    %op1 = gep i8 row, %o1
+    %g8 = trunc i8 %gi
+    store i8 %op1, %g8
+    %o2 = add i64 %o0, 2
+    %op2 = gep i8 row, %o2
+    %b8 = trunc i8 %bi
+    store i8 %op2, %b8
+    ret
+}
+
+fn render_row(ptr, ptr, ptr, i64, i64, ptr) -> void {
+  entry(R: ptr, G: ptr, B: ptr, S: i64, y: i64, row: ptr):
+    %_s0 = iconst i64 0
+    %_s1 = iconst i32 0
+    %_s2 = iconst i8 0
+    %_s3 = iconst i64 1
+    %_s4 = iconst i32 1
+    %_s5 = iconst i8 1
+    br loop(0, R, G, B, S, y, row)
+  loop(x: i64, R: ptr, G: ptr, B: ptr, S: i64, y: i64, row: ptr):
+    %done = icmp.sge i64 x, S
+    condbr %done, fin(), body(x, R, G, B, S, y, row)
+  body(x: i64, R: ptr, G: ptr, B: ptr, S: i64, y: i64, row: ptr):
+    call void shade(R, G, B, S, x, y, row)
+    %x2 = add i64 x, 1
+    br loop(%x2, R, G, B, S, y, row)
+  fin():
+    ret
+}
+
+fn main(i32, ptr) -> i32 {
+  entry(argc: i32, argv: ptr):
+    %_s0 = iconst i64 0
+    %_s1 = iconst i32 0
+    %_s2 = iconst i8 0
+    %_s3 = iconst i64 1
+    %_s4 = iconst i32 1
+    %_s5 = iconst i8 1
+    %_s6 = iconst i64 2
+    %_s7 = iconst i32 2
+    %_s8 = iconst i8 2
+    %_s9 = iconst i64 3
+    %_s10 = iconst i32 3
+    %_s11 = iconst i8 3
+    %_s12 = iconst i64 4
+    %_s13 = iconst i32 4
+    %_s14 = iconst i8 4
+    %_s15 = iconst i64 5
+    %_s16 = iconst i32 5
+    %_s17 = iconst i8 5
+    %_s18 = iconst i64 6
+    %_s19 = iconst i32 6
+    %_s20 = iconst i8 6
+    %_s21 = iconst i64 7
+    %_s22 = iconst i32 7
+    %_s23 = iconst i8 7
+    %_s24 = iconst i64 8
+    %_s25 = iconst i32 8
+    %_s26 = iconst i8 8
+    %_s27 = iconst i64 9
+    %_s28 = iconst i32 9
+    %_s29 = iconst i8 9
+    %_s30 = iconst i64 10
+    %_s31 = iconst i32 10
+    %_s32 = iconst i8 10
+    %_s33 = iconst i64 11
+    %_s34 = iconst i32 11
+    %_s35 = iconst i8 11
+    %_s36 = iconst i64 16
+    %_s37 = iconst i32 16
+    %_s38 = iconst i8 16
+    %_s39 = iconst i64 96
+    %_s40 = iconst i32 96
+    %_s41 = iconst i8 96
+    %_s42 = iconst i64 120
+    %_s43 = iconst i32 120
+    %_s44 = iconst i8 120
+    %_s45 = iconst i64 960
+    %_s46 = iconst i32 960
+    %_s47 = iconst i8 960
+    %_s48 = iconst i64 1728
+    %_s49 = iconst i32 1728
+    %_s50 = iconst i8 1728
+    %_s51 = iconst i64 10000
+    %_s52 = iconst i32 10000
+    %_s53 = iconst i8 10000
+    %_s54 = fconst f64 0.0167
+    %_s55 = fconst f64 0.0177
+    %_s56 = fconst f64 0.5
+    %_s57 = fconst f64 0.927
+    %_s58 = fconst f64 1.0
+    %_s59 = fconst f64 1.000000001
+    %_s60 = fconst f64 1.000000002
+    %_s61 = fconst f64 1.000000003
+    %_s62 = fconst f64 20.0
+    %h1 = icmp.sge i32 argc, 2
+    condbr %h1, a1(argc, argv), setup(0, 1728, 960)
+  a1(argc: i32, argv: ptr):
+    %p1 = gep ptr argv, 1
+    %s1 = load ptr, %p1
+    %av1 = call i32 atoi(%s1)
+    %fr = sext i64 %av1
+    %h2 = icmp.sge i32 argc, 3
+    condbr %h2, a2(argc, argv, %fr), setup(%fr, 1728, 960)
+  a2(argc: i32, argv: ptr, fr: i64):
+    %p2 = gep ptr argv, 2
+    %s2 = load ptr, %p2
+    %av2 = call i32 atoi(%s2)
+    %tot = sext i64 %av2
+    %h3 = icmp.sge i32 argc, 4
+    condbr %h3, a3(argv, fr, %tot), setup(fr, %tot, 960)
+  a3(argv: ptr, fr: i64, tot: i64):
+    %p3 = gep ptr argv, 3
+    %s3 = load ptr, %p3
+    %av3 = call i32 atoi(%s3)
+    %sz = sext i64 %av3
+    br setup(fr, tot, %sz)
+  setup(fr: i64, tot: i64, S: i64):
+    %npix = mul i64 S, S
+    %nbytes = mul i64 %npix, 8
+    %R = call ptr malloc(%nbytes)
+    call void zero_canvas(%R, %npix)
+    %G = call ptr malloc(%nbytes)
+    call void zero_canvas(%G, %npix)
+    %B = call ptr malloc(%nbytes)
+    call void zero_canvas(%B, %npix)
+    %st = call ptr malloc(96)
+    %w = call ptr malloc(120)
+    %i0 = gep f64 %st, 0
+    store f64 %i0, 1.0
+    %i1 = gep f64 %st, 1
+    store f64 %i1, 1.0
+    %i2 = gep f64 %st, 2
+    store f64 %i2, 20.0
+    %i3 = gep f64 %st, 3
+    store f64 %i3, 1.000000001
+    %i4 = gep f64 %st, 4
+    store f64 %i4, 1.0
+    %i5 = gep f64 %st, 5
+    store f64 %i5, 20.0
+    %i6 = gep f64 %st, 6
+    store f64 %i6, 1.000000002
+    %i7 = gep f64 %st, 7
+    store f64 %i7, 1.0
+    %i8 = gep f64 %st, 8
+    store f64 %i8, 20.0
+    %i9 = gep f64 %st, 9
+    store f64 %i9, 1.000000003
+    %i10 = gep f64 %st, 10
+    store f64 %i10, 1.0
+    %i11 = gep f64 %st, 11
+    store f64 %i11, 20.0
+    %adv0 = mul i64 fr, 16
+    %adv = add i64 %adv0, 10000
+    call void advance(%st, %w, %adv)
+    %frf = sitofp f64 fr
+    %totf = sitofp f64 tot
+    %ph = fdiv f64 %frf, %totf
+    %ang = fmul f64 %ph, 0.5
+    %cA = call f64 kcos(%ang)
+    %sA = call f64 ksin(%ang)
+    %sf = sitofp f64 S
+    %cx = fmul f64 %sf, 0.5
+    %top = fmul f64 %sf, 0.927
+    %sc = fmul f64 %sf, 0.0167
+    %vs = fmul f64 %sf, 0.0177
+    call void draw(%R, %G, %B, S, %st, %w, %cA, %sA, %cx, %top, %sc, %vs)
+    %rowb = mul i64 S, 3
+    %row = call ptr malloc(%rowb)
+    call void wh1()
+    call void print_u64(S)
+    call void wsp()
+    call void print_u64(S)
+    call void wh2()
+    br rows(0, %R, %G, %B, S, %row, %rowb)
+  rows(y: i64, R: ptr, G: ptr, B: ptr, S: i64, row: ptr, rowb: i64):
+    %done = icmp.sge i64 y, S
+    condbr %done, fin(), rbody(y, R, G, B, S, row, rowb)
+  rbody(y: i64, R: ptr, G: ptr, B: ptr, S: i64, row: ptr, rowb: i64):
+    call void render_row(R, G, B, S, y, row)
+    %wr = call i64 write(1, row, rowb)
+    %y2 = add i64 y, 1
+    br rows(%y2, R, G, B, S, row, rowb)
+  fin():
+    ret 0
+}

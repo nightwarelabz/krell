@@ -1,0 +1,462 @@
+; SYNCHRONY - SOUND
+; The score of the film, synthesized in Krell.
+;
+; Two of the film's Lorenz systems (x offsets 0 and 3e-9) are
+; integrated at one RK4 step (dt 0.000006966) per sample. Each
+; system's height z sets a drone pitch (55 + 1.1z Hz and
+; 82.5 + 1.65z Hz); a bell with an inharmonic partial at
+; 2.756x is struck whenever the first system changes wing
+; (x crosses zero). Sine is a Taylor polynomial evaluated in
+; the program; there is no host mathematics.
+;
+; Output is raw PCM on stdout: 44100 Hz, mono, signed 16-bit
+; little endian, 72 seconds, 3,175,200 samples.
+
+extern write(i32, ptr, i64) -> i64
+extern malloc(i64) -> ptr
+extern free(ptr) -> void
+
+
+fn clamp01(f64) -> f64 {
+  entry(v: f64):
+    %_s0 = fconst f64 0.0
+    %_s1 = fconst f64 1.0
+    %lo = fcmp.olt f64 v, 0.0
+    %a = select f64 %lo, 0.0, v
+    %hi = fcmp.ogt f64 %a, 1.0
+    %b = select f64 %hi, 1.0, %a
+    ret %b
+}
+
+fn clamp255(f64) -> f64 {
+  entry(v: f64):
+    %_s0 = fconst f64 0.0
+    %_s1 = fconst f64 255.0
+    %lo = fcmp.olt f64 v, 0.0
+    %a = select f64 %lo, 0.0, v
+    %hi = fcmp.ogt f64 %a, 255.0
+    %b = select f64 %hi, 255.0, %a
+    ret %b
+}
+
+; Sine on [-pi, pi], Taylor polynomial, Horner form with plain
+; fmul/fadd only (no fma op anywhere in these programs).
+fn ksin(f64) -> f64 {
+  entry(x: f64):
+    %_s0 = fconst f64 -0.00019841269841269842
+    %_s1 = fconst f64 -0.16666666666666666
+    %_s2 = fconst f64 0.0000027557319223985893
+    %_s3 = fconst f64 0.008333333333333334
+    %_s4 = fconst f64 1.0
+    %x2 = fmul f64 x, x
+    %c0 = fmul f64 0.0000027557319223985893, %x2
+    %c0b = fadd f64 %c0, -0.00019841269841269842
+    %c1 = fmul f64 %c0b, %x2
+    %c1b = fadd f64 %c1, 0.008333333333333334
+    %c2 = fmul f64 %c1b, %x2
+    %c2b = fadd f64 %c2, -0.16666666666666666
+    %c3 = fmul f64 %c2b, %x2
+    %c3b = fadd f64 %c3, 1.0
+    %r = fmul f64 %c3b, x
+    ret %r
+}
+
+fn kcos(f64) -> f64 {
+  entry(x: f64):
+    %_s0 = fconst f64 1.5707963267948966
+    %s = fadd f64 x, 1.5707963267948966
+    %r = call f64 ksin(%s)
+    ret %r
+}
+
+; Lorenz derivative: sigma 10, rho 28, beta 8/3. Pure fadd/fmul/fsub.
+fn deriv(f64, f64, f64, ptr) -> void {
+  entry(x: f64, y: f64, z: f64, out: ptr):
+    %_s0 = iconst i64 0
+    %_s1 = iconst i32 0
+    %_s2 = iconst i8 0
+    %_s3 = iconst i64 1
+    %_s4 = iconst i32 1
+    %_s5 = iconst i8 1
+    %_s6 = iconst i64 2
+    %_s7 = iconst i32 2
+    %_s8 = iconst i8 2
+    %_s9 = fconst f64 10.0
+    %_s10 = fconst f64 2.6666666666666665
+    %_s11 = fconst f64 28.0
+    %d0 = fsub f64 y, x
+    %dx = fmul f64 10.0, %d0
+    %z0 = fsub f64 28.0, z
+    %m0 = fmul f64 x, %z0
+    %dy = fsub f64 %m0, y
+    %m1 = fmul f64 x, y
+    %m2 = fmul f64 2.6666666666666665, z
+    %dz = fsub f64 %m1, %m2
+    %p0 = gep f64 out, 0
+    store f64 %p0, %dx
+    %p1 = gep f64 out, 1
+    store f64 %p1, %dy
+    %p2 = gep f64 out, 2
+    store f64 %p2, %dz
+    ret
+}
+
+; One RK4 step, in place on s[0..2]; w is 15 f64 of scratch:
+; k1 at 0..2, k2 at 3..5, k3 at 6..8, k4 at 9..11, temp state at 12..14.
+fn lstep(ptr, ptr, f64) -> void {
+  entry(s: ptr, w: ptr, dt: f64):
+    %_s0 = iconst i64 0
+    %_s1 = iconst i32 0
+    %_s2 = iconst i8 0
+    %_s3 = iconst i64 1
+    %_s4 = iconst i32 1
+    %_s5 = iconst i8 1
+    %_s6 = iconst i64 2
+    %_s7 = iconst i32 2
+    %_s8 = iconst i8 2
+    %_s9 = iconst i64 3
+    %_s10 = iconst i32 3
+    %_s11 = iconst i8 3
+    %_s12 = iconst i64 4
+    %_s13 = iconst i32 4
+    %_s14 = iconst i8 4
+    %_s15 = iconst i64 5
+    %_s16 = iconst i32 5
+    %_s17 = iconst i8 5
+    %_s18 = iconst i64 6
+    %_s19 = iconst i32 6
+    %_s20 = iconst i8 6
+    %_s21 = iconst i64 7
+    %_s22 = iconst i32 7
+    %_s23 = iconst i8 7
+    %_s24 = iconst i64 8
+    %_s25 = iconst i32 8
+    %_s26 = iconst i8 8
+    %_s27 = iconst i64 9
+    %_s28 = iconst i32 9
+    %_s29 = iconst i8 9
+    %_s30 = iconst i64 10
+    %_s31 = iconst i32 10
+    %_s32 = iconst i8 10
+    %_s33 = iconst i64 11
+    %_s34 = iconst i32 11
+    %_s35 = iconst i8 11
+    %_s36 = iconst i64 12
+    %_s37 = iconst i32 12
+    %_s38 = iconst i8 12
+    %_s39 = iconst i64 13
+    %_s40 = iconst i32 13
+    %_s41 = iconst i8 13
+    %_s42 = iconst i64 14
+    %_s43 = iconst i32 14
+    %_s44 = iconst i8 14
+    %_s45 = fconst f64 0.5
+    %_s46 = fconst f64 2.0
+    %_s47 = fconst f64 6.0
+    %h = fmul f64 dt, 0.5
+    %d6 = fdiv f64 dt, 6.0
+    %sx = gep f64 s, 0
+    %x = load f64, %sx
+    %sy = gep f64 s, 1
+    %y = load f64, %sy
+    %sz = gep f64 s, 2
+    %z = load f64, %sz
+    call void deriv(%x, %y, %z, w)
+    %k10 = gep f64 w, 0
+    %k1x = load f64, %k10
+    %k11 = gep f64 w, 1
+    %k1y = load f64, %k11
+    %k12 = gep f64 w, 2
+    %k1z = load f64, %k12
+    %a0 = fmul f64 %h, %k1x
+    %tx = fadd f64 %x, %a0
+    %a1 = fmul f64 %h, %k1y
+    %ty = fadd f64 %y, %a1
+    %a2 = fmul f64 %h, %k1z
+    %tz = fadd f64 %z, %a2
+    %tp = gep f64 w, 12
+    store f64 %tp, %tx
+    %tp1 = gep f64 w, 13
+    store f64 %tp1, %ty
+    %tp2 = gep f64 w, 14
+    store f64 %tp2, %tz
+    %w3 = gep f64 w, 3
+    call void deriv(%tx, %ty, %tz, %w3)
+    %k23 = gep f64 w, 3
+    %k2x = load f64, %k23
+    %k24 = gep f64 w, 4
+    %k2y = load f64, %k24
+    %k25 = gep f64 w, 5
+    %k2z = load f64, %k25
+    %b0 = fmul f64 %h, %k2x
+    %ux = fadd f64 %x, %b0
+    %b1 = fmul f64 %h, %k2y
+    %uy = fadd f64 %y, %b1
+    %b2 = fmul f64 %h, %k2z
+    %uz = fadd f64 %z, %b2
+    store f64 %tp, %ux
+    store f64 %tp1, %uy
+    store f64 %tp2, %uz
+    %w6 = gep f64 w, 6
+    call void deriv(%ux, %uy, %uz, %w6)
+    %k36 = gep f64 w, 6
+    %k3x = load f64, %k36
+    %k37 = gep f64 w, 7
+    %k3y = load f64, %k37
+    %k38 = gep f64 w, 8
+    %k3z = load f64, %k38
+    %c0 = fmul f64 dt, %k3x
+    %vx = fadd f64 %x, %c0
+    %c1 = fmul f64 dt, %k3y
+    %vy = fadd f64 %y, %c1
+    %c2 = fmul f64 dt, %k3z
+    %vz = fadd f64 %z, %c2
+    store f64 %tp, %vx
+    store f64 %tp1, %vy
+    store f64 %tp2, %vz
+    %w9 = gep f64 w, 9
+    call void deriv(%vx, %vy, %vz, %w9)
+    %k49 = gep f64 w, 9
+    %k4x = load f64, %k49
+    %k410 = gep f64 w, 10
+    %k4y = load f64, %k410
+    %k411 = gep f64 w, 11
+    %k4z = load f64, %k411
+    %e0 = fmul f64 2.0, %k2x
+    %e1 = fadd f64 %k1x, %e0
+    %e2 = fmul f64 2.0, %k3x
+    %e3 = fadd f64 %e1, %e2
+    %e4 = fadd f64 %e3, %k4x
+    %e5 = fmul f64 %d6, %e4
+    %nx = fadd f64 %x, %e5
+    %f0 = fmul f64 2.0, %k2y
+    %f1 = fadd f64 %k1y, %f0
+    %f2 = fmul f64 2.0, %k3y
+    %f3 = fadd f64 %f1, %f2
+    %f4 = fadd f64 %f3, %k4y
+    %f5 = fmul f64 %d6, %f4
+    %ny = fadd f64 %y, %f5
+    %g0 = fmul f64 2.0, %k2z
+    %g1 = fadd f64 %k1z, %g0
+    %g2 = fmul f64 2.0, %k3z
+    %g3 = fadd f64 %g1, %g2
+    %g4 = fadd f64 %g3, %k4z
+    %g5 = fmul f64 %d6, %g4
+    %nz = fadd f64 %z, %g5
+    store f64 %sx, %nx
+    store f64 %sy, %ny
+    store f64 %sz, %nz
+    ret
+}
+
+
+fn main(i32, ptr) -> i32 {
+  entry(argc: i32, argv: ptr):
+    %_s0 = iconst i64 0
+    %_s1 = iconst i32 0
+    %_s2 = iconst i8 0
+    %_s3 = iconst i64 1
+    %_s4 = iconst i32 1
+    %_s5 = iconst i8 1
+    %_s6 = iconst i64 2
+    %_s7 = iconst i32 2
+    %_s8 = iconst i8 2
+    %_s9 = iconst i64 4
+    %_s10 = iconst i32 4
+    %_s11 = iconst i8 4
+    %_s12 = iconst i64 9
+    %_s13 = iconst i32 9
+    %_s14 = iconst i8 9
+    %_s15 = iconst i64 10
+    %_s16 = iconst i32 10
+    %_s17 = iconst i8 10
+    %_s18 = iconst i64 11
+    %_s19 = iconst i32 11
+    %_s20 = iconst i8 11
+    %_s21 = iconst i64 96
+    %_s22 = iconst i32 96
+    %_s23 = iconst i8 96
+    %_s24 = iconst i64 120
+    %_s25 = iconst i32 120
+    %_s26 = iconst i8 120
+    %_s27 = iconst i64 4410
+    %_s28 = iconst i32 4410
+    %_s29 = iconst i8 4410
+    %_s30 = iconst i64 1148408
+    %_s31 = iconst i32 1148408
+    %_s32 = iconst i8 1148408
+    %_s33 = iconst i64 3175200
+    %_s34 = iconst i32 3175200
+    %_s35 = iconst i8 3175200
+    %_s36 = iconst i64 6350400
+    %_s37 = iconst i32 6350400
+    %_s38 = iconst i8 6350400
+    %_s39 = fconst f64 -6.283185307179586
+    %_s40 = fconst f64 0.0
+    %_s41 = fconst f64 0.000006966
+    %_s42 = fconst f64 0.000022675736961451248
+    %_s43 = fconst f64 0.00014247585730565955
+    %_s44 = fconst f64 0.22
+    %_s45 = fconst f64 0.25
+    %_s46 = fconst f64 0.30
+    %_s47 = fconst f64 0.4
+    %_s48 = fconst f64 0.5
+    %_s49 = fconst f64 0.99988
+    %_s50 = fconst f64 1.0
+    %_s51 = fconst f64 1.000000003
+    %_s52 = fconst f64 1.1
+    %_s53 = fconst f64 1.65
+    %_s54 = fconst f64 1046.5
+    %_s55 = fconst f64 2.756
+    %_s56 = fconst f64 20.0
+    %_s57 = fconst f64 24000.0
+    %_s58 = fconst f64 3.141592653589793
+    %_s59 = fconst f64 523.25
+    %_s60 = fconst f64 55.0
+    %_s61 = fconst f64 587.33
+    %_s62 = fconst f64 72.0
+    %_s63 = fconst f64 783.99
+    %_s64 = fconst f64 82.5
+    %buf = call ptr malloc(6350400)
+    %st = call ptr malloc(96)
+    %w = call ptr malloc(120)
+    %i0 = gep f64 %st, 0
+    store f64 %i0, 1.0
+    %i1 = gep f64 %st, 1
+    store f64 %i1, 1.0
+    %i2 = gep f64 %st, 2
+    store f64 %i2, 20.0
+    %i9 = gep f64 %st, 9
+    store f64 %i9, 1.000000003
+    %i10 = gep f64 %st, 10
+    store f64 %i10, 1.0
+    %i11 = gep f64 %st, 11
+    store f64 %i11, 20.0
+    call void adv2(%st, %w, 1148408)
+    %pa = bitcast i64 %buf
+    %ok = icmp.ne i64 %pa, 0
+    condbr %ok, sloop(0, %st, %w, %buf, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0), fail()
+  sloop(n: i64, st: ptr, w: ptr, buf: ptr, ph1: f64, ph2: f64, phb: f64, phb2: f64, env: f64, sgn: i64, bidx: i64):
+    %done = icmp.sge i64 n, 3175200
+    condbr %done, finish(buf), sbody(n, st, w, buf, ph1, ph2, phb, phb2, env, sgn, bidx)
+  sbody(n: i64, st: ptr, w: ptr, buf: ptr, ph1: f64, ph2: f64, phb: f64, phb2: f64, env: f64, sgn: i64, bidx: i64):
+    %s0 = gep f64 st, 0
+    call void lstep(%s0, w, 0.000006966)
+    %s3 = gep f64 st, 9
+    call void lstep(%s3, w, 0.000006966)
+    %x0p = gep f64 st, 0
+    %x0 = load f64, %x0p
+    %z0p = gep f64 st, 2
+    %z0 = load f64, %z0p
+    %z3p = gep f64 st, 11
+    %z3 = load f64, %z3p
+    %fn = sitofp f64 n
+    %t = fmul f64 %fn, 0.000022675736961451248
+    ; wing-flip bell: sign of x0 changed (and past the settle transient)
+    %ns = fcmp.olt f64 %x0, 0.0
+    %nsgn = select i64 %ns, 1, 0
+    %chg = icmp.ne i64 %nsgn, sgn
+    %late = icmp.sgt i64 n, 4410
+    %fire = and i1 %chg, %late
+    %env1 = select f64 %fire, 1.0, env
+    %eq0 = icmp.eq i64 bidx, 0
+    %eq1 = icmp.eq i64 bidx, 1
+    %eq2 = icmp.eq i64 bidx, 2
+    %fa = select f64 %eq2, 783.99, 1046.5
+    %fb = select f64 %eq1, 587.33, %fa
+    %bf = select f64 %eq0, 523.25, %fb
+    %nb0 = add i64 bidx, 1
+    %nb1 = urem i64 %nb0, 4
+    %bidxn = select i64 %fire, %nb1, bidx
+    ; drones: pitch follows each system's height
+    %f1a = fmul f64 %z0, 1.1
+    %f1 = fadd f64 %f1a, 55.0
+    %i1 = fmul f64 %f1, 0.00014247585730565955
+    %p1a = fadd f64 ph1, %i1
+    %o1 = fcmp.ogt f64 %p1a, 3.141592653589793
+    %p1b = fadd f64 %p1a, -6.283185307179586
+    %ph1n = select f64 %o1, %p1b, %p1a
+    %v1 = call f64 ksin(%ph1n)
+    %f2a = fmul f64 %z3, 1.65
+    %f2 = fadd f64 %f2a, 82.5
+    %i2 = fmul f64 %f2, 0.00014247585730565955
+    %p2a = fadd f64 ph2, %i2
+    %o2 = fcmp.ogt f64 %p2a, 3.141592653589793
+    %p2b = fadd f64 %p2a, -6.283185307179586
+    %ph2n = select f64 %o2, %p2b, %p2a
+    %v2 = call f64 ksin(%ph2n)
+    ; bell: fundamental + inharmonic partial, decaying envelope
+    %ib = fmul f64 %bf, 0.00014247585730565955
+    %pba = fadd f64 phb, %ib
+    %ob = fcmp.ogt f64 %pba, 3.141592653589793
+    %pbb = fadd f64 %pba, -6.283185307179586
+    %phbn = select f64 %ob, %pbb, %pba
+    %vb1 = call f64 ksin(%phbn)
+    %ib2 = fmul f64 %ib, 2.756
+    %pb2a = fadd f64 phb2, %ib2
+    %ob2 = fcmp.ogt f64 %pb2a, 3.141592653589793
+    %pb2b = fadd f64 %pb2a, -6.283185307179586
+    %phb2n = select f64 %ob2, %pb2b, %pb2a
+    %vb2 = call f64 ksin(%phb2n)
+    %envn = fmul f64 %env1, 0.99988
+    %bell0 = fmul f64 %vb2, 0.4
+    %bell1 = fadd f64 %vb1, %bell0
+    %bell = fmul f64 %bell1, %envn
+    %bellg = fmul f64 %bell, 0.5
+    ; master envelope: 2 s attack, 4 s release
+    %at0 = fmul f64 %t, 0.5
+    %atk = call f64 clamp01(%at0)
+    %rem = fsub f64 72.0, %t
+    %rel0 = fmul f64 %rem, 0.25
+    %rel = call f64 clamp01(%rel0)
+    %menv = fmul f64 %atk, %rel
+    %d1 = fmul f64 %v1, 0.30
+    %d2 = fmul f64 %v2, 0.22
+    %mix = fadd f64 %d1, %d2
+    %mix2 = fadd f64 %mix, %bellg
+    %mm = fmul f64 %mix2, %menv
+    %am = fabs f64 %mm
+    %dn = fadd f64 %am, 1.0
+    %y = fdiv f64 %mm, %dn
+    %sc = fmul f64 %y, 24000.0
+    %sv = fptosi i16 %sc
+    %addr = gep i16 buf, n
+    store i16 %addr, %sv
+    %n2 = add i64 n, 1
+    br sloop(%n2, st, w, buf, %ph1n, %ph2n, %phbn, %phb2n, %envn, %nsgn, %bidxn)
+  finish(buf: ptr):
+    %wr = call i64 write(1, buf, 6350400)
+    call void free(buf)
+    ret 0
+  fail():
+    ret 1
+}
+
+; Advance systems 0 and 3 together (audio settle: same 8 time
+; units as the video, at the audio step).
+fn adv2(ptr, ptr, i64) -> void {
+  entry(st: ptr, w: ptr, n: i64):
+    %_s0 = iconst i64 0
+    %_s1 = iconst i32 0
+    %_s2 = iconst i8 0
+    %_s3 = iconst i64 1
+    %_s4 = iconst i32 1
+    %_s5 = iconst i8 1
+    %_s6 = iconst i64 9
+    %_s7 = iconst i32 9
+    %_s8 = iconst i8 9
+    %_s9 = fconst f64 0.000006966
+    br loop(0, st, w, n)
+  loop(i: i64, st: ptr, w: ptr, n: i64):
+    %done = icmp.sge i64 i, n
+    condbr %done, fin(), body(i, st, w, n)
+  body(i: i64, st: ptr, w: ptr, n: i64):
+    %s0 = gep f64 st, 0
+    call void lstep(%s0, w, 0.000006966)
+    %s3 = gep f64 st, 9
+    call void lstep(%s3, w, 0.000006966)
+    %i2 = add i64 i, 1
+    br loop(%i2, st, w, n)
+  fin():
+    ret
+}
