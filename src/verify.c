@@ -103,6 +103,7 @@ static const char *check_instr(Module *m, Func *f, Block *b, Instr *in, int idx)
         NEED(ty_is_vec(in->ty) && same_ty(VT(in->a), ty_elem(in->ty)), "vsplat element mismatch");
         break;
     case OP_VADD: case OP_VSUB: case OP_VMUL: case OP_VUDIV: case OP_VAND: case OP_VOR: case OP_VXOR:
+    case OP_VLSHR:
         NEED(ty_is_vec(in->ty) && same_ty(VT(in->a), in->ty) && same_ty(VT(in->b), in->ty), "vec binop mismatch");
         NEED(ty_elem(in->ty).kind == TY_INT, "int vec op needs int elements");
         break;
@@ -271,7 +272,7 @@ const char *mod_verify(Module *m) {
                     bool okd = (db == bi) ? (defpos[v] < ii || defpos[v] == -1) : (DOM(db, bi) && db != bi);
                     if (db == bi) okd = defpos[v] == -1 || defpos[v] < ii;
                     else okd = DOM(db, bi) != 0;
-                    if (!okd) { free(defblk); free(defpos); free(doms); return fail("verifier: use not dominated by definition"); }
+                    if (!okd) { snprintf(ERR, sizeof ERR, "verifier: use not dominated by definition (func %s block %d ins %d val %d defblock %d)", f->name, bi, ii, v, db); free(defblk); free(defpos); free(doms); return ERR; }
                 }
             }
         }

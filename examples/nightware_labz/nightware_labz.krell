@@ -1,0 +1,1568 @@
+; ==============================================================================
+; NIGHTWARE LABZ: Demoscene Holographic Cyberpunk IR Engine
+; Pure Krell surface syntax. Zero external dependencies.
+; Runs continuously until interrupted (Ctrl+C).
+; Features:
+;   - Fullscreen auto-adapting resolution via kc_winsize / ioctl
+;   - Double-buffered zero-flicker 24-bit truecolor ANSI output
+;   - 3D Volumetric Undulating Typography ("NIGHTWARE LABZ") with dynamic wave ripples
+;   - Dynamic multi-layer 3D extrusion (specular front face, bevel, deep shadow)
+;   - Real-time laser chrome sweep with white-hot specular highlights
+;   - Retro-futuristic synthwave perspective ground grid with high-speed travel
+;   - Cosmic multi-harmonic plasma nebula and twinkling starfield
+;   - Dual 3D intersecting quantum gyroscope rings with depth testing
+;   - Real-time 32-band procedural synthesizer audio spectrum visualizer
+;   - Cyberpunk demoscene telemetry HUD and frame counter
+; ==============================================================================
+
+extern write(i32, ptr, i64) -> i64
+extern kc_winsize(i32, ptr) -> i32
+extern usleep(i32) -> i32
+extern malloc(i64) -> ptr
+extern free(ptr) -> void
+extern sin(f64) -> f64
+extern cos(f64) -> f64
+extern sqrt(f64) -> f64
+
+data glyphs_nw : i8 = {
+  17, 25, 21, 19, 17,
+  31, 4, 4, 4, 31,
+  31, 16, 23, 17, 31,
+  17, 17, 31, 17, 17,
+  31, 4, 4, 4, 4,
+  17, 17, 21, 27, 17,
+  14, 17, 31, 17, 17,
+  30, 17, 30, 20, 19,
+  31, 16, 30, 16, 31
+}
+
+data glyphs_lbz : i8 = {
+  16, 16, 16, 16, 31,
+  14, 17, 31, 17, 17,
+  30, 17, 30, 17, 30,
+  31, 2, 4, 8, 31
+}
+
+data title_l : i8 = {
+  32, 91, 32, 78, 73, 71, 72, 84, 87, 65, 82, 69, 32, 76, 65, 66, 90, 32, 118, 50, 46, 48, 32, 93, 32
+}
+
+data title_r : i8 = {
+  32, 91, 32, 81, 85, 65, 78, 84, 85, 77, 32, 67, 79, 71, 78, 73, 84, 73, 79, 78, 32, 67, 79, 82, 69, 32, 93, 32
+}
+
+data sub_title : i8 = {
+  32, 32, 83, 83, 65, 32, 66, 76, 79, 67, 75, 45, 65, 82, 71, 32, 124, 32, 84, 79, 84, 65, 76, 32, 83, 69, 77, 65, 78, 84, 73, 67, 83, 32, 40, 78, 79, 32, 85, 66, 41, 32, 124, 32, 54, 48, 32, 70, 80, 83, 32, 84, 82, 85, 69, 67, 79, 76, 79, 82, 32, 69, 78, 71, 73, 78, 69, 32, 32
+}
+
+data footer_l : i8 = {
+  32, 32, 70, 82, 65, 77, 69, 58, 32
+}
+
+data footer_r : i8 = {
+  32, 124, 32, 54, 48, 32, 70, 80, 83, 32, 124, 32, 83, 83, 65, 32, 86, 69, 82, 73, 70, 73, 69, 68, 32, 124, 32, 90, 69, 82, 79, 45, 76, 69, 65, 75, 32, 124, 32, 91, 67, 84, 82, 76, 43, 67, 32, 84, 79, 32, 69, 88, 73, 84, 93
+}
+
+data footer_bot : i8 = {
+  32, 91, 32, 78, 73, 71, 72, 84, 87, 65, 82, 69, 32, 76, 65, 66, 90, 32, 58, 32, 80, 79, 82, 84, 65, 66, 76, 69, 32, 65, 83, 83, 69, 77, 66, 76, 89, 32, 73, 82, 32, 93, 32
+}
+
+fn copy_bytes(ptr, ptr, i64) -> void {
+  entry(dst: ptr, src: ptr, len: i64):
+    ; Dominating constants auto-injected
+    %_dom_i64_0 = iconst i64 0
+    %_dom_i32_0 = iconst i32 0
+    %_dom_i8_0 = iconst i8 0
+    %_dom_i64_1 = iconst i64 1
+    %_dom_i32_1 = iconst i32 1
+    %_dom_i8_1 = iconst i8 1
+    br loop(0, dst, src, len)
+  loop(i: i64, dst: ptr, src: ptr, len: i64):
+    %done = icmp.sge i64 i, len
+    condbr %done, exit(), body(i, dst, src, len)
+  body(i: i64, dst: ptr, src: ptr, len: i64):
+    %sp = gep i8 src, i
+    %b = load i8, %sp
+    %dp = gep i8 dst, i
+    store i8 %dp, %b
+    %i2 = add i64 i, 1
+    br loop(%i2, dst, src, len)
+  exit():
+    ret
+}
+
+fn put_u8(ptr, i64, i64) -> i64 {
+  entry(buf: ptr, off: i64, val: i64):
+    ; Dominating constants auto-injected
+    %_dom_i64_1 = iconst i64 1
+    %_dom_i32_1 = iconst i32 1
+    %_dom_i8_1 = iconst i8 1
+    %_dom_i64_2 = iconst i64 2
+    %_dom_i32_2 = iconst i32 2
+    %_dom_i8_2 = iconst i8 2
+    %_dom_i64_3 = iconst i64 3
+    %_dom_i32_3 = iconst i32 3
+    %_dom_i8_3 = iconst i8 3
+    %_dom_i64_10 = iconst i64 10
+    %_dom_i32_10 = iconst i32 10
+    %_dom_i8_10 = iconst i8 10
+    %_dom_i64_48 = iconst i64 48
+    %_dom_i32_48 = iconst i32 48
+    %_dom_i8_48 = iconst i8 48
+    %_dom_i64_100 = iconst i64 100
+    %_dom_i32_100 = iconst i32 100
+    %_dom_i8_100 = iconst i8 100
+    %c100 = iconst i64 100
+    %c10 = iconst i64 10
+    %c48 = iconst i64 48
+    %c1 = iconst i64 1
+    %c2 = iconst i64 2
+    %c3 = iconst i64 3
+    %is_ge100 = icmp.sge i64 val, 100
+    condbr %is_ge100, three(buf, off, val), check2(buf, off, val)
+  three(buf: ptr, off: i64, val: i64):
+    %d0 = sdiv i64 val, 100
+    %m0 = srem i64 val, 100
+    %d1 = sdiv i64 %m0, 10
+    %d2 = srem i64 %m0, 10
+    %ch0 = add i64 %d0, 48
+    %ch1 = add i64 %d1, 48
+    %ch2 = add i64 %d2, 48
+    %b0 = trunc i8 %ch0
+    %b1 = trunc i8 %ch1
+    %b2 = trunc i8 %ch2
+    %p0 = gep i8 buf, off
+    store i8 %p0, %b0
+    %o1 = add i64 off, 1
+    %p1 = gep i8 buf, %o1
+    store i8 %p1, %b1
+    %o2 = add i64 off, 2
+    %p2 = gep i8 buf, %o2
+    store i8 %p2, %b2
+    %o3 = add i64 off, 3
+    ret %o3
+  check2(buf: ptr, off: i64, val: i64):
+    %is_ge10 = icmp.sge i64 val, 10
+    condbr %is_ge10, two(buf, off, val), one(buf, off, val)
+  two(buf: ptr, off: i64, val: i64):
+    %d1_2 = sdiv i64 val, 10
+    %d2_2 = srem i64 val, 10
+    %ch1_2 = add i64 %d1_2, 48
+    %ch2_2 = add i64 %d2_2, 48
+    %b1_2 = trunc i8 %ch1_2
+    %b2_2 = trunc i8 %ch2_2
+    %p0_2 = gep i8 buf, off
+    store i8 %p0_2, %b1_2
+    %o1_2 = add i64 off, 1
+    %p1_2 = gep i8 buf, %o1_2
+    store i8 %p1_2, %b2_2
+    %o2_2 = add i64 off, 2
+    ret %o2_2
+  one(buf: ptr, off: i64, val: i64):
+    %ch2_1 = add i64 val, 48
+    %b2_1 = trunc i8 %ch2_1
+    %p0_1 = gep i8 buf, off
+    store i8 %p0_1, %b2_1
+    %o1_1 = add i64 off, 1
+    ret %o1_1
+}
+
+fn put_digits6(ptr, i64, i64) -> i64 {
+  entry(buf: ptr, off: i64, val: i64):
+    ; Dominating constants auto-injected
+    %_dom_i64_1 = iconst i64 1
+    %_dom_i32_1 = iconst i32 1
+    %_dom_i8_1 = iconst i8 1
+    %_dom_i64_2 = iconst i64 2
+    %_dom_i32_2 = iconst i32 2
+    %_dom_i8_2 = iconst i8 2
+    %_dom_i64_3 = iconst i64 3
+    %_dom_i32_3 = iconst i32 3
+    %_dom_i8_3 = iconst i8 3
+    %_dom_i64_4 = iconst i64 4
+    %_dom_i32_4 = iconst i32 4
+    %_dom_i8_4 = iconst i8 4
+    %_dom_i64_5 = iconst i64 5
+    %_dom_i32_5 = iconst i32 5
+    %_dom_i8_5 = iconst i8 5
+    %_dom_i64_6 = iconst i64 6
+    %_dom_i32_6 = iconst i32 6
+    %_dom_i8_6 = iconst i8 6
+    %_dom_i64_10 = iconst i64 10
+    %_dom_i32_10 = iconst i32 10
+    %_dom_i8_10 = iconst i8 10
+    %_dom_i64_48 = iconst i64 48
+    %_dom_i32_48 = iconst i32 48
+    %_dom_i8_48 = iconst i8 48
+    %_dom_i64_100 = iconst i64 100
+    %_dom_i32_100 = iconst i32 100
+    %_dom_i8_100 = iconst i8 100
+    %_dom_i64_1000 = iconst i64 1000
+    %_dom_i32_1000 = iconst i32 1000
+    %_dom_i64_10000 = iconst i64 10000
+    %_dom_i32_10000 = iconst i32 10000
+    %_dom_i64_100000 = iconst i64 100000
+    %_dom_i32_100000 = iconst i32 100000
+    %_dom_i64_1000000 = iconst i64 1000000
+    %_dom_i32_1000000 = iconst i32 1000000
+    %v0 = srem i64 val, 1000000
+    %d0 = sdiv i64 %v0, 100000
+    %m0 = srem i64 %v0, 100000
+    %d1 = sdiv i64 %m0, 10000
+    %m1 = srem i64 %m0, 10000
+    %d2 = sdiv i64 %m1, 1000
+    %m2 = srem i64 %m1, 1000
+    %d3 = sdiv i64 %m2, 100
+    %m3 = srem i64 %m2, 100
+    %d4 = sdiv i64 %m3, 10
+    %d5 = srem i64 %m3, 10
+    %ch0 = add i64 %d0, 48
+    %ch1 = add i64 %d1, 48
+    %ch2 = add i64 %d2, 48
+    %ch3 = add i64 %d3, 48
+    %ch4 = add i64 %d4, 48
+    %ch5 = add i64 %d5, 48
+    %b0 = trunc i8 %ch0
+    %b1 = trunc i8 %ch1
+    %b2 = trunc i8 %ch2
+    %b3 = trunc i8 %ch3
+    %b4 = trunc i8 %ch4
+    %b5 = trunc i8 %ch5
+    %p0 = gep i8 buf, off
+    store i8 %p0, %b0
+    %o1 = add i64 off, 1
+    %p1 = gep i8 buf, %o1
+    store i8 %p1, %b1
+    %o2 = add i64 off, 2
+    %p2 = gep i8 buf, %o2
+    store i8 %p2, %b2
+    %o3 = add i64 off, 3
+    %p3 = gep i8 buf, %o3
+    store i8 %p3, %b3
+    %o4 = add i64 off, 4
+    %p4 = gep i8 buf, %o4
+    store i8 %p4, %b4
+    %o5 = add i64 off, 5
+    %p5 = gep i8 buf, %o5
+    store i8 %p5, %b5
+    %o6 = add i64 off, 6
+    ret %o6
+}
+
+fn put_color(ptr, i64, i32, i32) -> i64 {
+  entry(buf: ptr, off: i64, rgb: i32, is_bg: i32):
+    ; Dominating constants auto-injected
+    %_dom_i64_0 = iconst i64 0
+    %_dom_i32_0 = iconst i32 0
+    %_dom_i8_0 = iconst i8 0
+    %_dom_i64_1 = iconst i64 1
+    %_dom_i32_1 = iconst i32 1
+    %_dom_i8_1 = iconst i8 1
+    %_dom_i64_2 = iconst i64 2
+    %_dom_i32_2 = iconst i32 2
+    %_dom_i8_2 = iconst i8 2
+    %_dom_i64_3 = iconst i64 3
+    %_dom_i32_3 = iconst i32 3
+    %_dom_i8_3 = iconst i8 3
+    %_dom_i64_4 = iconst i64 4
+    %_dom_i32_4 = iconst i32 4
+    %_dom_i8_4 = iconst i8 4
+    %_dom_i64_5 = iconst i64 5
+    %_dom_i32_5 = iconst i32 5
+    %_dom_i8_5 = iconst i8 5
+    %_dom_i64_6 = iconst i64 6
+    %_dom_i32_6 = iconst i32 6
+    %_dom_i8_6 = iconst i8 6
+    %_dom_i64_7 = iconst i64 7
+    %_dom_i32_7 = iconst i32 7
+    %_dom_i8_7 = iconst i8 7
+    %_dom_i64_8 = iconst i64 8
+    %_dom_i32_8 = iconst i32 8
+    %_dom_i8_8 = iconst i8 8
+    %_dom_i64_16 = iconst i64 16
+    %_dom_i32_16 = iconst i32 16
+    %_dom_i8_16 = iconst i8 16
+    %_dom_i64_27 = iconst i64 27
+    %_dom_i32_27 = iconst i32 27
+    %_dom_i8_27 = iconst i8 27
+    %_dom_i64_50 = iconst i64 50
+    %_dom_i32_50 = iconst i32 50
+    %_dom_i8_50 = iconst i8 50
+    %_dom_i64_51 = iconst i64 51
+    %_dom_i32_51 = iconst i32 51
+    %_dom_i8_51 = iconst i8 51
+    %_dom_i64_52 = iconst i64 52
+    %_dom_i32_52 = iconst i32 52
+    %_dom_i8_52 = iconst i8 52
+    %_dom_i64_56 = iconst i64 56
+    %_dom_i32_56 = iconst i32 56
+    %_dom_i8_56 = iconst i8 56
+    %_dom_i64_59 = iconst i64 59
+    %_dom_i32_59 = iconst i32 59
+    %_dom_i8_59 = iconst i8 59
+    %_dom_i64_91 = iconst i64 91
+    %_dom_i32_91 = iconst i32 91
+    %_dom_i8_91 = iconst i8 91
+    %_dom_i64_109 = iconst i64 109
+    %_dom_i32_109 = iconst i32 109
+    %_dom_i8_109 = iconst i8 109
+    %_dom_i64_255 = iconst i64 255
+    %_dom_i32_255 = iconst i32 255
+    %_dom_i8_255 = iconst i8 255
+    %p0 = gep i8 buf, off
+    store i8 %p0, 27
+    %o1 = add i64 off, 1
+    %p1 = gep i8 buf, %o1
+    store i8 %p1, 91
+    %o2 = add i64 off, 2
+    %p2 = gep i8 buf, %o2
+    %is_bg_b = icmp.ne i32 is_bg, 0
+    %code = select i8 %is_bg_b, 52, 51
+    store i8 %p2, %code
+    %o3 = add i64 off, 3
+    %p3 = gep i8 buf, %o3
+    store i8 %p3, 56
+    %o4 = add i64 off, 4
+    %p4 = gep i8 buf, %o4
+    store i8 %p4, 59
+    %o5 = add i64 off, 5
+    %p5 = gep i8 buf, %o5
+    store i8 %p5, 50
+    %o6 = add i64 off, 6
+    %p6 = gep i8 buf, %o6
+    store i8 %p6, 59
+    %off_prefix = add i64 off, 7
+    %r_sh = lshr i32 rgb, 16
+    %r_b = and i32 %r_sh, 255
+    %r64 = zext i64 %r_b
+    %o_r = call i64 put_u8(buf, %off_prefix, %r64)
+    %p_sc1 = gep i8 buf, %o_r
+    store i8 %p_sc1, 59
+    %off_g = add i64 %o_r, 1
+    %g_sh = lshr i32 rgb, 8
+    %g_b = and i32 %g_sh, 255
+    %g64 = zext i64 %g_b
+    %o_g = call i64 put_u8(buf, %off_g, %g64)
+    %p_sc2 = gep i8 buf, %o_g
+    store i8 %p_sc2, 59
+    %off_b = add i64 %o_g, 1
+    %b_b = and i32 rgb, 255
+    %b64 = zext i64 %b_b
+    %o_b = call i64 put_u8(buf, %off_b, %b64)
+    %p_end = gep i8 buf, %o_b
+    store i8 %p_end, 109
+    %final_off = add i64 %o_b, 1
+    ret %final_off
+}
+
+fn make_line(ptr, i64, i8, i8, i8, i64) -> i64 {
+  entry(buf: ptr, off: i64, left_ch: i8, mid_ch: i8, right_ch: i8, width: i64):
+    ; Dominating constants auto-injected
+    %_dom_i64_0 = iconst i64 0
+    %_dom_i32_0 = iconst i32 0
+    %_dom_i8_0 = iconst i8 0
+    %_dom_i64_1 = iconst i64 1
+    %_dom_i32_1 = iconst i32 1
+    %_dom_i8_1 = iconst i8 1
+    %_dom_i64_2 = iconst i64 2
+    %_dom_i32_2 = iconst i32 2
+    %_dom_i8_2 = iconst i8 2
+    %_dom_i64_10 = iconst i64 10
+    %_dom_i32_10 = iconst i32 10
+    %_dom_i8_10 = iconst i8 10
+    %p0 = gep i8 buf, off
+    store i8 %p0, left_ch
+    %off1 = add i64 off, 1
+    %w_mid = sub i64 width, 2
+    br loop(0, buf, %off1, mid_ch, %w_mid, right_ch, width)
+  loop(i: i64, buf: ptr, cur_p: i64, mid_ch: i8, count: i64, right_ch: i8, width: i64):
+    %done = icmp.sge i64 i, count
+    condbr %done, finish(buf, cur_p, right_ch), body(i, buf, cur_p, mid_ch, count, right_ch, width)
+  body(i: i64, buf: ptr, cur_p: i64, mid_ch: i8, count: i64, right_ch: i8, width: i64):
+    %p = gep i8 buf, cur_p
+    store i8 %p, mid_ch
+    %next_p = add i64 cur_p, 1
+    %i2 = add i64 i, 1
+    br loop(%i2, buf, %next_p, mid_ch, count, right_ch, width)
+  finish(buf: ptr, cur_p: i64, right_ch: i8):
+    %pend = gep i8 buf, cur_p
+    store i8 %pend, right_ch
+    %pnl = add i64 cur_p, 1
+    %p_nl = gep i8 buf, %pnl
+    store i8 %p_nl, 10
+    %final_off = add i64 %pnl, 1
+    ret %final_off
+}
+
+fn render_background(ptr, ptr, ptr, ptr, i64, i64, f64) -> void {
+  entry(ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, cols: i64, rows: i64, t: f64):
+    ; Dominating constants auto-injected
+    %_dom_f_0_0 = fconst f64 0.0
+    %_dom_f_0_075 = fconst f64 0.075
+    %_dom_f_0_08 = fconst f64 0.08
+    %_dom_f_0_1 = fconst f64 0.1
+    %_dom_f_0_12 = fconst f64 0.12
+    %_dom_f_0_333333 = fconst f64 0.333333
+    %_dom_f_0_4 = fconst f64 0.4
+    %_dom_f_0_45 = fconst f64 0.45
+    %_dom_f_0_5 = fconst f64 0.5
+    %_dom_f_0_6 = fconst f64 0.6
+    %_dom_f_0_70 = fconst f64 0.70
+    %_dom_f_0_8 = fconst f64 0.8
+    %_dom_f_0_85 = fconst f64 0.85
+    %_dom_f_1_0 = fconst f64 1.0
+    %_dom_f_1_4 = fconst f64 1.4
+    %_dom_f_1_6 = fconst f64 1.6
+    %_dom_f_2_2 = fconst f64 2.2
+    %_dom_f_2_6 = fconst f64 2.6
+    %_dom_f_3_14159265 = fconst f64 3.14159265
+    %_dom_f_3_5 = fconst f64 3.5
+    %_dom_f_4_0 = fconst f64 4.0
+    %_dom_f_6_0 = fconst f64 6.0
+    %_dom_f_8_0 = fconst f64 8.0
+    %_dom_f_10_0 = fconst f64 10.0
+    %_dom_f_12_0 = fconst f64 12.0
+    %_dom_f_14_0 = fconst f64 14.0
+    %_dom_f_25_0 = fconst f64 25.0
+    %_dom_f_28_0 = fconst f64 28.0
+    %_dom_f_32_0 = fconst f64 32.0
+    %_dom_f_40_0 = fconst f64 40.0
+    %_dom_f_190_0 = fconst f64 190.0
+    %_dom_f_255_0 = fconst f64 255.0
+    %_dom_f_10000_0 = fconst f64 10000.0
+    %_dom_i64_0 = iconst i64 0
+    %_dom_i32_0 = iconst i32 0
+    %_dom_i8_0 = iconst i8 0
+    %_dom_i64_1 = iconst i64 1
+    %_dom_i32_1 = iconst i32 1
+    %_dom_i8_1 = iconst i8 1
+    %_dom_i64_8 = iconst i64 8
+    %_dom_i32_8 = iconst i32 8
+    %_dom_i8_8 = iconst i8 8
+    %_dom_i64_16 = iconst i64 16
+    %_dom_i32_16 = iconst i32 16
+    %_dom_i8_16 = iconst i8 16
+    %_dom_i64_32 = iconst i64 32
+    %_dom_i32_32 = iconst i32 32
+    %_dom_i8_32 = iconst i8 32
+    %_dom_i64_42 = iconst i64 42
+    %_dom_i32_42 = iconst i32 42
+    %_dom_i8_42 = iconst i8 42
+    %_dom_i64_43 = iconst i64 43
+    %_dom_i32_43 = iconst i32 43
+    %_dom_i8_43 = iconst i8 43
+    %_dom_i64_46 = iconst i64 46
+    %_dom_i32_46 = iconst i32 46
+    %_dom_i8_46 = iconst i8 46
+    %_dom_i64_61 = iconst i64 61
+    %_dom_i32_61 = iconst i32 61
+    %_dom_i8_61 = iconst i8 61
+    %_dom_i64_100 = iconst i64 100
+    %_dom_i32_100 = iconst i32 100
+    %_dom_i8_100 = iconst i8 100
+    %_dom_i64_124 = iconst i64 124
+    %_dom_i32_124 = iconst i32 124
+    %_dom_i8_124 = iconst i8 124
+    %_dom_i64_180 = iconst i64 180
+    %_dom_i32_180 = iconst i32 180
+    %_dom_i8_180 = iconst i8 180
+    %_dom_i64_220 = iconst i64 220
+    %_dom_i32_220 = iconst i32 220
+    %_dom_i8_220 = iconst i8 220
+    %_dom_i64_255 = iconst i64 255
+    %_dom_i32_255 = iconst i32 255
+    %_dom_i8_255 = iconst i8 255
+    %_dom_i64_11853311 = iconst i64 11853311
+    %_dom_i32_11853311 = iconst i32 11853311
+    %_dom_i64_374761393 = iconst i64 374761393
+    %_dom_i32_374761393 = iconst i32 374761393
+    %_dom_i64_668265263 = iconst i64 668265263
+    %_dom_i32_668265263 = iconst i32 668265263
+    %_dom_i64_2147483647 = iconst i64 2147483647
+    %_dom_i32_2147483647 = iconst i32 2147483647
+    %c0 = iconst i64 0
+    %c1 = iconst i64 1
+    %c16 = iconst i32 16
+    %c8 = iconst i32 8
+    %c32 = iconst i8 32
+    %c42 = iconst i8 42
+    %c43 = iconst i8 43
+    %c46 = iconst i8 46
+    %c61 = iconst i8 61
+    %c124 = iconst i8 124
+    %f0 = fconst f64 0.0
+    %f05 = fconst f64 0.5
+    %f1 = fconst f64 1.0
+    %f10000 = fconst f64 10000.0
+    %fc = sitofp f64 cols
+    %fr = sitofp f64 rows
+    %cx = fmul f64 %fc, 0.5
+    %cy = fmul f64 %fr, 0.45
+    %horizon = fmul f64 %fr, 0.70
+    br row_loop(0, ch_buf, fg_buf, bg_buf, z_buf, cols, rows, t, %fc, %fr, %cx, %cy, %horizon)
+  row_loop(py: i64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, cols: i64, rows: i64, t: f64, fc: f64, fr: f64, cx: f64, cy: f64, horizon: f64):
+    %done_y = icmp.sge i64 py, rows
+    condbr %done_y, exit(), col_loop(0, py, ch_buf, fg_buf, bg_buf, z_buf, cols, rows, t, fc, fr, cx, cy, horizon)
+  col_loop(px: i64, py: i64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, cols: i64, rows: i64, t: f64, fc: f64, fr: f64, cx: f64, cy: f64, horizon: f64):
+    %done_x = icmp.sge i64 px, cols
+    condbr %done_x, next_row(py, ch_buf, fg_buf, bg_buf, z_buf, cols, rows, t, fc, fr, cx, cy, horizon), pix(px, py, ch_buf, fg_buf, bg_buf, z_buf, cols, rows, t, fc, fr, cx, cy, horizon)
+  next_row(py: i64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, cols: i64, rows: i64, t: f64, fc: f64, fr: f64, cx: f64, cy: f64, horizon: f64):
+    %py2 = add i64 py, 1
+    br row_loop(%py2, ch_buf, fg_buf, bg_buf, z_buf, cols, rows, t, fc, fr, cx, cy, horizon)
+  pix(px: i64, py: i64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, cols: i64, rows: i64, t: f64, fc: f64, fr: f64, cx: f64, cy: f64, horizon: f64):
+    %row_off = mul i64 py, cols
+    %idx = add i64 %row_off, px
+    %zp = gep f64 z_buf, %idx
+    store f64 %zp, -1000000.0
+    %fy = sitofp f64 py
+    %fx = sitofp f64 px
+    %is_ground = fcmp.oge f64 %fy, horizon
+    condbr %is_ground, ground(px, py, idx, ch_buf, fg_buf, bg_buf, z_buf, cols, rows, t, fc, fr, cx, cy, horizon, %fx, %fy), sky(px, py, idx, ch_buf, fg_buf, bg_buf, z_buf, cols, rows, t, fc, fr, cx, cy, horizon, %fx, %fy)
+  ground(px: i64, py: i64, idx: i64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, cols: i64, rows: i64, t: f64, fc: f64, fr: f64, cx: f64, cy: f64, horizon: f64, fx: f64, fy: f64):
+    %num_dy = fsub f64 fy, horizon
+    %num_dy2 = fadd f64 %num_dy, 0.5
+    %den_dy = fsub f64 fr, horizon
+    %den_dy2 = fadd f64 %den_dy, 0.5
+    %dy = fdiv f64 %num_dy2, %den_dy2
+    %z_den = fadd f64 %dy, 0.08
+    %z_depth = fdiv f64 1.0, %z_den
+    %dfx = fsub f64 fx, cx
+    %gx_term = fmul f64 %dfx, %z_depth
+    %gx = fmul f64 %gx_term, 0.075
+    %gz_base = fmul f64 %z_depth, 0.70
+    %t_spd = fmul f64 t, 3.5
+    %gz = fadd f64 %gz_base, %t_spd
+    %gx_pos = fadd f64 %gx, 10000.0
+    %gx_i = fptosi i64 %gx_pos
+    %gx_fl = sitofp f64 %gx_i
+    %gx_fr = fsub f64 %gx_pos, %gx_fl
+    %gx_hi = fcmp.ogt f64 %gx_fr, 0.5
+    %gx_fr_sub = fsub f64 1.0, %gx_fr
+    %gx_edge = select f64 %gx_hi, %gx_fr_sub, %gx_fr
+    %is_grid_x = fcmp.olt f64 %gx_edge, 0.08
+    %gz_pos = fadd f64 %gz, 10000.0
+    %gz_i = fptosi i64 %gz_pos
+    %gz_fl = sitofp f64 %gz_i
+    %gz_fr = fsub f64 %gz_pos, %gz_fl
+    %gz_hi = fcmp.ogt f64 %gz_fr, 0.5
+    %gz_fr_sub = fsub f64 1.0, %gz_fr
+    %gz_edge = select f64 %gz_hi, %gz_fr_sub, %gz_fr
+    %is_grid_z = fcmp.olt f64 %gz_edge, 0.12
+    %fog_raw = fmul f64 %dy, 1.4
+    %fog_hi = fcmp.ogt f64 %fog_raw, 1.0
+    %fog = select f64 %fog_hi, 1.0, %fog_raw
+    %inv_fog = fsub f64 1.0, %fog
+    %br_f = fmul f64 %inv_fog, 12.0
+    %bg_f = fmul f64 %inv_fog, 6.0
+    %bb_f = fmul f64 %inv_fog, 28.0
+    %br = fptosi i32 %br_f
+    %bg = fptosi i32 %bg_f
+    %bb = fptosi i32 %bb_f
+    %sh_r = shl i32 %br, 16
+    %sh_g = shl i32 %bg, 8
+    %bg_pk0 = or i32 %sh_r, %sh_g
+    %bg_pk = or i32 %bg_pk0, %bb
+    %bg_p = gep i32 bg_buf, idx
+    store i32 %bg_p, %bg_pk
+    %is_any_grid = or i1 %is_grid_x, %is_grid_z
+    condbr %is_any_grid, grid_cell(px, py, idx, ch_buf, fg_buf, bg_buf, z_buf, cols, rows, t, fc, fr, cx, cy, horizon, %fog, %is_grid_x, %is_grid_z), empty_ground(px, py, idx, ch_buf, fg_buf, bg_buf, z_buf, cols, rows, t, fc, fr, cx, cy, horizon)
+  grid_cell(px: i64, py: i64, idx: i64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, cols: i64, rows: i64, t: f64, fc: f64, fr: f64, cx: f64, cy: f64, horizon: f64, fog: f64, is_x: i1, is_z: i1):
+    %gr_f = fmul f64 fog, 255.0
+    %gg_f = fmul f64 fog, 25.0
+    %gb_f = fmul f64 fog, 190.0
+    %gr = fptosi i32 %gr_f
+    %gg = fptosi i32 %gg_f
+    %gb = fptosi i32 %gb_f
+    %sh_gr = shl i32 %gr, 16
+    %sh_gg = shl i32 %gg, 8
+    %fg_pk0 = or i32 %sh_gr, %sh_gg
+    %fg_pk = or i32 %fg_pk0, %gb
+    %fg_p = gep i32 fg_buf, idx
+    store i32 %fg_p, %fg_pk
+    %is_cross = and i1 is_x, is_z
+    %ch_g1 = select i8 is_x, 124, 61
+    %ch_grid = select i8 %is_cross, 43, %ch_g1
+    %ch_p = gep i8 ch_buf, idx
+    store i8 %ch_p, %ch_grid
+    %px2 = add i64 px, 1
+    br col_loop(%px2, py, ch_buf, fg_buf, bg_buf, z_buf, cols, rows, t, fc, fr, cx, cy, horizon)
+  empty_ground(px: i64, py: i64, idx: i64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, cols: i64, rows: i64, t: f64, fc: f64, fr: f64, cx: f64, cy: f64, horizon: f64):
+    %ch_p0 = gep i8 ch_buf, idx
+    store i8 %ch_p0, 32
+    %fg_p0 = gep i32 fg_buf, idx
+    store i32 %fg_p0, 0
+    %px3 = add i64 px, 1
+    br col_loop(%px3, py, ch_buf, fg_buf, bg_buf, z_buf, cols, rows, t, fc, fr, cx, cy, horizon)
+  sky(px: i64, py: i64, idx: i64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, cols: i64, rows: i64, t: f64, fc: f64, fr: f64, cx: f64, cy: f64, horizon: f64, fx: f64, fy: f64):
+    %u_num = fsub f64 fx, cx
+    %u = fdiv f64 %u_num, cx
+    %v_num = fsub f64 fy, cy
+    %v = fdiv f64 %v_num, cy
+    %u_sc = fmul f64 %u, 2.2
+    %a1 = fadd f64 %u_sc, t
+    %w1 = call f64 sin(%a1)
+    %v_sc = fmul f64 %v, 2.6
+    %t_08 = fmul f64 t, 0.8
+    %a2 = fsub f64 %v_sc, %t_08
+    %w2 = call f64 cos(%a2)
+    %uv = fadd f64 %u, %v
+    %uv_sc = fmul f64 %uv, 1.6
+    %t_06 = fmul f64 t, 0.6
+    %a3 = fadd f64 %uv_sc, %t_06
+    %w3 = call f64 sin(%a3)
+    %s12 = fadd f64 %w1, %w2
+    %s123 = fadd f64 %s12, %w3
+    %pls = fmul f64 %s123, 0.333333
+    %br_base = fmul f64 %pls, 14.0
+    %br_f2 = fadd f64 %br_base, 12.0
+    %br2 = fptosi i32 %br_f2
+    %pls_pi = fmul f64 %pls, 3.14159265
+    %t_08b = fmul f64 t, 0.8
+    %bg_arg = fadd f64 %pls_pi, %t_08b
+    %c_g = call f64 cos(%bg_arg)
+    %bg_base = fmul f64 %c_g, 10.0
+    %bg_f2 = fadd f64 %bg_base, 8.0
+    %bg2 = fptosi i32 %bg_f2
+    %pls_2 = fmul f64 %pls, 2.2
+    %bb_arg = fsub f64 %pls_2, t
+    %s_b = call f64 sin(%bb_arg)
+    %bb_base = fmul f64 %s_b, 32.0
+    %bb_f2 = fadd f64 %bb_base, 40.0
+    %bb2 = fptosi i32 %bb_f2
+    %sh_r2 = shl i32 %br2, 16
+    %sh_g2 = shl i32 %bg2, 8
+    %bg_pk0_2 = or i32 %sh_r2, %sh_g2
+    %bg_pk2 = or i32 %bg_pk0_2, %bb2
+    %bg_p2 = gep i32 bg_buf, idx
+    store i32 %bg_p2, %bg_pk2
+    %h1 = mul i64 px, 374761393
+    %h2 = mul i64 py, 668265263
+    %h_sum = add i64 %h1, %h2
+    %h_pos = and i64 %h_sum, 2147483647
+    %star_rem = srem i64 %h_pos, 43
+    %is_star = icmp.eq i64 %star_rem, 0
+    condbr %is_star, star_check(px, py, idx, ch_buf, fg_buf, bg_buf, z_buf, cols, rows, t, fc, fr, cx, cy, horizon, %h_pos), empty_sky(px, py, idx, ch_buf, fg_buf, bg_buf, z_buf, cols, rows, t, fc, fr, cx, cy, horizon)
+  star_check(px: i64, py: i64, idx: i64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, cols: i64, rows: i64, t: f64, fc: f64, fr: f64, cx: f64, cy: f64, horizon: f64, h_pos: i64):
+    %rem100 = srem i64 h_pos, 100
+    %f_rem = sitofp f64 %rem100
+    %phase = fmul f64 %f_rem, 0.1
+    %t_4 = fmul f64 t, 4.0
+    %t_arg = fadd f64 %t_4, %phase
+    %tw = call f64 sin(%t_arg)
+    %is_tw = fcmp.ogt f64 %tw, 0.4
+    condbr %is_tw, star_on(px, py, idx, ch_buf, fg_buf, bg_buf, z_buf, cols, rows, t, fc, fr, cx, cy, horizon, %tw), empty_sky(px, py, idx, ch_buf, fg_buf, bg_buf, z_buf, cols, rows, t, fc, fr, cx, cy, horizon)
+  star_on(px: i64, py: i64, idx: i64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, cols: i64, rows: i64, t: f64, fc: f64, fr: f64, cx: f64, cy: f64, horizon: f64, tw: f64):
+    %fg_p_star = gep i32 fg_buf, idx
+    store i32 %fg_p_star, 11853311 ; (180, 220, 255)
+    %is_big = fcmp.ogt f64 tw, 0.85
+    %ch_star = select i8 %is_big, 42, 46 ; '*' or '.'
+    %ch_p_star = gep i8 ch_buf, idx
+    store i8 %ch_p_star, %ch_star
+    %px4 = add i64 px, 1
+    br col_loop(%px4, py, ch_buf, fg_buf, bg_buf, z_buf, cols, rows, t, fc, fr, cx, cy, horizon)
+  empty_sky(px: i64, py: i64, idx: i64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, cols: i64, rows: i64, t: f64, fc: f64, fr: f64, cx: f64, cy: f64, horizon: f64):
+    %ch_p_e = gep i8 ch_buf, idx
+    store i8 %ch_p_e, 32
+    %fg_p_e = gep i32 fg_buf, idx
+    store i32 %fg_p_e, 0
+    %px5 = add i64 px, 1
+    br col_loop(%px5, py, ch_buf, fg_buf, bg_buf, z_buf, cols, rows, t, fc, fr, cx, cy, horizon)
+  exit():
+    ret
+}
+
+fn render_rings(ptr, ptr, ptr, ptr, i64, i64, f64) -> void {
+  entry(ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, cols: i64, rows: i64, t: f64):
+    ; Dominating constants auto-injected
+    %_dom_f_0_45 = fconst f64 0.45
+    %_dom_f_0_48 = fconst f64 0.48
+    %_dom_f_0_5 = fconst f64 0.5
+    %_dom_f_0_8 = fconst f64 0.8
+    %_dom_f_1_0 = fconst f64 1.0
+    %_dom_f_1_1 = fconst f64 1.1
+    %_dom_f_1_3 = fconst f64 1.3
+    %_dom_f_1_5707963 = fconst f64 1.5707963
+    %_dom_f_6_2831853 = fconst f64 6.2831853
+    %_dom_f_22_0 = fconst f64 22.0
+    %_dom_f_28_0 = fconst f64 28.0
+    %_dom_f_55_0 = fconst f64 55.0
+    %_dom_f_160_0 = fconst f64 160.0
+    %_dom_i64_0 = iconst i64 0
+    %_dom_i32_0 = iconst i32 0
+    %_dom_i8_0 = iconst i8 0
+    %_dom_i64_1 = iconst i64 1
+    %_dom_i32_1 = iconst i32 1
+    %_dom_i8_1 = iconst i8 1
+    %_dom_i64_6 = iconst i64 6
+    %_dom_i32_6 = iconst i32 6
+    %_dom_i8_6 = iconst i8 6
+    %_dom_i64_42 = iconst i64 42
+    %_dom_i32_42 = iconst i32 42
+    %_dom_i8_42 = iconst i8 42
+    %_dom_i64_46 = iconst i64 46
+    %_dom_i32_46 = iconst i32 46
+    %_dom_i8_46 = iconst i8 46
+    %_dom_i64_111 = iconst i64 111
+    %_dom_i32_111 = iconst i32 111
+    %_dom_i8_111 = iconst i8 111
+    %_dom_i64_126 = iconst i64 126
+    %_dom_i32_126 = iconst i32 126
+    %_dom_i8_126 = iconst i8 126
+    %_dom_i64_160 = iconst i64 160
+    %_dom_i32_160 = iconst i32 160
+    %_dom_i8_160 = iconst i8 160
+    %_dom_i64_61695 = iconst i64 61695
+    %_dom_i32_61695 = iconst i32 61695
+    %_dom_i64_16727240 = iconst i64 16727240
+    %_dom_i32_16727240 = iconst i32 16727240
+    %fc = sitofp f64 cols
+    %fr = sitofp f64 rows
+    %cx = fmul f64 %fc, 0.5
+    %cy = fmul f64 %fr, 0.45
+    %r_maj = fmul f64 %fr, 0.48
+    %A0 = fmul f64 t, 0.8
+    %B0 = fmul f64 t, 1.1
+    br ring_pts(0, 0, ch_buf, fg_buf, z_buf, cols, rows, t, cx, cy, %r_maj, %A0, %B0)
+  ring_pts(i: i64, ring_id: i64, ch_buf: ptr, fg_buf: ptr, z_buf: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, r_maj: f64, A: f64, B: f64):
+    %done = icmp.sge i64 i, 160
+    condbr %done, ring_done(ring_id, ch_buf, fg_buf, z_buf, cols, rows, t, cx, cy, r_maj), ring_body(i, ring_id, ch_buf, fg_buf, z_buf, cols, rows, t, cx, cy, r_maj, A, B)
+  ring_body(i: i64, ring_id: i64, ch_buf: ptr, fg_buf: ptr, z_buf: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, r_maj: f64, A: f64, B: f64):
+    %fi = sitofp f64 i
+    %th_step = fdiv f64 6.2831853, 160.0
+    %th = fmul f64 %fi, %th_step
+    %c_th = call f64 cos(%th)
+    %s_th = call f64 sin(%th)
+    %x0 = fmul f64 r_maj, %c_th
+    %y0 = fmul f64 r_maj, %s_th
+    %cA = call f64 cos(A)
+    %sA = call f64 sin(A)
+    %cB = call f64 cos(B)
+    %sB = call f64 sin(B)
+    %y1 = fmul f64 %y0, %cA
+    %z1 = fmul f64 %y0, %sA
+    %x2_a = fmul f64 %x0, %cB
+    %x2_b = fmul f64 %z1, %sB
+    %x2 = fadd f64 %x2_a, %x2_b
+    %z2_a = fmul f64 %x0, %sB
+    %z2_b = fmul f64 %z1, %cB
+    %z2 = fsub f64 %z2_b, %z2_a
+    %proj_z = fadd f64 %z2, 22.0
+    %ooz = fdiv f64 1.0, %proj_z
+    %x2_ooz = fmul f64 %x2, %ooz
+    %x2_sc = fmul f64 %x2_ooz, 55.0
+    %px_f = fadd f64 cx, %x2_sc
+    %px = fptosi i64 %px_f
+    %y1_ooz = fmul f64 %y1, %ooz
+    %y1_sc = fmul f64 %y1_ooz, 28.0
+    %py_f = fadd f64 cy, %y1_sc
+    %py = fptosi i64 %py_f
+    %c_x0 = icmp.sge i64 %px, 0
+    %c_x1 = icmp.slt i64 %px, cols
+    %ok_x = and i1 %c_x0, %c_x1
+    %c_y0 = icmp.sge i64 %py, 0
+    %c_y1 = icmp.slt i64 %py, rows
+    %ok_y = and i1 %c_y0, %c_y1
+    %inside = and i1 %ok_x, %ok_y
+    condbr %inside, ring_plot(i, ring_id, ch_buf, fg_buf, z_buf, cols, rows, t, cx, cy, r_maj, A, B, %px, %py, %ooz), ring_next(i, ring_id, ch_buf, fg_buf, z_buf, cols, rows, t, cx, cy, r_maj, A, B)
+  ring_plot(i: i64, ring_id: i64, ch_buf: ptr, fg_buf: ptr, z_buf: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, r_maj: f64, A: f64, B: f64, px: i64, py: i64, ooz: f64):
+    %row_off = mul i64 py, cols
+    %idx = add i64 %row_off, px
+    %zp = gep f64 z_buf, %idx
+    %old_z = load f64, %zp
+    %closer = fcmp.ogt f64 ooz, %old_z
+    condbr %closer, ring_write(i, ring_id, ch_buf, fg_buf, z_buf, cols, rows, t, cx, cy, r_maj, A, B, %idx, %zp, ooz), ring_next(i, ring_id, ch_buf, fg_buf, z_buf, cols, rows, t, cx, cy, r_maj, A, B)
+  ring_write(i: i64, ring_id: i64, ch_buf: ptr, fg_buf: ptr, z_buf: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, r_maj: f64, A: f64, B: f64, idx: i64, zp: ptr, ooz: f64):
+    store f64 zp, ooz
+    %fg_p = gep i32 fg_buf, idx
+    %ch_p = gep i8 ch_buf, idx
+    %is_r0 = icmp.eq i64 ring_id, 0
+    %fg_col = select i32 %is_r0, 61695, 16727240 ; Cyan 0x00F0FF (61695) vs Magenta 0xFF3CC8 (16727240)
+    store i32 %fg_p, %fg_col
+    %rem6 = srem i64 i, 6
+    %is_nod = icmp.eq i64 %rem6, 0
+    %ch_r0 = select i8 %is_nod, 111, 46 ; 'o' or '.'
+    %ch_r1 = select i8 %is_nod, 42, 126 ; '*' or '~'
+    %ch_val = select i8 %is_r0, %ch_r0, %ch_r1
+    store i8 %ch_p, %ch_val
+    br ring_next(i, ring_id, ch_buf, fg_buf, z_buf, cols, rows, t, cx, cy, r_maj, A, B)
+  ring_next(i: i64, ring_id: i64, ch_buf: ptr, fg_buf: ptr, z_buf: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, r_maj: f64, A: f64, B: f64):
+    %i2 = add i64 i, 1
+    br ring_pts(%i2, ring_id, ch_buf, fg_buf, z_buf, cols, rows, t, cx, cy, r_maj, A, B)
+  ring_done(ring_id: i64, ch_buf: ptr, fg_buf: ptr, z_buf: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, r_maj: f64):
+    %is_r0 = icmp.eq i64 ring_id, 0
+    condbr %is_r0, start_ring1(ch_buf, fg_buf, z_buf, cols, rows, t, cx, cy, r_maj), exit()
+  start_ring1(ch_buf: ptr, fg_buf: ptr, z_buf: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, r_maj: f64):
+    %A1 = fmul f64 t, -1.1
+    %B1_base = fmul f64 t, 1.3
+    %B1 = fadd f64 %B1_base, 1.5707963
+    br ring_pts(0, 1, ch_buf, fg_buf, z_buf, cols, rows, t, cx, cy, r_maj, %A1, %B1)
+  exit():
+    ret
+}
+
+fn render_text(ptr, ptr, ptr, ptr, ptr, ptr, i64, i64, f64) -> void {
+  entry(ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64):
+    ; Dominating constants auto-injected
+    %_dom_f_0_0 = fconst f64 0.0
+    %_dom_f_0_08 = fconst f64 0.08
+    %_dom_f_0_15 = fconst f64 0.15
+    %_dom_f_0_18 = fconst f64 0.18
+    %_dom_f_0_25 = fconst f64 0.25
+    %_dom_f_0_45 = fconst f64 0.45
+    %_dom_f_0_48 = fconst f64 0.48
+    %_dom_f_0_5 = fconst f64 0.5
+    %_dom_f_0_6 = fconst f64 0.6
+    %_dom_f_0_7 = fconst f64 0.7
+    %_dom_f_0_8 = fconst f64 0.8
+    %_dom_f_1_0 = fconst f64 1.0
+    %_dom_f_1_6 = fconst f64 1.6
+    %_dom_f_1_8 = fconst f64 1.8
+    %_dom_f_2_6 = fconst f64 2.6
+    %_dom_f_3_2 = fconst f64 3.2
+    %_dom_f_6_0 = fconst f64 6.0
+    %_dom_f_9_0 = fconst f64 9.0
+    %_dom_f_18_0 = fconst f64 18.0
+    %_dom_f_20_0 = fconst f64 20.0
+    %_dom_f_27_0 = fconst f64 27.0
+    %_dom_f_40_0 = fconst f64 40.0
+    %_dom_f_160_0 = fconst f64 160.0
+    %_dom_f_180_0 = fconst f64 180.0
+    %_dom_f_210_0 = fconst f64 210.0
+    %_dom_f_240_0 = fconst f64 240.0
+    %_dom_f_255_0 = fconst f64 255.0
+    %_dom_i64_0 = iconst i64 0
+    %_dom_i32_0 = iconst i32 0
+    %_dom_i8_0 = iconst i8 0
+    %_dom_i64_1 = iconst i64 1
+    %_dom_i32_1 = iconst i32 1
+    %_dom_i8_1 = iconst i8 1
+    %_dom_i64_2 = iconst i64 2
+    %_dom_i32_2 = iconst i32 2
+    %_dom_i8_2 = iconst i8 2
+    %_dom_i64_4 = iconst i64 4
+    %_dom_i32_4 = iconst i32 4
+    %_dom_i8_4 = iconst i8 4
+    %_dom_i64_5 = iconst i64 5
+    %_dom_i32_5 = iconst i32 5
+    %_dom_i8_5 = iconst i8 5
+    %_dom_i64_8 = iconst i64 8
+    %_dom_i32_8 = iconst i32 8
+    %_dom_i8_8 = iconst i8 8
+    %_dom_i64_9 = iconst i64 9
+    %_dom_i32_9 = iconst i32 9
+    %_dom_i8_9 = iconst i8 9
+    %_dom_i64_10 = iconst i64 10
+    %_dom_i32_10 = iconst i32 10
+    %_dom_i8_10 = iconst i8 10
+    %_dom_i64_15 = iconst i64 15
+    %_dom_i32_15 = iconst i32 15
+    %_dom_i8_15 = iconst i8 15
+    %_dom_i64_16 = iconst i64 16
+    %_dom_i32_16 = iconst i32 16
+    %_dom_i8_16 = iconst i8 16
+    %_dom_i64_25 = iconst i64 25
+    %_dom_i32_25 = iconst i32 25
+    %_dom_i8_25 = iconst i8 25
+    %_dom_i64_30 = iconst i64 30
+    %_dom_i32_30 = iconst i32 30
+    %_dom_i8_30 = iconst i8 30
+    %_dom_i64_35 = iconst i64 35
+    %_dom_i32_35 = iconst i32 35
+    %_dom_i8_35 = iconst i8 35
+    %_dom_i64_40 = iconst i64 40
+    %_dom_i32_40 = iconst i32 40
+    %_dom_i8_40 = iconst i8 40
+    %_dom_i64_50 = iconst i64 50
+    %_dom_i32_50 = iconst i32 50
+    %_dom_i8_50 = iconst i8 50
+    %_dom_i64_58 = iconst i64 58
+    %_dom_i32_58 = iconst i32 58
+    %_dom_i8_58 = iconst i8 58
+    %_dom_i64_64 = iconst i64 64
+    %_dom_i32_64 = iconst i32 64
+    %_dom_i8_64 = iconst i8 64
+    %_dom_i64_70 = iconst i64 70
+    %_dom_i32_70 = iconst i32 70
+    %_dom_i8_70 = iconst i8 70
+    %_dom_i64_90 = iconst i64 90
+    %_dom_i32_90 = iconst i32 90
+    %_dom_i8_90 = iconst i8 90
+    %_dom_i64_160 = iconst i64 160
+    %_dom_i32_160 = iconst i32 160
+    %_dom_i8_160 = iconst i8 160
+    %_dom_i64_984350 = iconst i64 984350
+    %_dom_i32_984350 = iconst i32 984350
+    %_dom_i64_1641010 = iconst i64 1641010
+    %_dom_i32_1641010 = iconst i32 1641010
+    %_dom_i64_2625350 = iconst i64 2625350
+    %_dom_i32_2625350 = iconst i32 2625350
+    %_dom_i64_5908640 = iconst i64 5908640
+    %_dom_i32_5908640 = iconst i32 5908640
+    %fc = sitofp f64 cols
+    %fr = sitofp f64 rows
+    %cx = fmul f64 %fc, 0.5
+    %cy = fmul f64 %fr, 0.45
+    %t_16 = fmul f64 t, 1.6
+    %s_sw = call f64 sin(%t_16)
+    %s_sw_sc = fmul f64 %s_sw, 0.7
+    %sw_pos = fadd f64 %s_sw_sc, 0.5
+    %sweep_x = fmul f64 %sw_pos, %fc
+    br word_prep(0, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, %sweep_x)
+  word_prep(w_idx: i64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64):
+    %is_w0 = icmp.eq i64 w_idx, 0
+    %num_chars = select i64 %is_w0, 9, 4
+    %char_w = select f64 %is_w0, 6.0, 9.0
+    %half_w = select f64 %is_w0, 27.0, 18.0
+    %w_phase_off = select f64 %is_w0, 0.0, 1.8
+    %base_y_off = select f64 %is_w0, -3.8, 2.6
+    %glyphs = select ptr %is_w0, glyphs_nw, glyphs_lbz
+    %start_x = fsub f64 cx, %half_w
+    br char_loop(0, w_idx, num_chars, %char_w, start_x, base_y_off, w_phase_off, glyphs, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x)
+  char_loop(c_idx: i64, w_idx: i64, num_chars: i64, char_w: f64, start_x: f64, base_y_off: f64, w_phase_off: f64, glyphs: ptr, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64):
+    %done_c = icmp.sge i64 c_idx, num_chars
+    condbr %done_c, word_done(w_idx, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x), char_body(c_idx, w_idx, num_chars, char_w, start_x, base_y_off, w_phase_off, glyphs, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x)
+  char_body(c_idx: i64, w_idx: i64, num_chars: i64, char_w: f64, start_x: f64, base_y_off: f64, w_phase_off: f64, glyphs: ptr, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64):
+    %fc_idx = sitofp f64 c_idx
+    %c_x_off = fmul f64 %fc_idx, char_w
+    %char_base_x = fadd f64 start_x, %c_x_off
+    %t_32 = fmul f64 t, 3.2
+    %c_48 = fmul f64 %fc_idx, 0.48
+    %ph1 = fadd f64 %t_32, %c_48
+    %phase = fadd f64 %ph1, w_phase_off
+    %s_ph = call f64 sin(%phase)
+    %wave_y = fmul f64 %s_ph, 1.0
+    %ph_08 = fmul f64 %phase, 0.8
+    %c_ph = call f64 cos(%ph_08)
+    %wz_term = fmul f64 %c_ph, 0.15
+    %wave_z = fadd f64 %wz_term, 0.5
+    %cy_off = fadd f64 cy, base_y_off
+    %char_base_y = fadd f64 %cy_off, %wave_y
+    br layer_loop(2, c_idx, w_idx, num_chars, char_w, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x)
+  layer_loop(layer: i64, c_idx: i64, w_idx: i64, num_chars: i64, char_w: f64, start_x: f64, base_y_off: f64, w_phase_off: f64, glyphs: ptr, char_base_x: f64, char_base_y: f64, wave_z: f64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64):
+    %done_l = icmp.slt i64 layer, 0
+    condbr %done_l, next_char(c_idx, w_idx, num_chars, char_w, start_x, base_y_off, w_phase_off, glyphs, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x), layer_body(layer, c_idx, w_idx, num_chars, char_w, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x)
+  layer_body(layer: i64, c_idx: i64, w_idx: i64, num_chars: i64, char_w: f64, start_x: f64, base_y_off: f64, w_phase_off: f64, glyphs: ptr, char_base_x: f64, char_base_y: f64, wave_z: f64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64):
+    %fl = sitofp f64 layer
+    %lz_sub = fmul f64 %fl, 0.08
+    %lz = fsub f64 wave_z, %lz_sub
+    %off_x = fneg f64 %fl
+    %off_y = fmul f64 %fl, 0.7
+    br row_loop(0, layer, c_idx, w_idx, num_chars, char_w, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, lz, off_x, off_y, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x)
+  row_loop(r: i64, layer: i64, c_idx: i64, w_idx: i64, num_chars: i64, char_w: f64, start_x: f64, base_y_off: f64, w_phase_off: f64, glyphs: ptr, char_base_x: f64, char_base_y: f64, wave_z: f64, lz: f64, off_x: f64, off_y: f64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64):
+    %done_r = icmp.sge i64 r, 5
+    condbr %done_r, next_layer(layer, c_idx, w_idx, num_chars, char_w, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x), row_body(r, layer, c_idx, w_idx, num_chars, char_w, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, lz, off_x, off_y, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x)
+  row_body(r: i64, layer: i64, c_idx: i64, w_idx: i64, num_chars: i64, char_w: f64, start_x: f64, base_y_off: f64, w_phase_off: f64, glyphs: ptr, char_base_x: f64, char_base_y: f64, wave_z: f64, lz: f64, off_x: f64, off_y: f64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64):
+    %c5 = mul i64 c_idx, 5
+    %g_idx = add i64 %c5, r
+    %gp = gep i8 glyphs, %g_idx
+    %bits_b = load i8, %gp
+    %bits = zext i64 %bits_b
+    br col_loop(0, r, bits, layer, c_idx, w_idx, num_chars, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, lz, off_x, off_y, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x)
+  col_loop(c: i64, r: i64, bits: i64, layer: i64, c_idx: i64, w_idx: i64, num_chars: i64, start_x: f64, base_y_off: f64, w_phase_off: f64, glyphs: ptr, char_base_x: f64, char_base_y: f64, wave_z: f64, lz: f64, off_x: f64, off_y: f64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64):
+    %done_col = icmp.sge i64 c, 5
+    condbr %done_col, next_row(r, layer, c_idx, w_idx, num_chars, char_w, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, lz, off_x, off_y, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x), check_bit(c, r, bits, layer, c_idx, w_idx, num_chars, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, lz, off_x, off_y, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x)
+  check_bit(c: i64, r: i64, bits: i64, layer: i64, c_idx: i64, w_idx: i64, num_chars: i64, start_x: f64, base_y_off: f64, w_phase_off: f64, glyphs: ptr, char_base_x: f64, char_base_y: f64, wave_z: f64, lz: f64, off_x: f64, off_y: f64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64):
+    %sh_amt = sub i64 4, c
+    %sh = lshr i64 bits, %sh_amt
+    %bit = and i64 %sh, 1
+    %is_set = icmp.ne i64 %bit, 0
+    condbr %is_set, plot_voxel(c, r, bits, layer, c_idx, w_idx, num_chars, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, lz, off_x, off_y, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x), next_col(c, r, bits, layer, c_idx, w_idx, num_chars, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, lz, off_x, off_y, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x)
+  plot_voxel(c: i64, r: i64, bits: i64, layer: i64, c_idx: i64, w_idx: i64, num_chars: i64, start_x: f64, base_y_off: f64, w_phase_off: f64, glyphs: ptr, char_base_x: f64, char_base_y: f64, wave_z: f64, lz: f64, off_x: f64, off_y: f64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64):
+    %fc = sitofp f64 c
+    %px_f0 = fadd f64 char_base_x, %fc
+    %px_f = fadd f64 %px_f0, off_x
+    %px = fptosi i64 %px_f
+    %fr_idx = sitofp f64 r
+    %py_f0 = fadd f64 char_base_y, %fr_idx
+    %py_f = fadd f64 %py_f0, off_y
+    %py = fptosi i64 %py_f
+    %c_x0 = icmp.sge i64 %px, 0
+    %c_x1 = icmp.slt i64 %px, cols
+    %ok_x = and i1 %c_x0, %c_x1
+    %c_y0 = icmp.sge i64 %py, 0
+    %c_y1 = icmp.slt i64 %py, rows
+    %ok_y = and i1 %c_y0, %c_y1
+    %inside = and i1 %ok_x, %ok_y
+    condbr %inside, test_z(c, r, bits, layer, c_idx, w_idx, num_chars, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, lz, off_x, off_y, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x, %px, %py, %px_f), next_col(c, r, bits, layer, c_idx, w_idx, num_chars, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, lz, off_x, off_y, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x)
+  test_z(c: i64, r: i64, bits: i64, layer: i64, c_idx: i64, w_idx: i64, num_chars: i64, start_x: f64, base_y_off: f64, w_phase_off: f64, glyphs: ptr, char_base_x: f64, char_base_y: f64, wave_z: f64, lz: f64, off_x: f64, off_y: f64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64, px: i64, py: i64, px_f: f64):
+    %row_off = mul i64 py, cols
+    %idx = add i64 %row_off, px
+    %zp = gep f64 z_buf, %idx
+    %old_z = load f64, %zp
+    %closer = fcmp.ogt f64 lz, %old_z
+    condbr %closer, write_voxel(c, r, bits, layer, c_idx, w_idx, num_chars, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, lz, off_x, off_y, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x, %idx, %zp, px_f), next_col(c, r, bits, layer, c_idx, w_idx, num_chars, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, lz, off_x, off_y, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x)
+  write_voxel(c: i64, r: i64, bits: i64, layer: i64, c_idx: i64, w_idx: i64, num_chars: i64, start_x: f64, base_y_off: f64, w_phase_off: f64, glyphs: ptr, char_base_x: f64, char_base_y: f64, wave_z: f64, lz: f64, off_x: f64, off_y: f64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64, idx: i64, zp: ptr, px_f: f64):
+    store f64 zp, lz
+    %ch_p = gep i8 ch_buf, idx
+    %fg_p = gep i32 fg_buf, idx
+    %bg_p = gep i32 bg_buf, idx
+    %is_l2 = icmp.eq i64 layer, 2
+    condbr %is_l2, write_l2(c, r, bits, layer, c_idx, w_idx, num_chars, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, lz, off_x, off_y, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x, ch_p, fg_p, bg_p), check_l1(c, r, bits, layer, c_idx, w_idx, num_chars, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, lz, off_x, off_y, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x, ch_p, fg_p, bg_p, px_f)
+  write_l2(c: i64, r: i64, bits: i64, layer: i64, c_idx: i64, w_idx: i64, num_chars: i64, start_x: f64, base_y_off: f64, w_phase_off: f64, glyphs: ptr, char_base_x: f64, char_base_y: f64, wave_z: f64, lz: f64, off_x: f64, off_y: f64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64, ch_p: ptr, fg_p: ptr, bg_p: ptr):
+    store i8 ch_p, 58 ; ':'
+    store i32 fg_p, 2625350 ; (40, 15, 70) = 0x280F46
+    store i32 bg_p, 984350 ; (15, 5, 30) = 0x0F051E
+    br next_col(c, r, bits, layer, c_idx, w_idx, num_chars, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, lz, off_x, off_y, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x)
+  check_l1(c: i64, r: i64, bits: i64, layer: i64, c_idx: i64, w_idx: i64, num_chars: i64, start_x: f64, base_y_off: f64, w_phase_off: f64, glyphs: ptr, char_base_x: f64, char_base_y: f64, wave_z: f64, lz: f64, off_x: f64, off_y: f64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64, ch_p: ptr, fg_p: ptr, bg_p: ptr, px_f: f64):
+    %is_l1 = icmp.eq i64 layer, 1
+    condbr %is_l1, write_l1(c, r, bits, layer, c_idx, w_idx, num_chars, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, lz, off_x, off_y, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x, ch_p, fg_p, bg_p), write_l0(c, r, bits, layer, c_idx, w_idx, num_chars, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, lz, off_x, off_y, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x, ch_p, fg_p, bg_p, px_f)
+  write_l1(c: i64, r: i64, bits: i64, layer: i64, c_idx: i64, w_idx: i64, num_chars: i64, start_x: f64, base_y_off: f64, w_phase_off: f64, glyphs: ptr, char_base_x: f64, char_base_y: f64, wave_z: f64, lz: f64, off_x: f64, off_y: f64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64, ch_p: ptr, fg_p: ptr, bg_p: ptr):
+    store i8 ch_p, 35 ; '#'
+    store i32 fg_p, 5908640 ; (90, 40, 160) = 0x5A28A0
+    store i32 bg_p, 1641010 ; (25, 10, 50) = 0x190A32
+    br next_col(c, r, bits, layer, c_idx, w_idx, num_chars, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, lz, off_x, off_y, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x)
+  write_l0(c: i64, r: i64, bits: i64, layer: i64, c_idx: i64, w_idx: i64, num_chars: i64, start_x: f64, base_y_off: f64, w_phase_off: f64, glyphs: ptr, char_base_x: f64, char_base_y: f64, wave_z: f64, lz: f64, off_x: f64, off_y: f64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64, ch_p: ptr, fg_p: ptr, bg_p: ptr, px_f: f64):
+    %d_sw = fsub f64 px_f, sweep_x
+    %d_abs = fabs f64 %d_sw
+    %d_att = fmul f64 %d_abs, 0.18
+    %sh_raw = fsub f64 1.0, %d_att
+    %sh_neg = fcmp.olt f64 %sh_raw, 0.0
+    %shine = select f64 %sh_neg, 0.0, %sh_raw
+    %fr = sitofp f64 r
+    %gt = fmul f64 %fr, 0.25
+    %inv_gt = fsub f64 1.0, %gt
+    %is_w0 = icmp.eq i64 w_idx, 0
+    %cr_w0 = fmul f64 %gt, 255.0
+    %cg_w0_a = fmul f64 %inv_gt, 240.0
+    %cg_w0_b = fmul f64 %gt, 20.0
+    %cg_w0 = fadd f64 %cg_w0_a, %cg_w0_b
+    %cb_w0_a = fmul f64 %inv_gt, 255.0
+    %cb_w0_b = fmul f64 %gt, 160.0
+    %cb_w0 = fadd f64 %cb_w0_a, %cb_w0_b
+    
+    %cr_w1 = fconst f64 255.0
+    %cg_w1 = fmul f64 %inv_gt, 210.0
+    %cb_w1_a = fmul f64 %inv_gt, 40.0
+    %cb_w1_b = fmul f64 %gt, 180.0
+    %cb_w1 = fadd f64 %cb_w1_a, %cb_w1_b
+    
+    %cr_base = select f64 %is_w0, %cr_w0, %cr_w1
+    %cg_base = select f64 %is_w0, %cg_w0, %cg_w1
+    %cb_base = select f64 %is_w0, %cb_w0, %cb_w1
+    %inv_sh = fsub f64 1.0, %shine
+    %cr_sh0 = fmul f64 %cr_base, %inv_sh
+    %sh_255 = fmul f64 %shine, 255.0
+    %cr_final = fadd f64 %cr_sh0, %sh_255
+    %cg_sh0 = fmul f64 %cg_base, %inv_sh
+    %cg_final = fadd f64 %cg_sh0, %sh_255
+    %cb_sh0 = fmul f64 %cb_base, %inv_sh
+    %cb_final = fadd f64 %cb_sh0, %sh_255
+    %ir = fptosi i32 %cr_final
+    %ig = fptosi i32 %cg_final
+    %ib = fptosi i32 %cb_final
+    %sh_ir = shl i32 %ir, 16
+    %sh_ig = shl i32 %ig, 8
+    %pk_fg0 = or i32 %sh_ir, %sh_ig
+    %pk_fg = or i32 %pk_fg0, %ib
+    store i32 fg_p, %pk_fg
+    %br_f = fmul f64 %cr_final, 0.25
+    %bg_f = fmul f64 %cg_final, 0.25
+    %bb_f = fmul f64 %cb_final, 0.25
+    %ibr = fptosi i32 %br_f
+    %ibg = fptosi i32 %bg_f
+    %ibb = fptosi i32 %bb_f
+    %sh_ibr = shl i32 %ibr, 16
+    %sh_ibg = shl i32 %ibg, 8
+    %pk_bg0 = or i32 %sh_ibr, %sh_ibg
+    %pk_bg = or i32 %pk_bg0, %ibb
+    store i32 bg_p, %pk_bg
+    %is_hot = fcmp.ogt f64 %shine, 0.6
+    %ch_f = select i8 %is_hot, 64, 35
+    store i8 ch_p, %ch_f
+    br next_col(c, r, bits, layer, c_idx, w_idx, num_chars, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, lz, off_x, off_y, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x)
+  next_col(c: i64, r: i64, bits: i64, layer: i64, c_idx: i64, w_idx: i64, num_chars: i64, start_x: f64, base_y_off: f64, w_phase_off: f64, glyphs: ptr, char_base_x: f64, char_base_y: f64, wave_z: f64, lz: f64, off_x: f64, off_y: f64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64):
+    %c2 = add i64 c, 1
+    br col_loop(%c2, r, bits, layer, c_idx, w_idx, num_chars, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, lz, off_x, off_y, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x)
+  next_row(r: i64, layer: i64, c_idx: i64, w_idx: i64, num_chars: i64, char_w: f64, start_x: f64, base_y_off: f64, w_phase_off: f64, glyphs: ptr, char_base_x: f64, char_base_y: f64, wave_z: f64, lz: f64, off_x: f64, off_y: f64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64):
+    %r2 = add i64 r, 1
+    br row_loop(%r2, layer, c_idx, w_idx, num_chars, char_w, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, lz, off_x, off_y, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x)
+  next_layer(layer: i64, c_idx: i64, w_idx: i64, num_chars: i64, char_w: f64, start_x: f64, base_y_off: f64, w_phase_off: f64, glyphs: ptr, char_base_x: f64, char_base_y: f64, wave_z: f64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64):
+    %l_prev = sub i64 layer, 1
+    br layer_loop(%l_prev, c_idx, w_idx, num_chars, char_w, start_x, base_y_off, w_phase_off, glyphs, char_base_x, char_base_y, wave_z, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x)
+  next_char(c_idx: i64, w_idx: i64, num_chars: i64, char_w: f64, start_x: f64, base_y_off: f64, w_phase_off: f64, glyphs: ptr, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64):
+    %c_next = add i64 c_idx, 1
+    br char_loop(%c_next, w_idx, num_chars, char_w, start_x, base_y_off, w_phase_off, glyphs, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x)
+  word_done(w_idx: i64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64):
+    %is_w0 = icmp.eq i64 w_idx, 0
+    condbr %is_w0, start_word1(ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x), exit()
+  start_word1(ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, glyphs_nw: ptr, glyphs_lbz: ptr, cols: i64, rows: i64, t: f64, cx: f64, cy: f64, sweep_x: f64):
+    br word_prep(1, ch_buf, fg_buf, bg_buf, z_buf, glyphs_nw, glyphs_lbz, cols, rows, t, cx, cy, sweep_x)
+  exit():
+    ret
+}
+
+fn render_equalizer(ptr, ptr, ptr, i64, i64, f64) -> void {
+  entry(ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, cols: i64, rows: i64, t: f64):
+    ; Dominating constants auto-injected
+    %_dom_f_0_25 = fconst f64 0.25
+    %_dom_f_0_5 = fconst f64 0.5
+    %_dom_f_2_8 = fconst f64 2.8
+    %_dom_f_4_0 = fconst f64 4.0
+    %_dom_i64_0 = iconst i64 0
+    %_dom_i32_0 = iconst i32 0
+    %_dom_i8_0 = iconst i8 0
+    %_dom_i64_1 = iconst i64 1
+    %_dom_i32_1 = iconst i32 1
+    %_dom_i8_1 = iconst i8 1
+    %_dom_i64_2 = iconst i64 2
+    %_dom_i32_2 = iconst i32 2
+    %_dom_i8_2 = iconst i8 2
+    %_dom_i64_4 = iconst i64 4
+    %_dom_i32_4 = iconst i32 4
+    %_dom_i8_4 = iconst i8 4
+    %_dom_i64_32 = iconst i64 32
+    %_dom_i32_32 = iconst i32 32
+    %_dom_i8_32 = iconst i8 32
+    %_dom_i64_120 = iconst i64 120
+    %_dom_i32_120 = iconst i32 120
+    %_dom_i8_120 = iconst i8 120
+    %_dom_i64_124 = iconst i64 124
+    %_dom_i32_124 = iconst i32 124
+    %_dom_i8_124 = iconst i8 124
+    %_dom_i64_220 = iconst i64 220
+    %_dom_i32_220 = iconst i32 220
+    %_dom_i8_220 = iconst i8 220
+    %_dom_i64_255 = iconst i64 255
+    %_dom_i32_255 = iconst i32 255
+    %_dom_i8_255 = iconst i8 255
+    %_dom_i64_65400 = iconst i64 65400
+    %_dom_i32_65400 = iconst i32 65400
+    %_dom_i64_16770560 = iconst i64 16770560
+    %_dom_i32_16770560 = iconst i32 16770560
+    %eq_row = sub i64 rows, 2
+    %c_lim = sub i64 cols, 4
+    %is_wide = icmp.sgt i64 %c_lim, 32
+    %n_bands = select i64 %is_wide, 32, %c_lim
+    %tot_eq_w = mul i64 %n_bands, 2
+    %rem_w = sub i64 cols, %tot_eq_w
+    %start_eq_x = sdiv i64 %rem_w, 2
+    br eq_loop(0, n_bands, start_eq_x, eq_row, ch_buf, fg_buf, cols, rows, t)
+  eq_loop(b: i64, n_bands: i64, start_x: i64, eq_row: i64, ch_buf: ptr, fg_buf: ptr, cols: i64, rows: i64, t: f64):
+    %done = icmp.sge i64 b, n_bands
+    condbr %done, exit(), eq_body(b, n_bands, start_x, eq_row, ch_buf, fg_buf, cols, rows, t)
+  eq_body(b: i64, n_bands: i64, start_x: i64, eq_row: i64, ch_buf: ptr, fg_buf: ptr, cols: i64, rows: i64, t: f64):
+    %fb = sitofp f64 b
+    %fb_sc = fmul f64 %fb, 0.25
+    %t_4 = fmul f64 t, 4.0
+    %arg = fadd f64 %t_4, %fb_sc
+    %s_bt = call f64 sin(%arg)
+    %s_half = fmul f64 %s_bt, 0.5
+    %beat = fadd f64 %s_half, 0.5
+    %h_f = fmul f64 %beat, 2.8
+    %h = fptosi i64 %h_f
+    %b2 = mul i64 b, 2
+    %bx = add i64 start_x, %b2
+    br h_loop(0, h, bx, eq_row, b, n_bands, start_x, ch_buf, fg_buf, cols, rows, t)
+  h_loop(eh: i64, h: i64, bx: i64, eq_row: i64, b: i64, n_bands: i64, start_x: i64, ch_buf: ptr, fg_buf: ptr, cols: i64, rows: i64, t: f64):
+    %done_h = icmp.sge i64 eh, 2
+    condbr %done_h, next_b(b, n_bands, start_x, eq_row, ch_buf, fg_buf, cols, rows, t), h_check(eh, h, bx, eq_row, b, n_bands, start_x, ch_buf, fg_buf, cols, rows, t)
+  h_check(eh: i64, h: i64, bx: i64, eq_row: i64, b: i64, n_bands: i64, start_x: i64, ch_buf: ptr, fg_buf: ptr, cols: i64, rows: i64, t: f64):
+    %is_lit = icmp.sle i64 eh, h
+    condbr %is_lit, h_plot(eh, h, bx, eq_row, b, n_bands, start_x, ch_buf, fg_buf, cols, rows, t), next_h(eh, h, bx, eq_row, b, n_bands, start_x, ch_buf, fg_buf, cols, rows, t)
+  h_plot(eh: i64, h: i64, bx: i64, eq_row: i64, b: i64, n_bands: i64, start_x: i64, ch_buf: ptr, fg_buf: ptr, cols: i64, rows: i64, t: f64):
+    %sub_eh = sub i64 1, eh
+    %ey = add i64 eq_row, %sub_eh
+    %c_x0 = icmp.sge i64 bx, 0
+    %c_x1 = icmp.slt i64 bx, cols
+    %ok_x = and i1 %c_x0, %c_x1
+    %c_y0 = icmp.sge i64 %ey, 0
+    %c_y1 = icmp.slt i64 %ey, rows
+    %ok_y = and i1 %c_y0, %c_y1
+    %inside = and i1 %ok_x, %ok_y
+    condbr %inside, h_write(eh, h, bx, ey, eq_row, b, n_bands, start_x, ch_buf, fg_buf, cols, rows, t), next_h(eh, h, bx, eq_row, b, n_bands, start_x, ch_buf, fg_buf, cols, rows, t)
+  h_write(eh: i64, h: i64, bx: i64, ey: i64, eq_row: i64, b: i64, n_bands: i64, start_x: i64, ch_buf: ptr, fg_buf: ptr, cols: i64, rows: i64, t: f64):
+    %row_off = mul i64 ey, cols
+    %idx = add i64 %row_off, bx
+    %is_h0 = icmp.eq i64 eh, 0
+    %fg_col = select i32 %is_h0, 65400, 16770560 ; Green (0, 255, 120) = 65400 vs Gold/Yellow (255, 220, 0) = 16770560
+    %fg_p = gep i32 fg_buf, idx
+    store i32 %fg_p, %fg_col
+    %ch_p = gep i8 ch_buf, idx
+    store i8 %ch_p, 124 ; '|'
+    br next_h(eh, h, bx, eq_row, b, n_bands, start_x, ch_buf, fg_buf, cols, rows, t)
+  next_h(eh: i64, h: i64, bx: i64, eq_row: i64, b: i64, n_bands: i64, start_x: i64, ch_buf: ptr, fg_buf: ptr, cols: i64, rows: i64, t: f64):
+    %eh2 = add i64 eh, 1
+    br h_loop(%eh2, h, bx, eq_row, b, n_bands, start_x, ch_buf, fg_buf, cols, rows, t)
+  next_b(b: i64, n_bands: i64, start_x: i64, eq_row: i64, ch_buf: ptr, fg_buf: ptr, cols: i64, rows: i64, t: f64):
+    %b_next = add i64 b, 1
+    br eq_loop(%b_next, n_bands, start_x, eq_row, ch_buf, fg_buf, cols, rows, t)
+  exit():
+    ret
+}
+
+fn render_frame(ptr, ptr, ptr, ptr, i64, i64, i64, i64, f64) -> i64 {
+  entry(out_buf: ptr, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, cols: i64, rows: i64, gfx_rows: i64, frame_num: i64, t: f64):
+    ; Dominating constants auto-injected
+    %_dom_i64_0 = iconst i64 0
+    %_dom_i32_0 = iconst i32 0
+    %_dom_i8_0 = iconst i8 0
+    %_dom_i64_1 = iconst i64 1
+    %_dom_i32_1 = iconst i32 1
+    %_dom_i8_1 = iconst i8 1
+    %_dom_i64_2 = iconst i64 2
+    %_dom_i32_2 = iconst i32 2
+    %_dom_i8_2 = iconst i8 2
+    %_dom_i64_3 = iconst i64 3
+    %_dom_i32_3 = iconst i32 3
+    %_dom_i8_3 = iconst i8 3
+    %_dom_i64_4 = iconst i64 4
+    %_dom_i32_4 = iconst i32 4
+    %_dom_i8_4 = iconst i8 4
+    %_dom_i64_5 = iconst i64 5
+    %_dom_i32_5 = iconst i32 5
+    %_dom_i8_5 = iconst i8 5
+    %_dom_i64_6 = iconst i64 6
+    %_dom_i32_6 = iconst i32 6
+    %_dom_i8_6 = iconst i8 6
+    %_dom_i64_7 = iconst i64 7
+    %_dom_i32_7 = iconst i32 7
+    %_dom_i8_7 = iconst i8 7
+    %_dom_i64_9 = iconst i64 9
+    %_dom_i32_9 = iconst i32 9
+    %_dom_i8_9 = iconst i8 9
+    %_dom_i64_10 = iconst i64 10
+    %_dom_i32_10 = iconst i32 10
+    %_dom_i8_10 = iconst i8 10
+    %_dom_i64_11 = iconst i64 11
+    %_dom_i32_11 = iconst i32 11
+    %_dom_i8_11 = iconst i8 11
+    %_dom_i64_17 = iconst i64 17
+    %_dom_i32_17 = iconst i32 17
+    %_dom_i8_17 = iconst i8 17
+    %_dom_i64_19 = iconst i64 19
+    %_dom_i32_19 = iconst i32 19
+    %_dom_i8_19 = iconst i8 19
+    %_dom_i64_25 = iconst i64 25
+    %_dom_i32_25 = iconst i32 25
+    %_dom_i8_25 = iconst i8 25
+    %_dom_i64_27 = iconst i64 27
+    %_dom_i32_27 = iconst i32 27
+    %_dom_i8_27 = iconst i8 27
+    %_dom_i64_28 = iconst i64 28
+    %_dom_i32_28 = iconst i32 28
+    %_dom_i8_28 = iconst i8 28
+    %_dom_i64_31 = iconst i64 31
+    %_dom_i32_31 = iconst i32 31
+    %_dom_i8_31 = iconst i8 31
+    %_dom_i64_32 = iconst i64 32
+    %_dom_i32_32 = iconst i32 32
+    %_dom_i8_32 = iconst i8 32
+    %_dom_i64_43 = iconst i64 43
+    %_dom_i32_43 = iconst i32 43
+    %_dom_i8_43 = iconst i8 43
+    %_dom_i64_45 = iconst i64 45
+    %_dom_i32_45 = iconst i32 45
+    %_dom_i8_45 = iconst i8 45
+    %_dom_i64_48 = iconst i64 48
+    %_dom_i32_48 = iconst i32 48
+    %_dom_i8_48 = iconst i8 48
+    %_dom_i64_55 = iconst i64 55
+    %_dom_i32_55 = iconst i32 55
+    %_dom_i8_55 = iconst i8 55
+    %_dom_i64_61 = iconst i64 61
+    %_dom_i32_61 = iconst i32 61
+    %_dom_i8_61 = iconst i8 61
+    %_dom_i64_69 = iconst i64 69
+    %_dom_i32_69 = iconst i32 69
+    %_dom_i8_69 = iconst i8 69
+    %_dom_i64_70 = iconst i64 70
+    %_dom_i32_70 = iconst i32 70
+    %_dom_i8_70 = iconst i8 70
+    %_dom_i64_72 = iconst i64 72
+    %_dom_i32_72 = iconst i32 72
+    %_dom_i8_72 = iconst i8 72
+    %_dom_i64_91 = iconst i64 91
+    %_dom_i32_91 = iconst i32 91
+    %_dom_i8_91 = iconst i8 91
+    %_dom_i64_109 = iconst i64 109
+    %_dom_i32_109 = iconst i32 109
+    %_dom_i8_109 = iconst i8 109
+    %_dom_i64_124 = iconst i64 124
+    %_dom_i32_124 = iconst i32 124
+    %_dom_i8_124 = iconst i8 124
+    %_dom_i64_61695 = iconst i64 61695
+    %_dom_i32_61695 = iconst i32 61695
+    %_dom_i64_329748 = iconst i64 329748
+    %_dom_i32_329748 = iconst i32 329748
+    %_dom_i64_12548351 = iconst i64 12548351
+    %_dom_i32_12548351 = iconst i32 12548351
+    %_dom_i64_16765480 = iconst i64 16765480
+    %_dom_i32_16765480 = iconst i32 16765480
+    %p0 = gep i8 out_buf, 0
+    store i8 %p0, 27
+    %p1 = gep i8 out_buf, 1
+    store i8 %p1, 91
+    %p2 = gep i8 out_buf, 2
+    store i8 %p2, 72
+    %o_col1 = call i64 put_color(out_buf, 3, 61695, 0)
+    %o_col2 = call i64 put_color(out_buf, %o_col1, 329748, 1)
+    %o_l1 = call i64 make_line(out_buf, %o_col2, 43, 61, 43, cols)
+    %title_p = dataptr 2 ; title_l
+    %dest_t = gep i8 out_buf, %o_col2
+    %dest_t3 = gep i8 %dest_t, 3
+    call void copy_bytes(%dest_t3, %title_p, 25)
+    %has_w = icmp.sge i64 cols, 70
+    condbr %has_w, ov_right(out_buf, %o_col2, cols, %o_l1, ch_buf, fg_buf, bg_buf, rows, gfx_rows, frame_num), cont_l2(out_buf, %o_l1, cols, ch_buf, fg_buf, bg_buf, rows, gfx_rows, frame_num)
+  ov_right(out_buf: ptr, base_line1: i64, cols: i64, o_l1: i64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, rows: i64, gfx_rows: i64, frame_num: i64):
+    %r_p = dataptr 3 ; title_r
+    %r_col = sub i64 cols, 31
+    %dest_r0 = gep i8 out_buf, base_line1
+    %dest_r = gep i8 %dest_r0, %r_col
+    call void copy_bytes(%dest_r, %r_p, 28)
+    br cont_l2(out_buf, o_l1, cols, ch_buf, fg_buf, bg_buf, rows, gfx_rows, frame_num)
+  cont_l2(out_buf: ptr, o_l1: i64, cols: i64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, rows: i64, gfx_rows: i64, frame_num: i64):
+    %o_col3 = call i64 put_color(out_buf, o_l1, 12548351, 0)
+    %o_l2 = call i64 make_line(out_buf, %o_col3, 124, 32, 124, cols)
+    %sub_p = dataptr 4 ; sub_title
+    %dest_s0 = gep i8 out_buf, %o_col3
+    %dest_s = gep i8 %dest_s0, 2
+    %max_sub = sub i64 cols, 4
+    %c_sub_fit = icmp.sgt i64 %max_sub, 69
+    %sub_len = select i64 %c_sub_fit, 69, %max_sub
+    %sub_pos = icmp.sgt i64 %sub_len, 0
+    condbr %sub_pos, ov_sub(out_buf, %dest_s, %sub_p, %sub_len, %o_l2, cols, ch_buf, fg_buf, bg_buf, rows, gfx_rows, frame_num), cont_l3(out_buf, %o_l2, cols, ch_buf, fg_buf, bg_buf, rows, gfx_rows, frame_num)
+  ov_sub(out_buf: ptr, dest_s: ptr, sub_p: ptr, sub_len: i64, o_l2: i64, cols: i64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, rows: i64, gfx_rows: i64, frame_num: i64):
+    call void copy_bytes(dest_s, sub_p, sub_len)
+    br cont_l3(out_buf, o_l2, cols, ch_buf, fg_buf, bg_buf, rows, gfx_rows, frame_num)
+  cont_l3(out_buf: ptr, o_l2: i64, cols: i64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, rows: i64, gfx_rows: i64, frame_num: i64):
+    %o_col4 = call i64 put_color(out_buf, o_l2, 61695, 0)
+    %o_l3 = call i64 make_line(out_buf, %o_col4, 43, 45, 43, cols)
+    br canvas_prep(out_buf, %o_l3, ch_buf, fg_buf, bg_buf, cols, rows, gfx_rows, frame_num)
+  canvas_prep(out_buf: ptr, off: i64, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, cols: i64, rows: i64, gfx_rows: i64, frame_num: i64):
+    br canvas_row(0, off, -1, -1, out_buf, ch_buf, fg_buf, bg_buf, cols, rows, gfx_rows, frame_num)
+  canvas_row(py: i64, off: i64, last_fg: i32, last_bg: i32, out_buf: ptr, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, cols: i64, rows: i64, gfx_rows: i64, frame_num: i64):
+    %done_rows = icmp.sge i64 py, gfx_rows
+    condbr %done_rows, canvas_done(off, out_buf, cols, rows, gfx_rows, frame_num), canvas_col(0, py, off, last_fg, last_bg, out_buf, ch_buf, fg_buf, bg_buf, cols, rows, gfx_rows, frame_num)
+  canvas_col(px: i64, py: i64, off: i64, last_fg: i32, last_bg: i32, out_buf: ptr, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, cols: i64, rows: i64, gfx_rows: i64, frame_num: i64):
+    %done_cols = icmp.sge i64 px, cols
+    condbr %done_cols, next_canvas_row(py, off, last_fg, last_bg, out_buf, ch_buf, fg_buf, bg_buf, cols, rows, gfx_rows, frame_num), emit_cell(px, py, off, last_fg, last_bg, out_buf, ch_buf, fg_buf, bg_buf, cols, rows, gfx_rows, frame_num)
+  next_canvas_row(py: i64, off: i64, last_fg: i32, last_bg: i32, out_buf: ptr, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, cols: i64, rows: i64, gfx_rows: i64, frame_num: i64):
+    %p_nl = gep i8 out_buf, off
+    store i8 %p_nl, 10
+    %off2 = add i64 off, 1
+    %py2 = add i64 py, 1
+    br canvas_row(%py2, %off2, last_fg, last_bg, out_buf, ch_buf, fg_buf, bg_buf, cols, rows, gfx_rows, frame_num)
+  emit_cell(px: i64, py: i64, off: i64, last_fg: i32, last_bg: i32, out_buf: ptr, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, cols: i64, rows: i64, gfx_rows: i64, frame_num: i64):
+    %row_off = mul i64 py, cols
+    %idx = add i64 %row_off, px
+    %ch_p = gep i8 ch_buf, %idx
+    %ch = load i8, %ch_p
+    %fg_p = gep i32 fg_buf, %idx
+    %fg = load i32, %fg_p
+    %bg_p = gep i32 bg_buf, %idx
+    %bg = load i32, %bg_p
+    %diff_fg = icmp.ne i32 %fg, last_fg
+    condbr %diff_fg, update_fg(px, py, off, %fg, last_bg, out_buf, ch_buf, fg_buf, bg_buf, cols, rows, gfx_rows, frame_num, %bg, %ch), check_bg(px, py, off, last_fg, last_bg, out_buf, ch_buf, fg_buf, bg_buf, cols, rows, gfx_rows, frame_num, %bg, %ch)
+  update_fg(px: i64, py: i64, off: i64, new_fg: i32, last_bg: i32, out_buf: ptr, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, cols: i64, rows: i64, gfx_rows: i64, frame_num: i64, cur_bg: i32, ch: i8):
+    %o_fg = call i64 put_color(out_buf, off, new_fg, 0)
+    br check_bg(px, py, %o_fg, new_fg, last_bg, out_buf, ch_buf, fg_buf, bg_buf, cols, rows, gfx_rows, frame_num, cur_bg, ch)
+  check_bg(px: i64, py: i64, off: i64, cur_fg: i32, last_bg: i32, out_buf: ptr, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, cols: i64, rows: i64, gfx_rows: i64, frame_num: i64, cur_bg: i32, ch: i8):
+    %diff_bg = icmp.ne i32 cur_bg, last_bg
+    condbr %diff_bg, update_bg(px, py, off, cur_fg, cur_bg, out_buf, ch_buf, fg_buf, bg_buf, cols, rows, gfx_rows, frame_num, ch), put_char(px, py, off, cur_fg, last_bg, out_buf, ch_buf, fg_buf, bg_buf, cols, rows, gfx_rows, frame_num, ch)
+  update_bg(px: i64, py: i64, off: i64, cur_fg: i32, new_bg: i32, out_buf: ptr, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, cols: i64, rows: i64, gfx_rows: i64, frame_num: i64, ch: i8):
+    %o_bg = call i64 put_color(out_buf, off, new_bg, 1)
+    br put_char(px, py, %o_bg, cur_fg, new_bg, out_buf, ch_buf, fg_buf, bg_buf, cols, rows, gfx_rows, frame_num, ch)
+  put_char(px: i64, py: i64, off: i64, cur_fg: i32, cur_bg: i32, out_buf: ptr, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, cols: i64, rows: i64, gfx_rows: i64, frame_num: i64, ch: i8):
+    %cp = gep i8 out_buf, off
+    store i8 %cp, ch
+    %off_next = add i64 off, 1
+    %px2 = add i64 px, 1
+    br canvas_col(%px2, py, %off_next, cur_fg, cur_bg, out_buf, ch_buf, fg_buf, bg_buf, cols, rows, gfx_rows, frame_num)
+  canvas_done(off: i64, out_buf: ptr, cols: i64, rows: i64, gfx_rows: i64, frame_num: i64):
+    %o_bcol1 = call i64 put_color(out_buf, off, 61695, 0)
+    %o_bcol2 = call i64 put_color(out_buf, %o_bcol1, 329748, 1)
+    %o_b1 = call i64 make_line(out_buf, %o_bcol2, 43, 45, 43, cols)
+    %o_bcol3 = call i64 put_color(out_buf, %o_b1, 16765480, 0)
+    %o_b2 = call i64 make_line(out_buf, %o_bcol3, 124, 32, 124, cols)
+    %fl_p = dataptr 5 ; footer_l
+    %dest_fl0 = gep i8 out_buf, %o_bcol3
+    %dest_fl = gep i8 %dest_fl0, 2
+    call void copy_bytes(%dest_fl, %fl_p, 9)
+    %dest_num = gep i8 %dest_fl0, 11
+    %o_num = call i64 put_digits6(%dest_fl0, 11, frame_num)
+    %fr_p = dataptr 6 ; footer_r
+    %dest_fr = gep i8 %dest_fl0, 17
+    %max_fr = sub i64 cols, 19
+    %c_fr_fit = icmp.sgt i64 %max_fr, 55
+    %fr_len = select i64 %c_fr_fit, 55, %max_fr
+    %fr_pos = icmp.sgt i64 %fr_len, 0
+    condbr %fr_pos, ov_fr(out_buf, %dest_fr, %fr_p, %fr_len, %o_b2, cols), cont_b3(out_buf, %o_b2, cols)
+  ov_fr(out_buf: ptr, dest_fr: ptr, fr_p: ptr, fr_len: i64, o_b2: i64, cols: i64):
+    call void copy_bytes(dest_fr, fr_p, fr_len)
+    br cont_b3(out_buf, o_b2, cols)
+  cont_b3(out_buf: ptr, o_b2: i64, cols: i64):
+    %o_bcol4 = call i64 put_color(out_buf, o_b2, 61695, 0)
+    %o_b3 = call i64 make_line(out_buf, %o_bcol4, 43, 61, 43, cols)
+    %fbot_p = dataptr 7 ; footer_bot
+    %dest_fb0 = gep i8 out_buf, %o_bcol4
+    %dest_fb = gep i8 %dest_fb0, 3
+    %max_fb = sub i64 cols, 5
+    %c_fb_fit = icmp.sgt i64 %max_fb, 43
+    %fb_len = select i64 %c_fb_fit, 43, %max_fb
+    %fb_pos = icmp.sgt i64 %fb_len, 0
+    condbr %fb_pos, ov_fbot(out_buf, %dest_fb, %fbot_p, %fb_len, %o_b3), cont_final(out_buf, %o_b3)
+  ov_fbot(out_buf: ptr, dest_fb: ptr, fbot_p: ptr, fb_len: i64, o_b3: i64):
+    call void copy_bytes(dest_fb, fbot_p, fb_len)
+    br cont_final(out_buf, o_b3)
+  cont_final(out_buf: ptr, o_b3: i64):
+    %p_r0 = gep i8 out_buf, o_b3
+    store i8 %p_r0, 27
+    %o_r1 = add i64 o_b3, 1
+    %p_r1b = gep i8 out_buf, %o_r1
+    store i8 %p_r1b, 91
+    %o_r2 = add i64 %o_r1, 1
+    %p_r2b = gep i8 out_buf, %o_r2
+    store i8 %p_r2b, 48
+    %o_r3 = add i64 %o_r2, 1
+    %p_r3b = gep i8 out_buf, %o_r3
+    store i8 %p_r3b, 109
+    %final_len = add i64 %o_r3, 1
+    ret %final_len
+}
+
+fn main() -> i64 {
+  entry():
+    ; Dominating constants auto-injected
+    %_dom_f_0_045 = fconst f64 0.045
+    %_dom_i64_0 = iconst i64 0
+    %_dom_i32_0 = iconst i32 0
+    %_dom_i8_0 = iconst i8 0
+    %_dom_i64_1 = iconst i64 1
+    %_dom_i32_1 = iconst i32 1
+    %_dom_i8_1 = iconst i8 1
+    %_dom_i64_2 = iconst i64 2
+    %_dom_i32_2 = iconst i32 2
+    %_dom_i8_2 = iconst i8 2
+    %_dom_i64_3 = iconst i64 3
+    %_dom_i32_3 = iconst i32 3
+    %_dom_i8_3 = iconst i8 3
+    %_dom_i64_4 = iconst i64 4
+    %_dom_i32_4 = iconst i32 4
+    %_dom_i8_4 = iconst i8 4
+    %_dom_i64_5 = iconst i64 5
+    %_dom_i32_5 = iconst i32 5
+    %_dom_i8_5 = iconst i8 5
+    %_dom_i64_6 = iconst i64 6
+    %_dom_i32_6 = iconst i32 6
+    %_dom_i8_6 = iconst i8 6
+    %_dom_i64_7 = iconst i64 7
+    %_dom_i32_7 = iconst i32 7
+    %_dom_i8_7 = iconst i8 7
+    %_dom_i64_8 = iconst i64 8
+    %_dom_i32_8 = iconst i32 8
+    %_dom_i8_8 = iconst i8 8
+    %_dom_i64_9 = iconst i64 9
+    %_dom_i32_9 = iconst i32 9
+    %_dom_i8_9 = iconst i8 9
+    %_dom_i64_10 = iconst i64 10
+    %_dom_i32_10 = iconst i32 10
+    %_dom_i8_10 = iconst i8 10
+    %_dom_i64_16 = iconst i64 16
+    %_dom_i32_16 = iconst i32 16
+    %_dom_i8_16 = iconst i8 16
+    %_dom_i64_20 = iconst i64 20
+    %_dom_i32_20 = iconst i32 20
+    %_dom_i8_20 = iconst i8 20
+    %_dom_i64_24 = iconst i64 24
+    %_dom_i32_24 = iconst i32 24
+    %_dom_i8_24 = iconst i8 24
+    %_dom_i64_27 = iconst i64 27
+    %_dom_i32_27 = iconst i32 27
+    %_dom_i8_27 = iconst i8 27
+    %_dom_i64_40 = iconst i64 40
+    %_dom_i32_40 = iconst i32 40
+    %_dom_i8_40 = iconst i8 40
+    %_dom_i64_50 = iconst i64 50
+    %_dom_i32_50 = iconst i32 50
+    %_dom_i8_50 = iconst i8 50
+    %_dom_i64_53 = iconst i64 53
+    %_dom_i32_53 = iconst i32 53
+    %_dom_i8_53 = iconst i8 53
+    %_dom_i64_63 = iconst i64 63
+    %_dom_i32_63 = iconst i32 63
+    %_dom_i8_63 = iconst i8 63
+    %_dom_i64_74 = iconst i64 74
+    %_dom_i32_74 = iconst i32 74
+    %_dom_i8_74 = iconst i8 74
+    %_dom_i64_80 = iconst i64 80
+    %_dom_i32_80 = iconst i32 80
+    %_dom_i8_80 = iconst i8 80
+    %_dom_i64_91 = iconst i64 91
+    %_dom_i32_91 = iconst i32 91
+    %_dom_i8_91 = iconst i8 91
+    %_dom_i64_108 = iconst i64 108
+    %_dom_i32_108 = iconst i32 108
+    %_dom_i8_108 = iconst i8 108
+    %_dom_i64_300 = iconst i64 300
+    %_dom_i32_300 = iconst i32 300
+    %_dom_i64_1000 = iconst i64 1000
+    %_dom_i32_1000 = iconst i32 1000
+    %_dom_i64_25000 = iconst i64 25000
+    %_dom_i32_25000 = iconst i32 25000
+    %_dom_i64_8388608 = iconst i64 8388608
+    %_dom_i32_8388608 = iconst i32 8388608
+    %ws = call ptr malloc(8)
+    %rc = call i32 kc_winsize(1, %ws)
+    %row_p = gep i16 %ws, 0
+    %col_p = gep i16 %ws, 1
+    %raw_rows = load i16, %row_p
+    %raw_cols = load i16, %col_p
+    call void free(%ws)
+    %r64 = zext i64 %raw_rows
+    %c64 = zext i64 %raw_cols
+    %c_lo = icmp.slt i64 %c64, 40
+    %cols_1 = select i64 %c_lo, 80, %c64
+    %c_hi = icmp.sgt i64 %cols_1, 1000
+    %cols = select i64 %c_hi, 1000, %cols_1
+    %r_lo = icmp.slt i64 %r64, 20
+    %rows_1 = select i64 %r_lo, 24, %r64
+    %r_hi = icmp.sgt i64 %rows_1, 300
+    %rows = select i64 %r_hi, 300, %rows_1
+    %gfx_rows = sub i64 %rows, 6
+    %gfx_cells = mul i64 %cols, %gfx_rows
+    %out_buf = call ptr malloc(8388608)
+    %ch_buf = call ptr malloc(%gfx_cells)
+    %fg_bytes = mul i64 %gfx_cells, 4
+    %fg_buf = call ptr malloc(%fg_bytes)
+    %bg_buf = call ptr malloc(%fg_bytes)
+    %z_bytes = mul i64 %gfx_cells, 8
+    %z_buf = call ptr malloc(%z_bytes)
+    %init_buf = call ptr malloc(16)
+    %p_i0 = gep i8 %init_buf, 0
+    store i8 %p_i0, 27
+    %p_i1 = gep i8 %init_buf, 1
+    store i8 %p_i1, 91
+    %p_i2 = gep i8 %init_buf, 2
+    store i8 %p_i2, 50
+    %p_i3 = gep i8 %init_buf, 3
+    store i8 %p_i3, 74
+    %p_i4 = gep i8 %init_buf, 4
+    store i8 %p_i4, 27
+    %p_i5 = gep i8 %init_buf, 5
+    store i8 %p_i5, 91
+    %p_i6 = gep i8 %init_buf, 6
+    store i8 %p_i6, 63
+    %p_i7 = gep i8 %init_buf, 7
+    store i8 %p_i7, 50
+    %p_i8 = gep i8 %init_buf, 8
+    store i8 %p_i8, 53
+    %p_i9 = gep i8 %init_buf, 9
+    store i8 %p_i9, 108
+    %wi = call i64 write(1, %init_buf, 10)
+    call void free(%init_buf)
+    %g_nw = dataptr 0
+    %g_lbz = dataptr 1
+    br anim_loop(0, %out_buf, %ch_buf, %fg_buf, %bg_buf, %z_buf, %g_nw, %g_lbz, %cols, %rows, %gfx_rows)
+  anim_loop(frame: i64, out_buf: ptr, ch_buf: ptr, fg_buf: ptr, bg_buf: ptr, z_buf: ptr, g_nw: ptr, g_lbz: ptr, cols: i64, rows: i64, gfx_rows: i64):
+    %ff = sitofp f64 frame
+    %t = fmul f64 %ff, 0.045
+    call void render_background(ch_buf, fg_buf, bg_buf, z_buf, cols, gfx_rows, %t)
+    call void render_rings(ch_buf, fg_buf, bg_buf, z_buf, cols, gfx_rows, %t)
+    call void render_text(ch_buf, fg_buf, bg_buf, z_buf, g_nw, g_lbz, cols, gfx_rows, %t)
+    call void render_equalizer(ch_buf, fg_buf, bg_buf, cols, gfx_rows, %t)
+    %frame_len = call i64 render_frame(out_buf, ch_buf, fg_buf, bg_buf, cols, rows, gfx_rows, frame, %t)
+    %w = call i64 write(1, out_buf, %frame_len)
+    %us = call i32 usleep(25000) ; 40 FPS silky smooth
+    %next_frame = add i64 frame, 1
+    br anim_loop(%next_frame, out_buf, ch_buf, fg_buf, bg_buf, z_buf, g_nw, g_lbz, cols, rows, gfx_rows)
+}

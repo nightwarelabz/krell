@@ -68,6 +68,7 @@ enum {
     OP_VLOAD, OP_VSTORE, OP_VEXTRACT, OP_VINSERT,
     OP_ALOAD, OP_ASTORE, OP_AADD,
     OP_BR, OP_CONDBR, OP_RET, OP_CALL, OP_TAILCALL, OP_SELECT, OP_ASSUME,
+    OP_VLSHR,   /* appended: existing opcode numbers are binary-format */
     OP_COUNT
 };
 /* icmp predicates */
@@ -169,6 +170,7 @@ Instr   ins_ret(int v);          /* v = -1 for void */
 Instr   ins_call(Type ret, int callee, bool ext, int32_t *args, int n, bool tail);
 int32_t *ids_dup(const int32_t *src, int n);
 Type     func_value_type(Func *f, int32_t v);
+void     func_rebuild_constants(Func *f);
 
 /* ---------------- binary format (binary.c) ---------------- */
 uint8_t *mod_encode(Module *m, size_t *out_len);

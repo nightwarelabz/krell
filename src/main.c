@@ -10,9 +10,127 @@
  *
  * A <module> is a binary module file, or a surface-syntax text file
  * (sniffed by content). Targets: x86_64, aarch64, riscv64, llvm. */
+#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE 1
+#define _DARWIN_C_SOURCE 1
 #include "krell.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <math.h>
+#include <sys/ioctl.h>
+
+/* Host externs for `krellc run`: the standard set the example
+ * programs link against when compiled ahead of time, provided
+ * by the interpreter's host table. Interpreter pointers are
+ * offsets into the flat interpreter memory (interp_mem). */
+static uint8_t *host_ptr(Interp *it, const IVal *v, size_t len, int *ok) {
+    size_t size; uint8_t *mem = interp_mem(it, &size);
+    uint64_t off = v->lanes[0];
+    if (off > size || len > size - (size_t)off) { *ok = 0; return NULL; }
+    *ok = 1; return mem + off;
+}
+
+/* The interpreter passes ret->lanes == NULL for void calls,
+ * so hosts must never write a result unconditionally. */
+static void ret_u64(IVal *ret, uint64_t v) { if (ret->lanes) ret->lanes[0] = v; }
+
+static uint64_t host_write(Interp *it, void *ctx, const IVal *args, int nargs, IVal *ret) {
+    (void)ctx; ret_u64(ret, (uint64_t)-1);
+    if (nargs < 3) return 0;
+    int ok; uint8_t *p = host_ptr(it, &args[1], (size_t)args[2].lanes[0], &ok);
+    if (!ok) return 0;
+    ret_u64(ret, (uint64_t)write((int)args[0].lanes[0], p, (size_t)args[2].lanes[0]));
+    return 0;
+}
+
+static uint64_t host_read(Interp *it, void *ctx, const IVal *args, int nargs, IVal *ret) {
+    (void)ctx; ret_u64(ret, (uint64_t)-1);
+    if (nargs < 3) return 0;
+    int ok; uint8_t *p = host_ptr(it, &args[1], (size_t)args[2].lanes[0], &ok);
+    if (!ok) return 0;
+    ret_u64(ret, (uint64_t)read((int)args[0].lanes[0], p, (size_t)args[2].lanes[0]));
+    return 0;
+}
+
+static uint64_t host_malloc(Interp *it, void *ctx, const IVal *args, int nargs, IVal *ret) {
+    (void)ctx;
+    ret_u64(ret, nargs >= 1 ? interp_alloc(it, (size_t)args[0].lanes[0], 16) : 0);
+    return 0;
+}
+
+static uint64_t host_free(Interp *it, void *ctx, const IVal *args, int nargs, IVal *ret) {
+    (void)it; (void)ctx; (void)args; (void)nargs;
+    ret_u64(ret, 0);   /* bump region: free is a no-op */
+    return 0;
+}
+
+static uint64_t host_atoi(Interp *it, void *ctx, const IVal *args, int nargs, IVal *ret) {
+    (void)ctx; ret_u64(ret, 0);
+    if (nargs < 1) return 0;
+    size_t size; uint8_t *mem = interp_mem(it, &size);
+    uint64_t off = args[0].lanes[0];
+    if (off >= size) return 0;
+    const char *s = (const char *)mem + off; size_t max = size - (size_t)off;
+    size_t i = 0; int neg = 0; long v = 0;
+    while (i < max && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n')) i++;
+    if (i < max && (s[i] == '-' || s[i] == '+')) { neg = s[i] == '-'; i++; }
+    while (i < max && s[i] >= '0' && s[i] <= '9') { v = v * 10 + (s[i] - '0'); i++; }
+    ret_u64(ret, (uint64_t)(neg ? -v : v));
+    return 0;
+}
+
+static double ival_f64(const IVal *v) { double d; memcpy(&d, &v->lanes[0], 8); return d; }
+static void ret_f64(IVal *ret, double d) { if (ret->lanes) memcpy(&ret->lanes[0], &d, 8); }
+
+static uint64_t host_sin(Interp *it, void *ctx, const IVal *args, int nargs, IVal *ret) {
+    (void)it; (void)ctx; ret_f64(ret, nargs >= 1 ? sin(ival_f64(&args[0])) : 0.0); return 0;
+}
+static uint64_t host_cos(Interp *it, void *ctx, const IVal *args, int nargs, IVal *ret) {
+    (void)it; (void)ctx; ret_f64(ret, nargs >= 1 ? cos(ival_f64(&args[0])) : 0.0); return 0;
+}
+static uint64_t host_sqrt(Interp *it, void *ctx, const IVal *args, int nargs, IVal *ret) {
+    (void)it; (void)ctx; ret_f64(ret, nargs >= 1 ? sqrt(ival_f64(&args[0])) : 0.0); return 0;
+}
+
+static uint64_t host_usleep(Interp *it, void *ctx, const IVal *args, int nargs, IVal *ret) {
+    (void)it; (void)ctx;
+    if (nargs >= 1) usleep((useconds_t)args[0].lanes[0]);
+    ret_u64(ret, 0);
+    return 0;
+}
+
+/* Same contract as the examples' kc_winsize shim: fill the
+ * winsize struct (row, col, xpixel, ypixel as u16s), seeded
+ * with 80x24 so a failed query leaves a sane default. */
+static uint64_t host_kc_winsize(Interp *it, void *ctx, const IVal *args, int nargs, IVal *ret) {
+    (void)ctx; ret_u64(ret, (uint64_t)-1);
+    if (nargs < 2) return 0;
+    int ok; uint8_t *p = host_ptr(it, &args[1], 8, &ok);
+    if (!ok) return 0;
+    struct winsize ws; memset(&ws, 0, sizeof ws);
+    ws.ws_row = 24; ws.ws_col = 80;
+    int rc = ioctl((int)args[0].lanes[0], TIOCGWINSZ, &ws);
+    if (ws.ws_row == 0 || ws.ws_col == 0) { ws.ws_row = 24; ws.ws_col = 80; }
+    uint16_t v[4] = { ws.ws_row, ws.ws_col, ws.ws_xpixel, ws.ws_ypixel };
+    memcpy(p, v, 8);
+    ret_u64(ret, (uint64_t)(int64_t)rc);
+    return 0;
+}
+
+static void register_std_hosts(Interp *it) {
+    interp_host(it, "write", host_write, NULL);
+    interp_host(it, "read", host_read, NULL);
+    interp_host(it, "malloc", host_malloc, NULL);
+    interp_host(it, "free", host_free, NULL);
+    interp_host(it, "atoi", host_atoi, NULL);
+    interp_host(it, "sin", host_sin, NULL);
+    interp_host(it, "cos", host_cos, NULL);
+    interp_host(it, "sqrt", host_sqrt, NULL);
+    interp_host(it, "usleep", host_usleep, NULL);
+    interp_host(it, "kc_winsize", host_kc_winsize, NULL);
+}
 
 static uint8_t *slurp(const char *path, size_t *len) {
     FILE *f = fopen(path, "rb");
@@ -108,6 +226,7 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "run") == 0) {
         if (argc < 4) { fprintf(stderr, "krellc: run needs a function name\n"); return 2; }
         Interp *it = interp_new(m);
+        register_std_hosts(it);
         int fi = mod_find_func(m, argv[3]);
         if (fi < 0) { fprintf(stderr, "krellc: no such function\n"); return 1; }
         Func *f = &m->funcs[fi];

@@ -50,13 +50,23 @@ typedef struct BeFunc {
 typedef struct {
     const PoolReg *gp;  int ngp;
     const PoolReg *fp;  int nfp;
-    /* vectors are memory-resident in v1 backends: no vector pool */
+    /* 1 if the backend's emission handles register-resident vector
+     * values (x86_64); 0 if vectors must be memory-resident, as the
+     * aarch64/riscv64 emitters assume -- they address every vector
+     * through its slot offset, and a register-assigned vector keeps
+     * offset 0, which made simultaneously live vectors collide on
+     * one address and corrupted the frame (both qemu batteries
+     * segfaulted on it once the allocator kept vectors in
+     * registers). With vec_regs == 0 the allocator classes every
+     * vector value BCLS_VEC and gives it a real slot. */
+    int vec_regs;
 } Pools;
 
 /* position of instruction ii in block bi */
 static inline int be_pos(const BeFunc *bf, int bi, int ii) { return bf->blkstart[bi] + 1 + ii; }
 
 BeFunc *be_analyze(Module *m, Func *f, const Pools *pools);
+BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folded);
 void    be_free(BeFunc *bf);
 int     be_class_of(Type t);
 /* byte offset (below frame ptr) for a stack Loc / vector value */

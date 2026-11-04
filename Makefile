@@ -21,6 +21,8 @@ tests: $(LIB)
 	/tmp/test-kernels
 	$(CC) $(CFLAGS) -Isrc -o /tmp/test-roundtrip tests/roundtrip.c tests/kernels.c -DKERNELS_NO_MAIN $(LIB) -lm
 	/tmp/test-roundtrip
+	$(CC) $(CFLAGS) -Isrc -o /tmp/test-surface tests/surface_test.c $(LIB) -lm
+	/tmp/test-surface
 
 clean:
 	rm -f $(OBJ) src/main.o $(LIB) krellc

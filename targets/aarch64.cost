@@ -64,6 +64,7 @@ op vfdiv.v lat 30 thr 12
 op vand.v lat 1 thr 1
 op vor.v lat 1 thr 1
 op vxor.v lat 1 thr 1
+op vlshr.v lat 1 thr 1
 op vload.v lat 4 thr 1
 op vstore.v lat 1 thr 1
 op vextract.i lat 2 thr 1

@@ -1,0 +1,524 @@
+; EPICYCLE, THE SOUND
+; The mare's outline, heard. The video's soundtrack is the
+; same Fourier series that draws her: every wheel of the
+; drawing whose frequency falls in the audible band becomes
+; a sine partial at 55 Hz times its frequency, with the gain
+; and phase of the phasor itself. The great wheel is the deep
+; root. The high wheels stay dim until the eye ignites at
+; 7.5 seconds, when their gains bloom. Nothing here is an
+; instrument; it is the symbol, transposed into air.
+;
+; 44100 Hz mono 16-bit PCM on stdout, exactly 12 seconds.
+; Host services: write, malloc, free.
+
+extern write(i32, ptr, i64) -> i64
+extern malloc(i64) -> ptr
+extern free(ptr) -> void
+
+fn clamp01(f64) -> f64 {
+  entry(v: f64):
+    %lo = fcmp.olt f64 v, 0.0
+    %a = select f64 %lo, 0.0, v
+    %hi = fcmp.ogt f64 %a, 1.0
+    %b = select f64 %hi, 1.0, %a
+    ret %b
+}
+
+fn sstep(f64) -> f64 {
+  entry(x: f64):
+    %a = fmul f64 x, x
+    %b = fma f64 -2.0, x, 3.0
+    %r = fmul f64 %a, %b
+    ret %r
+}
+
+fn ksin(f64) -> f64 {
+  entry(x: f64):
+    %x2 = fmul f64 x, x
+    %c0 = fma f64 0.0000027557319223985893, %x2, -0.00019841269841269842
+    %c1 = fma f64 %c0, %x2, 0.008333333333333334
+    %c2 = fma f64 %c1, %x2, -0.16666666666666666
+    %c3 = fma f64 %c2, %x2, 1.0
+    %r = fmul f64 %c3, x
+    ret %r
+}
+
+; The partial table: 48 wheels of the mare's spectrum.
+; inc = phase step per sample, gn = gain, bl = bloom class,
+; ph = starting phase, the phasor's own phase.
+fn init_parts(ptr, ptr, ptr, ptr) -> void {
+  entry(inc: ptr, gn: ptr, bl: ptr, ph: ptr):
+    %i0 = gep f64 inc, 0
+    store f64 %i0, 0.007836172151811276
+    %g0 = gep f64 gn, 0
+    store f64 %g0, 0.5546373607976961
+    %b0 = gep f64 bl, 0
+    store f64 %b0, 0
+    %p0 = gep f64 ph, 0
+    store f64 %p0, 1.3768981100338304
+    %i1 = gep f64 inc, 1
+    store f64 %i1, 0.015672344303622552
+    %g1 = gep f64 gn, 1
+    store f64 %g1, 0.046295625870317735
+    %b1 = gep f64 bl, 1
+    store f64 %b1, 0
+    %p1 = gep f64 ph, 1
+    store f64 %p1, 2.5306125081606821
+    %i2 = gep f64 inc, 2
+    store f64 %i2, 0.02350851645543383
+    %g2 = gep f64 gn, 2
+    store f64 %g2, 0.025468165163116532
+    %b2 = gep f64 bl, 2
+    store f64 %b2, 0
+    %p2 = gep f64 ph, 2
+    store f64 %p2, 2.2116186162131641
+    %i3 = gep f64 inc, 3
+    store f64 %i3, 0.031344688607245104
+    %g3 = gep f64 gn, 3
+    store f64 %g3, 0.019346294441262683
+    %b3 = gep f64 bl, 3
+    store f64 %b3, 0
+    %p3 = gep f64 ph, 3
+    store f64 %p3, -2.2603606433481929
+    %i4 = gep f64 inc, 4
+    store f64 %i4, 0.039180860759056378
+    %g4 = gep f64 gn, 4
+    store f64 %g4, 0.015465905935860176
+    %b4 = gep f64 bl, 4
+    store f64 %b4, 0
+    %p4 = gep f64 ph, 4
+    store f64 %p4, 0.12570082763527912
+    %i5 = gep f64 inc, 5
+    store f64 %i5, 0.054853205062678934
+    %g5 = gep f64 gn, 5
+    store f64 %g5, 0.012427327428602003
+    %b5 = gep f64 bl, 5
+    store f64 %b5, 1
+    %p5 = gep f64 ph, 5
+    store f64 %p5, -2.2187625311292805
+    %i6 = gep f64 inc, 6
+    store f64 %i6, 0.047017032910867659
+    %g6 = gep f64 gn, 6
+    store f64 %g6, 0.013251495935338009
+    %b6 = gep f64 bl, 6
+    store f64 %b6, 0
+    %p6 = gep f64 ph, 6
+    store f64 %p6, 1.7573198121145246
+    %i7 = gep f64 inc, 7
+    store f64 %i7, 0.10187023797354659
+    %g7 = gep f64 gn, 7
+    store f64 %g7, 0.0067264514125599034
+    %b7 = gep f64 bl, 7
+    store f64 %b7, 1
+    %p7 = gep f64 ph, 7
+    store f64 %p7, 2.7318686365790579
+    %i8 = gep f64 inc, 8
+    store f64 %i8, 0.062689377214490208
+    %g8 = gep f64 gn, 8
+    store f64 %g8, 0.0085042134015175241
+    %b8 = gep f64 bl, 8
+    store f64 %b8, 1
+    %p8 = gep f64 ph, 8
+    store f64 %p8, -2.2060179522664729
+    %i9 = gep f64 inc, 9
+    store f64 %i9, 0.070525549366301482
+    %g9 = gep f64 gn, 9
+    store f64 %g9, 0.007673210850987636
+    %b9 = gep f64 bl, 9
+    store f64 %b9, 1
+    %p9 = gep f64 ph, 9
+    store f64 %p9, 2.0227765461201335
+    %i10 = gep f64 inc, 10
+    store f64 %i10, 0.10970641012535787
+    %g10 = gep f64 gn, 10
+    store f64 %g10, 0.0058196774287529816
+    %b10 = gep f64 bl, 10
+    store f64 %b10, 1
+    %p10 = gep f64 ph, 10
+    store f64 %p10, 2.9154538459905188
+    %i11 = gep f64 inc, 11
+    store f64 %i11, 0.047017032910867659
+    %g11 = gep f64 gn, 11
+    store f64 %g11, 0.0088064429912861376
+    %b11 = gep f64 bl, 11
+    store f64 %b11, 0
+    %p11 = gep f64 ph, 11
+    store f64 %p11, 1.8501091617549394
+    %i12 = gep f64 inc, 12
+    store f64 %i12, 0.054853205062678934
+    %g12 = gep f64 gn, 12
+    store f64 %g12, 0.0076264718581671486
+    %b12 = gep f64 bl, 12
+    store f64 %b12, 1
+    %p12 = gep f64 ph, 12
+    store f64 %p12, -0.013815035049151839
+    %i13 = gep f64 inc, 13
+    store f64 %i13, 0.039180860759056378
+    %g13 = gep f64 gn, 13
+    store f64 %g13, 0.0088614364880387677
+    %b13 = gep f64 bl, 13
+    store f64 %b13, 0
+    %p13 = gep f64 ph, 13
+    store f64 %p13, -1.5776878103041716
+    %i14 = gep f64 inc, 14
+    store f64 %i14, 0.02350851645543383
+    %g14 = gep f64 gn, 14
+    store f64 %g14, 0.011037655232538324
+    %b14 = gep f64 bl, 14
+    store f64 %b14, 0
+    %p14 = gep f64 ph, 14
+    store f64 %p14, -2.4002890105479318
+    %i15 = gep f64 inc, 15
+    store f64 %i15, 0.062689377214490208
+    %g15 = gep f64 gn, 15
+    store f64 %g15, 0.0066924073464860196
+    %b15 = gep f64 bl, 15
+    store f64 %b15, 1
+    %p15 = gep f64 ph, 15
+    store f64 %p15, -0.27063921288820747
+    %i16 = gep f64 inc, 16
+    store f64 %i16, 0.015672344303622552
+    %g16 = gep f64 gn, 16
+    store f64 %g16, 0.013015147231701031
+    %b16 = gep f64 bl, 16
+    store f64 %b16, 0
+    %p16 = gep f64 ph, 16
+    store f64 %p16, 2.2502307619625395
+    %i17 = gep f64 inc, 17
+    store f64 %i17, 0.078361721518112756
+    %g17 = gep f64 gn, 17
+    store f64 %g17, 0.0057198417141260836
+    %b17 = gep f64 bl, 17
+    store f64 %b17, 1
+    %p17 = gep f64 ph, 17
+    store f64 %p17, -0.16966755204997733
+    %i18 = gep f64 inc, 18
+    store f64 %i18, 0.12537875442898042
+    %g18 = gep f64 gn, 18
+    store f64 %g18, 0.0042966272162050815
+    %b18 = gep f64 bl, 18
+    store f64 %b18, 1
+    %p18 = gep f64 ph, 18
+    store f64 %p18, 1.7416709965490762
+    %i19 = gep f64 inc, 19
+    store f64 %i19, 0.13321492658079168
+    %g19 = gep f64 gn, 19
+    store f64 %g19, 0.0041204067943965295
+    %b19 = gep f64 bl, 19
+    store f64 %b19, 1
+    %p19 = gep f64 ph, 19
+    store f64 %p19, 2.6694452437498115
+    %i20 = gep f64 inc, 20
+    store f64 %i20, 0.11754258227716914
+    %g20 = gep f64 gn, 20
+    store f64 %g20, 0.0040631337452057834
+    %b20 = gep f64 bl, 20
+    store f64 %b20, 1
+    %p20 = gep f64 ph, 20
+    store f64 %p20, 0.910903481108985
+    %i21 = gep f64 inc, 21
+    store f64 %i21, 0.007836172151811276
+    %g21 = gep f64 gn, 21
+    store f64 %g21, 0.015296272651958489
+    %b21 = gep f64 bl, 21
+    store f64 %b21, 0
+    %p21 = gep f64 ph, 21
+    store f64 %p21, -1.3369618130649674
+    %i22 = gep f64 inc, 22
+    store f64 %i22, 0.10970641012535787
+    %g22 = gep f64 gn, 22
+    store f64 %g22, 0.003780266024181465
+    %b22 = gep f64 bl, 22
+    store f64 %b22, 1
+    %p22 = gep f64 ph, 22
+    store f64 %p22, -1.5384499377849707
+    %i23 = gep f64 inc, 23
+    store f64 %i23, 0.070525549366301482
+    %g23 = gep f64 gn, 23
+    store f64 %g23, 0.0044245282601381658
+    %b23 = gep f64 bl, 23
+    store f64 %b23, 1
+    %p23 = gep f64 ph, 23
+    store f64 %p23, 2.2317995462307954
+    %i24 = gep f64 inc, 24
+    store f64 %i24, 0.094034065821735319
+    %g24 = gep f64 gn, 24
+    store f64 %g24, 0.0035257920907729658
+    %b24 = gep f64 bl, 24
+    store f64 %b24, 1
+    %p24 = gep f64 ph, 24
+    store f64 %p24, 1.1241916622316448
+    %i25 = gep f64 inc, 25
+    store f64 %i25, 0.17239578733984806
+    %g25 = gep f64 gn, 25
+    store f64 %g25, 0.0019206440499658145
+    %b25 = gep f64 bl, 25
+    store f64 %b25, 1
+    %p25 = gep f64 ph, 25
+    store f64 %p25, 0.037659104889036073
+    %i26 = gep f64 inc, 26
+    store f64 %i26, 0.18023195949165932
+    %g26 = gep f64 gn, 26
+    store f64 %g26, 0.0018595469903814716
+    %b26 = gep f64 bl, 26
+    store f64 %b26, 1
+    %p26 = gep f64 ph, 26
+    store f64 %p26, -0.53447254948505774
+    %i27 = gep f64 inc, 27
+    store f64 %i27, 0.13321492658079168
+    %g27 = gep f64 gn, 27
+    store f64 %g27, 0.0019402222795557669
+    %b27 = gep f64 bl, 27
+    store f64 %b27, 1
+    %p27 = gep f64 ph, 27
+    store f64 %p27, 2.8596556216252909
+    %i28 = gep f64 inc, 28
+    store f64 %i28, 0.11754258227716914
+    %g28 = gep f64 gn, 28
+    store f64 %g28, 0.0018078603116195762
+    %b28 = gep f64 bl, 28
+    store f64 %b28, 1
+    %p28 = gep f64 ph, 28
+    store f64 %p28, 1.6620236626205531
+    %i29 = gep f64 inc, 29
+    store f64 %i29, 0.15672344303622551
+    %g29 = gep f64 gn, 29
+    store f64 %g29, 0.0015582155086160839
+    %b29 = gep f64 bl, 29
+    store f64 %b29, 1
+    %p29 = gep f64 ph, 29
+    store f64 %p29, -1.3576894444672323
+    %i30 = gep f64 inc, 30
+    store f64 %i30, 0.031344688607245104
+    %g30 = gep f64 gn, 30
+    store f64 %g30, 0.0031001293523976229
+    %b30 = gep f64 bl, 30
+    store f64 %b30, 0
+    %p30 = gep f64 ph, 30
+    store f64 %p30, 1.4834424536227808
+    %i31 = gep f64 inc, 31
+    store f64 %i31, 0.16455961518803677
+    %g31 = gep f64 gn, 31
+    store f64 %g31, 0.0013478956454266327
+    %b31 = gep f64 bl, 31
+    store f64 %b31, 1
+    %p31 = gep f64 ph, 31
+    store f64 %p31, -0.9006722030089328
+    %i32 = gep f64 inc, 32
+    store f64 %i32, 0.14105109873260296
+    %g32 = gep f64 gn, 32
+    store f64 %g32, 0.0014548819578366972
+    %b32 = gep f64 bl, 32
+    store f64 %b32, 1
+    %p32 = gep f64 ph, 32
+    store f64 %p32, 1.8974525479562787
+    %i33 = gep f64 inc, 33
+    store f64 %i33, 0.14105109873260296
+    %g33 = gep f64 gn, 33
+    store f64 %g33, 0.0014382678878225019
+    %b33 = gep f64 bl, 33
+    store f64 %b33, 1
+    %p33 = gep f64 ph, 33
+    store f64 %p33, 2.6233366715284339
+    %i34 = gep f64 inc, 34
+    store f64 %i34, 0.18023195949165932
+    %g34 = gep f64 gn, 34
+    store f64 %g34, 0.001197518537251393
+    %b34 = gep f64 bl, 34
+    store f64 %b34, 1
+    %p34 = gep f64 ph, 34
+    store f64 %p34, 0.32168809456473979
+    %i35 = gep f64 inc, 35
+    store f64 %i35, 0.078361721518112756
+    %g35 = gep f64 gn, 35
+    store f64 %g35, 0.0017976546797788746
+    %b35 = gep f64 bl, 35
+    store f64 %b35, 1
+    %p35 = gep f64 ph, 35
+    store f64 %p35, -1.724247706616036
+    %i36 = gep f64 inc, 36
+    store f64 %i36, 0.086197893669924031
+    %g36 = gep f64 gn, 36
+    store f64 %g36, 0.0016611565893359175
+    %b36 = gep f64 bl, 36
+    store f64 %b36, 1
+    %p36 = gep f64 ph, 36
+    store f64 %p36, -0.49624032714762667
+    %i37 = gep f64 inc, 37
+    store f64 %i37, 0.15672344303622551
+    %g37 = gep f64 gn, 37
+    store f64 %g37, 0.0011913971228522499
+    %b37 = gep f64 bl, 37
+    store f64 %b37, 1
+    %p37 = gep f64 ph, 37
+    store f64 %p37, -2.3786627631412678
+    %i38 = gep f64 inc, 38
+    store f64 %i38, 0.18806813164347064
+    %g38 = gep f64 gn, 38
+    store f64 %g38, 0.0010663980902142229
+    %b38 = gep f64 bl, 38
+    store f64 %b38, 1
+    %p38 = gep f64 ph, 38
+    store f64 %p38, 1.5845913573638553
+    %i39 = gep f64 inc, 39
+    store f64 %i39, 0.10187023797354659
+    %g39 = gep f64 gn, 39
+    store f64 %g39, 0.0013880044276660104
+    %b39 = gep f64 bl, 39
+    store f64 %b39, 1
+    %p39 = gep f64 ph, 39
+    store f64 %p39, -2.123018022545109
+    %i40 = gep f64 inc, 40
+    store f64 %i40, 0.086197893669924031
+    %g40 = gep f64 gn, 40
+    store f64 %g40, 0.0014948870767491592
+    %b40 = gep f64 bl, 40
+    store f64 %b40, 1
+    %p40 = gep f64 ph, 40
+    store f64 %p40, -2.5551578132456489
+    %i41 = gep f64 inc, 41
+    store f64 %i41, 0.17239578733984806
+    %g41 = gep f64 gn, 41
+    store f64 %g41, 0.0010447832055796461
+    %b41 = gep f64 bl, 41
+    store f64 %b41, 1
+    %p41 = gep f64 ph, 41
+    store f64 %p41, -0.89877108842115894
+    %i42 = gep f64 inc, 42
+    store f64 %i42, 0.094034065821735319
+    %g42 = gep f64 gn, 42
+    store f64 %g42, 0.0014097091065832469
+    %b42 = gep f64 bl, 42
+    store f64 %b42, 1
+    %p42 = gep f64 ph, 42
+    store f64 %p42, -0.66165213539560719
+    %i43 = gep f64 inc, 43
+    store f64 %i43, 0.14888727088441422
+    %g43 = gep f64 gn, 43
+    store f64 %g43, 0.0011101100335064499
+    %b43 = gep f64 bl, 43
+    store f64 %b43, 1
+    %p43 = gep f64 ph, 43
+    store f64 %p43, -2.6962881931179852
+    %i44 = gep f64 inc, 44
+    store f64 %i44, 0.16455961518803677
+    %g44 = gep f64 gn, 44
+    store f64 %g44, 0.0010146041395669421
+    %b44 = gep f64 bl, 44
+    store f64 %b44, 1
+    %p44 = gep f64 ph, 44
+    store f64 %p44, 1.2577265259123129
+    %i45 = gep f64 inc, 45
+    store f64 %i45, 0.18806813164347064
+    %g45 = gep f64 gn, 45
+    store f64 %g45, 0.00079347262372261049
+    %b45 = gep f64 bl, 45
+    store f64 %b45, 1
+    %p45 = gep f64 ph, 45
+    store f64 %p45, -1.0416816023921645
+    %i46 = gep f64 inc, 46
+    store f64 %i46, 0.12537875442898042
+    %g46 = gep f64 gn, 46
+    store f64 %g46, 0.00089922008085177563
+    %b46 = gep f64 bl, 46
+    store f64 %b46, 1
+    %p46 = gep f64 ph, 46
+    store f64 %p46, -1.4223696831565971
+    %i47 = gep f64 inc, 47
+    store f64 %i47, 0.14888727088441422
+    %g47 = gep f64 gn, 47
+    store f64 %g47, 0.00062126199150592545
+    %b47 = gep f64 bl, 47
+    store f64 %b47, 1
+    %p47 = gep f64 ph, 47
+    store f64 %p47, 0.06239058386639508
+    ret
+}
+
+; One sample of the series: sum every partial, advance every
+; phase inside [-pi, pi].
+fn mix1(ptr, ptr, ptr, ptr, f64) -> f64 {
+  entry(ph: ptr, inc: ptr, gn: ptr, bl: ptr, bloom: f64):
+    %one = iconst i64 1
+    br loop(0, 0.0, ph, inc, gn, bl, bloom)
+  loop(j: i64, m: f64, ph: ptr, inc: ptr, gn: ptr, bl: ptr, bloom: f64):
+    %done = icmp.sge i64 j, 48
+    condbr %done, fin(%m), body(j, m, ph, inc, gn, bl, bloom)
+  body(j: i64, m: f64, ph: ptr, inc: ptr, gn: ptr, bl: ptr, bloom: f64):
+    %ap = gep f64 ph, j
+    %p = load f64, %ap
+    %s = call f64 ksin(%p)
+    %ag = gep f64 gn, j
+    %g = load f64, %ag
+    %ab = gep f64 bl, j
+    %b = load f64, %ab
+    %ge = fma f64 %bloom, %b, 1.0
+    %gg = fmul f64 %g, %ge
+    %m2 = fma f64 %gg, %s, m
+    %ai = gep f64 inc, j
+    %st = load f64, %ai
+    %pn = fadd f64 %p, %st
+    %over = fcmp.ogt f64 %pn, 3.141592653589793
+    %pw = fadd f64 %pn, -6.283185307179586
+    %pf = select f64 %over, %pw, %pn
+    store f64 %ap, %pf
+    %j2 = add i64 j, 1
+    br loop(%j2, %m2, ph, inc, gn, bl, bloom)
+  fin(m: f64):
+    ret %m
+}
+
+fn main(i32, ptr) -> i32 {
+  entry(argc: i32, argv: ptr):
+    %one = iconst i64 1
+    %z32 = iconst i32 0
+    %o32 = iconst i32 1
+    %inc = call ptr malloc(384)
+    %gn = call ptr malloc(384)
+    %bl = call ptr malloc(384)
+    %ph = call ptr malloc(384)
+    %buf = call ptr malloc(1058400)
+    %pb = bitcast i64 %inc
+    %ok = icmp.ne i64 %pb, 0
+    condbr %ok, run(%inc, %gn, %bl, %ph, %buf), fail()
+  run(inc: ptr, gn: ptr, bl: ptr, ph: ptr, buf: ptr):
+    call void init_parts(inc, gn, bl, ph)
+    br loop(0, inc, gn, bl, ph, buf)
+  loop(n: i64, inc: ptr, gn: ptr, bl: ptr, ph: ptr, buf: ptr):
+    %done = icmp.sge i64 n, 529200
+    condbr %done, fin(buf), body(n, inc, gn, bl, ph, buf)
+  body(n: i64, inc: ptr, gn: ptr, bl: ptr, ph: ptr, buf: ptr):
+    %fn = sitofp f64 n
+    %t = fmul f64 %fn, 0.000022675736961451247
+    %bl0 = fsub f64 %t, 7.5
+    %bl1 = fdiv f64 %bl0, 2.5
+    %bl2 = call f64 clamp01(%bl1)
+    %bloom = fmul f64 %bl2, 1.3
+    %m = call f64 mix1(ph, inc, gn, bl, %bloom)
+    %at0 = fdiv f64 %t, 1.5
+    %at1 = call f64 clamp01(%at0)
+    %atk = call f64 sstep(%at1)
+    %rl0 = fsub f64 12.0, %t
+    %rl1 = fdiv f64 %rl0, 2.5
+    %rel = call f64 clamp01(%rl1)
+    %env = fmul f64 %atk, %rel
+    %mm = fmul f64 %m, %env
+    %neg = fcmp.olt f64 %mm, 0.0
+    %abs = select f64 %neg, %mm, %mm
+    %abs2 = fsub f64 0.0, %abs
+    %mag = select f64 %neg, %abs2, %mm
+    %den = fadd f64 %mag, 1.0
+    %y = fdiv f64 %mm, %den
+    %sc = fmul f64 %y, 22000.0
+    %si = fptosi i32 %sc
+    %s16 = trunc i16 %si
+    %addr = gep i16 buf, n
+    store i16 %addr, %s16
+    %n2 = add i64 n, 1
+    br loop(%n2, inc, gn, bl, ph, buf)
+  fin(buf: ptr):
+    %wr = call i64 write(1, buf, 1058400)
+    ret 0
+  fail():
+    ret 1
+}

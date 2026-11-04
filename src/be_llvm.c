@@ -388,6 +388,7 @@ static void emit_instr(Ctx *c, Instr *in) {
     case OP_VAND: E(c, "  %s = and %s %s, %s", R, tb, ab, bb); break;
     case OP_VOR:  E(c, "  %s = or %s %s, %s", R, tb, ab, bb); break;
     case OP_VXOR: E(c, "  %s = xor %s %s, %s", R, tb, ab, bb); break;
+    case OP_VLSHR: E(c, "  %s = lshr %s %s, %s", R, tb, ab, bb); break;
     case OP_VEXTRACT: {
         char vb[48]; ty_str(c, f->vtypes[in->a], vb, sizeof vb);
         E(c, "  %s = extractelement %s %s, i64 %lld", R, vb, ab, (long long)in->imm);
@@ -517,7 +518,8 @@ static void emit_func(Ctx *c, int fi) {
         }
     /* signature */
     char rtb[48]; ty_str(c, f->ret, rtb, sizeof rtb);
-    fprintf(c->out, "define fastcc %s @%s(", rtb, f->name);
+    const char *cc = (strcmp(f->name, "main") == 0) ? "" : "fastcc ";
+    fprintf(c->out, "define %s%s @%s(", cc, rtb, f->name);
     if (f->nblocks > 0) {
         Block *b0 = &f->blocks[0];
         for (int i = 0; i < b0->nargs; i++) {
@@ -626,6 +628,19 @@ int be_llvm(Module *m, const Cost *cost, FILE *out, char *err, size_t errcap) {
         fprintf(out, "\", align %u\n", d->align ? d->align : 1);
     }
     for (int i = 0; i < m->nfuncs; i++) emit_func(&c, i);
+    /* external function declarations */
+    for (int i = 0; i < m->nexts; i++) {
+        Extern *ex = &m->exts[i];
+        char rty[48];
+        ty_str(&c, ex->ret, rty, sizeof rty);
+        fprintf(out, "declare %s @%s(", rty, ex->name);
+        for (int p = 0; p < ex->nparams; p++) {
+            char pty[48];
+            ty_str(&c, ex->params[p], pty, sizeof pty);
+            fprintf(out, "%s%s", p ? ", " : "", pty);
+        }
+        fprintf(out, ")\n");
+    }
     /* intrinsic declarations used */
     for (int w = 1; w < 65; w++) {
         if (c.need_ctpop[w]) E(&c, "declare i%d @llvm.ctpop.i%d(i%d)", w, w, w);

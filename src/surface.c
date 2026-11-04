@@ -40,8 +40,12 @@ typedef struct {
     char argarena[1 << 16];
     int argarena_len;
     /* queued function bodies, parsed after all shells exist */
-    struct { int fi; const char *start, *end; } bodies[256];
+    struct { int fi; const char *start, *end; } bodies[1024];
     int nbodies;
+    /* function signatures captured at shell (header) parse time, so a call
+       can be typed before the callee's body has been parsed (forward refs) */
+    Type fsig_params[1024][16];
+    int fsig_nparams[1024];
 } P;
 
 static void perr(P *p, const char *msg) {
@@ -227,8 +231,13 @@ static bool parse_instr(P *p, Func *f, int blk) {
     Type ty;
     /* terminators first */
     if (strcmp(w, "ret") == 0) {
-        skip_ws(p);
-        if (*p->p == '\n' || *p->p == '}' || *p->p == 0) { emit(f, blk, ins_ret(-1)); return true; }
+        /* a bare ret ends at the end of its line: skip blanks only.
+         * a newline-crossing skip would consume the next block's
+         * label as a would-be return value. a comment also closes
+         * the line, so it closes the ret as well. */
+        while (*p->p == ' ' || *p->p == '\t') p->p++;
+        if (*p->p == '\n' || *p->p == '\r' || *p->p == '}' || *p->p == 0 ||
+            *p->p == ';' || *p->p == '#') { emit(f, blk, ins_ret(-1)); return true; }
         /* value type: the function's return type */
         int v = parse_value(p, f, blk, f->ret);
         emit(f, blk, ins_ret(v));
@@ -250,12 +259,13 @@ static bool parse_instr(P *p, Func *f, int blk) {
         char l1[64], l2[64];
         if (!word(p, l1, sizeof l1)) return false;
         int t1 = block_find(p, l1);
+        if (t1 < 0) { perr(p, "condbr target"); return false; }
         int n1; int32_t *a1 = parse_branch_args(p, f, blk, &f->blocks[t1], &n1);
         if (!eat_ch(p, ',')) { perr(p, "condbr ,"); return false; }
         if (!word(p, l2, sizeof l2)) return false;
         int t2 = block_find(p, l2);
+        if (t2 < 0) { perr(p, "condbr target"); return false; }
         int n2; int32_t *a2 = parse_branch_args(p, f, blk, &f->blocks[t2], &n2);
-        if (t1 < 0 || t2 < 0) { perr(p, "condbr target"); return false; }
         emit(f, blk, ins_condbr(cond, t1, a1, n1, t2, a2, n2));
         return true;
     }
@@ -269,7 +279,7 @@ static bool parse_instr(P *p, Func *f, int blk) {
         /* args */
         const Type *ps; int np;
         if (ext) { ps = p->m->exts[ci].params; np = p->m->exts[ci].nparams; }
-        else { ps = p->m->funcs[ci].blocks[0].arg_types; np = p->m->funcs[ci].blocks[0].nargs; }
+        else { ps = p->fsig_params[ci]; np = p->fsig_nparams[ci]; }
         if (!eat_ch(p, '(')) { perr(p, "call ("); return false; }
         int32_t *args = NULL; int n = 0;
         skip_ws(p);
@@ -309,7 +319,7 @@ static bool parse_instr(P *p, Func *f, int blk) {
     case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FDIV:
     case OP_VADD: case OP_VSUB: case OP_VMUL: case OP_VUDIV:
     case OP_VFADD: case OP_VFSUB: case OP_VFMUL: case OP_VFDIV:
-    case OP_VAND: case OP_VOR: case OP_VXOR: {
+    case OP_VAND: case OP_VOR: case OP_VXOR: case OP_VLSHR: {
         if (!parse_type(p, &ty)) return false;
         int a = parse_value(p, f, blk, ty);
         if (!eat_ch(p, ',')) { perr(p, "expected ,"); return false; }
@@ -448,7 +458,7 @@ static bool parse_instr(P *p, Func *f, int blk) {
         if (ci < 0) { perr(p, "unknown callee"); return false; }
         const Type *ps; int np;
         if (ext) { ps = p->m->exts[ci].params; np = p->m->exts[ci].nparams; }
-        else { ps = p->m->funcs[ci].blocks[0].arg_types; np = p->m->funcs[ci].blocks[0].nargs; }
+        else { ps = p->fsig_params[ci]; np = p->fsig_nparams[ci]; }
         if (!eat_ch(p, '(')) { perr(p, "call ("); return false; }
         int32_t *args = NULL; int n = 0;
         skip_ws(p);
@@ -581,10 +591,11 @@ static bool parse_block_header(P *p, Func *f, const char *lbl) {
     char w[64];
     if (!word(p, w, sizeof w) || strcmp(w, lbl) != 0) { perr(p, "block label"); return false; }
     if (!eat_ch(p, '(')) { perr(p, "block ("); return false; }
-    Type atys[32]; char anames[32][64]; int na = 0;
+    Type atys[64]; char anames[64][64]; int na = 0;
     skip_ws(p);
     if (*p->p != ')') {
         for (;;) {
+            if (na >= 64) { perr(p, "too many block args"); return false; }
             if (!word(p, anames[na], sizeof anames[na])) { perr(p, "arg name"); return false; }
             if (!eat_ch(p, ':')) { perr(p, "arg :"); return false; }
             if (!parse_type(p, &atys[na])) return false;
@@ -656,11 +667,13 @@ static bool parse_fn_header(P *p) {
     char name[64];
     if (!word(p, name, sizeof name)) { perr(p, "fn name"); return false; }
     if (!eat_ch(p, '(')) { perr(p, "fn ("); return false; }
+    Type pts[16]; int npt = 0;
     skip_ws(p);
     if (*p->p != ')') {
         for (;;) {
             Type t;
             if (!parse_type(p, &t)) return false;
+            if (npt < 16) pts[npt++] = t;
             if (!eat_ch(p, ',')) break;
         }
     }
@@ -671,6 +684,10 @@ static bool parse_fn_header(P *p) {
     Func *f = mod_add_func(p->m, name, rt, 0);
     int fi = p->m->nfuncs - 1;
     (void)f;
+    if (fi < 1024) {
+        p->fsig_nparams[fi] = npt;
+        for (int i = 0; i < npt; i++) p->fsig_params[fi][i] = pts[i];
+    }
     /* body span: to the matching close brace */
     const char *start = p->p;
     const char *q = start;
@@ -682,7 +699,7 @@ static bool parse_fn_header(P *p) {
         q++;
     }
     if (depth != 0) { perr(p, "unterminated fn body"); return false; }
-    if (p->nbodies >= 256) { perr(p, "too many functions"); return false; }
+    if (p->nbodies >= 1024) { perr(p, "too many functions"); return false; }
     p->bodies[p->nbodies].fi = fi;
     p->bodies[p->nbodies].start = start;
     p->bodies[p->nbodies].end = q - 1;   /* the matching '}' */
