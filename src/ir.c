@@ -227,7 +227,7 @@ static uint64_t sext_u64(uint64_t v, int bits) {
     return ((v & mask_for(bits)) ^ m) - m;
 }
 
-static int emit_raw(Func *f, int blk, Instr in) {
+static int emit_at(Func *f, int blk, int pos, Instr in) {
     Block *b = &f->blocks[blk];
     if (b->nins == b->cap) {
         b->cap = b->cap ? b->cap * 2 : 16;
@@ -237,8 +237,26 @@ static int emit_raw(Func *f, int blk, Instr in) {
         func_reserve_value(f, in.ty);
         in.result = f->nvalues - 1;
     }
-    b->ins[b->nins++] = in;
+    if (pos < 0 || pos > b->nins) pos = b->nins;
+    memmove(&b->ins[pos + 1], &b->ins[pos], sizeof(Instr) * (size_t)(b->nins - pos));
+    b->ins[pos] = in;
+    b->nins++;
     return in.result;
+}
+
+static int emit_raw(Func *f, int blk, Instr in) { return emit_at(f, blk, -1, in); }
+
+/* v3: constants are function-scoped. A constant requested in any block is
+ * materialized in the entry block (inserted before its terminator if it
+ * already has one), which dominates every block in the function, so the
+ * single hash-consed definition is a legal use everywhere. This removes
+ * the v1/v2 trap in which a literal first materialized in a non-dominating
+ * branch block was reused for a sibling block and failed verification. */
+static int emit_entry_const(Func *f, Instr in) {
+    Block *b0 = &f->blocks[0];
+    int pos = b0->nins;
+    if (pos > 0 && op_is_terminator(b0->ins[pos - 1].op)) pos--;
+    return emit_at(f, 0, pos, in);
 }
 
 int emit(Func *f, int blk, Instr in) { return emit_pure(f, blk, in); }
@@ -247,6 +265,7 @@ int emit(Func *f, int blk, Instr in) { return emit_pure(f, blk, in); }
 typedef struct {
     Instr   key;      /* the pure instruction (result field ignored) */
     int32_t value;    /* value id it produced */
+    int32_t defblk;   /* block the value was defined in (v3: dominance-aware reuse) */
     int     used;
 } ConsEnt;
 
@@ -296,7 +315,18 @@ static int cons_find(Func *f, const Instr *in) {
     }
     return -1;
 }
-static void cons_put(Func *f, const Instr *in, int32_t value) {
+/* block in which the hash-consed value for `in` was defined, or -2 */
+static int cons_defblk(Func *f, const Instr *in) {
+    ConsTab *t = cons_tab(f);
+    uint64_t h = hash_ins(in);
+    for (int i = 0; i < t->cap; i++) {
+        ConsEnt *e = &t->e[(h + (uint64_t)i) & (uint64_t)(t->cap - 1)];
+        if (!e->used) return -2;
+        if (ins_eq(&e->key, in)) return e->defblk;
+    }
+    return -2;
+}
+static void cons_put(Func *f, const Instr *in, int32_t value, int32_t defblk) {
     ConsTab *t = cons_tab(f);
     if ((t->n + 1) * 2 >= t->cap) {
         ConsEnt *old = t->e; int ocap = t->cap;
@@ -316,8 +346,8 @@ static void cons_put(Func *f, const Instr *in, int32_t value) {
     uint64_t h = hash_ins(in);
     for (int i = 0; i < t->cap; i++) {
         ConsEnt *e = &t->e[(h + (uint64_t)i) & (uint64_t)(t->cap - 1)];
-        if (!e->used) { e->key = *in; e->value = value; e->used = 1; t->n++; return; }
-        if (ins_eq(&e->key, in)) { e->value = value; return; }
+        if (!e->used) { e->key = *in; e->value = value; e->defblk = defblk; e->used = 1; t->n++; return; }
+        if (ins_eq(&e->key, in)) { e->value = value; e->defblk = defblk; return; }
     }
 }
 
@@ -429,8 +459,26 @@ int emit_pure(Func *f, int blk, Instr in) {
     int folded = try_fold(f, blk, &in);
     if (folded >= 0) return folded;
     int found = cons_find(f, &in);
-    if (found >= 0) return found;
-    int r = emit_raw(f, blk, in);
+    if (found >= 0) {
+        /* Dominance-aware reuse (v3): a hash-consed value may only be
+         * reused where its definition dominates the use. The entry block
+         * dominates every block, and a definition earlier in the same
+         * block dominates by position. Any other hit (the classic case:
+         * first materialized in one arm of a branch, requested again in
+         * the sibling arm) must be re-emitted in the requesting block;
+         * for constants the re-emission is hoisted to the entry block
+         * below, after which the shared definition dominates all uses. */
+        int db = cons_defblk(f, &in);
+        if (db == blk || db == 0) return found;
+    }
+    int eblk = blk;
+    int r;
+    if ((in.op == OP_ICONST || in.op == OP_FCONST) && blk != 0 && f->nblocks > 0) {
+        r = emit_entry_const(f, in);
+        eblk = 0;
+    } else {
+        r = emit_raw(f, blk, in);
+    }
     if (r >= 0) {
         if (in.op == OP_ICONST) {
             Type t = in.ty;
@@ -440,7 +488,7 @@ int emit_pure(Func *f, int blk, Instr in) {
             f->isconst[r] = 1;
             f->cval[r] = (uint64_t)in.imm;
         }
-        cons_put(f, &in, r);
+        cons_put(f, &in, r, eblk);
     }
     return r;
 }

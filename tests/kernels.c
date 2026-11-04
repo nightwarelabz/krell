@@ -128,6 +128,44 @@ Module *build_kernels(void) {
     return m;
 }
 
+/* v3 regression builder: sib(i64 x) -> i64
+ *   b0(x): cond = x > 0; condbr b1(x) / b2(x)
+ *   b1(v): c = iconst 7; q = add x, x; r = add v, c; r = add r, q; br b3(r)
+ *   b2(v): c = iconst 7; q = add x, x; r = add v, c; r = add r, q; br b3(r)
+ *   b3(r): ret r
+ * The literal and the pure op are first materialized in b1 and requested
+ * again in the sibling block b2. Under the v1/v2 builder the hash-cons
+ * table returned b1's definitions for b2's requests and the module
+ * failed verification ("use not dominated by definition"). In v3 the
+ * constant is function-scoped (entry block) and non-constant pure ops
+ * are only reused where the definition dominates, so this verifies and
+ * computes x + 7 + 2x = 3x + 7 on both arms. */
+Module *build_sibtest(void) {
+    Module *m = mod_new();
+    Func *f = mod_add_func(m, "sib", ty_i64(), 0);
+    int b0 = func_add_block(f, (Type[]){ ty_i64() }, 1);
+    int b1 = func_add_block(f, (Type[]){ ty_i64() }, 1);
+    int b2 = func_add_block(f, (Type[]){ ty_i64() }, 1);
+    int b3 = func_add_block(f, (Type[]){ ty_i64() }, 1);
+    int x = f->blocks[b0].arg_vals[0];
+    int zero = emit(f, b0, ins_iconst(ty_i64(), 0));
+    Instr cmp = ins_make(OP_ICMP, ty_i1()); cmp.a = x; cmp.b = zero; cmp.pred = IC_SGT;
+    int cond = emit(f, b0, cmp);
+    emit(f, b0, ins_condbr(cond, b1, ids_dup((int32_t[]){ x }, 1), 1,
+                               b2, ids_dup((int32_t[]){ x }, 1), 1));
+    for (int k = 0; k < 2; k++) {
+        int bb = k == 0 ? b1 : b2;
+        int v = f->blocks[bb].arg_vals[0];
+        int c = emit(f, bb, ins_iconst(ty_i64(), 7));
+        int q = emit(f, bb, ins_bin(OP_ADD, ty_i64(), x, x));
+        int r = emit(f, bb, ins_bin(OP_ADD, ty_i64(), v, c));
+        r = emit(f, bb, ins_bin(OP_ADD, ty_i64(), r, q));
+        emit(f, bb, ins_br(b3, ids_dup((int32_t[]){ r }, 1), 1));
+    }
+    emit(f, b3, ins_ret(f->blocks[b3].arg_vals[0]));
+    return m;
+}
+
 /* ---------------- interpreter-side test ---------------- */
 #ifndef KERNELS_NO_MAIN
 static int failures = 0;
@@ -173,6 +211,27 @@ int main(void) {
 
     interp_free(it);
     mod_free(m);
+
+    /* v3: sibling-block literal / pure-op reuse must verify and run */
+    {
+        Module *sm = build_sibtest();
+        const char *se = mod_verify(sm);
+        CHECK(se == NULL, se ? se : "sibtest verifies");
+        if (se) printf("sibtest verify error: %s\n", se);
+        Interp *sit = interp_new(sm);
+        const int64_t xs[3] = { 5, -4, 0 };
+        for (int i = 0; i < 3; i++) {
+            IVal a = ival_make((uint64_t)xs[i]);
+            IVal rv; uint64_t rl[4]; rv.lanes = rl;
+            int src = interp_call(sit, "sib", &a, 1, &rv);
+            CHECK(src == 0, "sibtest interp run");
+            CHECK((int64_t)rv.lanes[0] == 3 * xs[i] + 7, "sibtest result is 3x+7");
+            free(a.lanes);
+        }
+        interp_free(sit);
+        mod_free(sm);
+    }
+
     if (!failures) printf("KERNELS_INTERP_OK\n");
     return failures ? 1 : 0;
 }
