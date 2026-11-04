@@ -668,12 +668,16 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
     /* vector values: stack-resident if not in register */
     {
         int unit = 0;
-        /* units counted after scalar slots are known: defer offset fixup */
+        /* units counted after scalar slots are known: defer offset fixup.
+         * Units are 16 bytes; a vector value occupies
+         * n * (pools->vec_bytes ? pools->vec_bytes : 16) bytes. */
+        int vunits = (pools->vec_bytes ? pools->vec_bytes : 16) / 16;
+        if (vunits < 1) vunits = 1;
         for (int v = 0; v < f->nvalues; v++)
             if (f->vtypes[v].kind == TY_VEC) {
                 if (!bf->loc[v].is_reg) {
                     bf->loc[v].is_reg = 0; bf->loc[v].cls = BCLS_VEC; bf->loc[v].idx = unit;
-                    unit += f->vtypes[v].n;
+                    unit += f->vtypes[v].n * vunits;
                 }
             }
         /* i128 values (v3.0): always memory-resident, one 16-byte unit
@@ -753,7 +757,20 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
         int allo_base = vec_base + vec_unit_total * 16;
         for (int v = 0; v < f->nvalues; v++) {
             if ((bf->loc[v].cls == BCLS_VEC || bf->loc[v].cls == BCLS_MEM128) && !bf->loc[v].is_reg) {
-                bf->vec_off[v] = vec_base + bf->loc[v].idx * 16;
+                /* Emitters address a vector value's bytes as
+                 * [base - (off - chunk)] for chunk in [0, bytes):
+                 * off is the distance from the frame base to the
+                 * value's LOWEST byte, so the value's own units sit
+                 * between its first unit and off. off = vec_base +
+                 * (first unit + own units) * 16 — for a 16-byte value
+                 * this is the historical (idx + 1) * 16; the old
+                 * idx * 16 form put every wider value's top chunk
+                 * across the frame base (WP21-B fix; n >= 2 slot
+                 * vectors at vl 4 were already corrupt the same way). */
+                int vunits = (pools->vec_bytes ? pools->vec_bytes : 16) / 16;
+                if (vunits < 1) vunits = 1;
+                int own = bf->loc[v].cls == BCLS_MEM128 ? 1 : f->vtypes[v].n * vunits;
+                bf->vec_off[v] = vec_base + (bf->loc[v].idx + own) * 16;
                 bf->loc[v].off = bf->vec_off[v];
             } else if (bf->vclass[v] >= 0 && !bf->loc[v].is_reg) {
                 if (bf->loc[v].idx >= 0) bf->loc[v].off = slot_base + bf->loc[v].idx * 8;

@@ -1206,7 +1206,7 @@ static int emit_func(Ctx *c, int fi) {
     Module *m = c->m;
     Func *f = &m->funcs[fi];
     c->f = f; c->fi = fi; c->lbl = 0;
-    Pools pools = { POOL_GP, 17, POOL_FP, 16, 0 };
+    Pools pools = { POOL_GP, 17, POOL_FP, 16, 0, 0 };
     BeFunc *bf = be_analyze(m, f, &pools);
     if (!bf) return -1;
     c->bf = bf;
