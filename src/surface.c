@@ -111,7 +111,7 @@ static bool parse_type(P *p, Type *t) {
     if (strcmp(w, "f64") == 0) { *t = ty_f64(); return true; }
     if (w[0] == 'i' && isdigit((uint8_t)w[1])) {
         int bits = atoi(w + 1);
-        if (bits < 1 || bits > 64) { perr(p, "bad int width"); return false; }
+        if (bits < 1 || bits > 128) { perr(p, "bad int width"); return false; }
         *t = ty_int(bits); return true;
     }
     if (w[0] == 'v') {   /* v<lanes><elem> e.g. v4i32, v2f64 */
@@ -309,7 +309,13 @@ static bool parse_instr(P *p, Func *f, int blk) {
     switch (op) {
     case OP_ICONST:
         if (!parse_type(p, &ty)) return false;
-        result = emit(f, blk, ins_iconst(ty, parse_int(p)));
+        if (ty.kind == TY_INT && ty.bits == 128) {
+            /* i128 surface form: iconst i128 <lo>[, <hi>] (two words) */
+            int64_t lo = parse_int(p);
+            int64_t hi = 0;
+            if (eat_ch(p, ',')) hi = parse_int(p);
+            result = emit(f, blk, ins_iconst128(lo, hi));
+        } else result = emit(f, blk, ins_iconst(ty, parse_int(p)));
         break;
     case OP_FCONST:
         if (!parse_type(p, &ty)) return false;

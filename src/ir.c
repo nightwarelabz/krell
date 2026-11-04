@@ -84,7 +84,7 @@ static void func_clear(Func *f) {
     }
     free(f->blocks); free(f->name);
     cons_free(f);
-    free(f->cval); free(f->isconst); free(f->vtypes);
+    free(f->cval); free(f->cval_hi); free(f->isconst); free(f->vtypes);
     memset(f, 0, sizeof *f);
 }
 
@@ -157,10 +157,12 @@ static void func_reserve_value(Func *f, Type t) {
         f->vcap = f->vcap ? f->vcap * 2 : 32;
         f->vtypes  = realloc(f->vtypes,  (size_t)f->vcap * sizeof(Type));
         f->cval    = realloc(f->cval,    (size_t)f->vcap * sizeof(uint64_t));
+        f->cval_hi = realloc(f->cval_hi, (size_t)f->vcap * sizeof(uint64_t));
         f->isconst = realloc(f->isconst, (size_t)f->vcap);
     }
     f->vtypes[f->nvalues] = t;
     f->cval[f->nvalues] = 0;
+    f->cval_hi[f->nvalues] = 0;
     f->isconst[f->nvalues] = 0;
     f->nvalues++;
 }
@@ -199,6 +201,7 @@ Instr ins_make(uint8_t op, Type ty) {
     return in;
 }
 Instr ins_iconst(Type ty, int64_t v) { Instr in = ins_make(OP_ICONST, ty); in.imm = v; return in; }
+Instr ins_iconst128(int64_t lo, int64_t hi) { Instr in = ins_make(OP_ICONST, ty_i128()); in.imm = lo; in.imm2 = hi; return in; }
 Instr ins_fconst(Type ty, uint64_t bits) { Instr in = ins_make(OP_FCONST, ty); in.imm = (int64_t)bits; return in; }
 Instr ins_bin(uint8_t op, Type ty, int a, int b) { Instr in = ins_make(op, ty); in.a = a; in.b = b; return in; }
 Instr ins_un(uint8_t op, Type ty, int a) { Instr in = ins_make(op, ty); in.a = a; return in; }
@@ -300,6 +303,7 @@ static uint64_t hash_ins(const Instr *in) {
     h = (h ^ (uint64_t)(uint32_t)in->b) * 1099511628211ull;
     h = (h ^ (uint64_t)(uint32_t)in->c) * 1099511628211ull;
     h = (h ^ (uint64_t)in->imm) * 1099511628211ull;
+    h = (h ^ (uint64_t)in->imm2) * 1099511628211ull;
     h = (h ^ (uint64_t)in->pred) * 1099511628211ull;
     h = (h ^ (uint64_t)in->aux) * 1099511628211ull;
     return h;
@@ -307,7 +311,7 @@ static uint64_t hash_ins(const Instr *in) {
 static bool ins_eq(const Instr *x, const Instr *y) {
     return x->op == y->op && ty_pack(x->ty) == ty_pack(y->ty) &&
            x->a == y->a && x->b == y->b && x->c == y->c &&
-           x->imm == y->imm && x->pred == y->pred && x->aux == y->aux;
+           x->imm == y->imm && x->imm2 == y->imm2 && x->pred == y->pred && x->aux == y->aux;
 }
 static ConsTab *cons_tab(Func *f) {
     if (!f->cons) {
@@ -377,6 +381,102 @@ static int try_fold(Func *f, int blk, Instr *in) {
     uint64_t av = ac ? f->cval[in->a] : 0, bv = bc ? f->cval[in->b] : 0;
 
     if (op == OP_SELECT && ac) return f->cval[in->a] ? in->b : in->c;
+
+    if (t.kind == TY_INT && t.bits == 128 && op != OP_ICONST) {
+        /* i128 constants live in (cval, cval_hi); fold on the full pair.
+         * Nothing below this block may see a 128-bit result: the generic
+         * folder tracks only the low word and would fold e.g. x + 2^64
+         * (low word 0) to x. */
+        unsigned __int128 A  = ((unsigned __int128)(ac ? f->cval_hi[in->a] : 0) << 64) | av;
+        unsigned __int128 Bv = ((unsigned __int128)(bc ? f->cval_hi[in->b] : 0) << 64) | bv;
+        #define K128(x) emit_pure(f, blk, ins_iconst128((int64_t)(uint64_t)(unsigned __int128)(x), (int64_t)(uint64_t)((unsigned __int128)(x) >> 64)))
+        if (bc) {
+            switch (op) {
+            case OP_ADD: case OP_OR: case OP_XOR: if (Bv == 0) return in->a; break;
+            case OP_SUB: if (Bv == 0) return in->a; if (in->a == in->b) return K128(0); break;
+            case OP_MUL: if (Bv == 0) return K128(0); if (Bv == 1) return in->a; break;
+            case OP_AND: if (Bv == 0) return K128(0); if (Bv == ~(unsigned __int128)0) return in->a; break;
+            case OP_SHL: case OP_LSHR: case OP_ASHR: if ((Bv % 128) == 0) return in->a; break;
+            default: break;
+            }
+        }
+        if (ac) {
+            switch (op) {
+            case OP_ADD: case OP_OR: case OP_XOR: if (A == 0) return in->b; break;
+            case OP_MUL: if (A == 0) return K128(0); if (A == 1) return in->b; break;
+            case OP_AND: if (A == 0) return K128(0); break;
+            default: break;
+            }
+        }
+        if (ac && bc) {
+            unsigned __int128 r = 0; bool ok = true;
+            switch (op) {
+            case OP_ADD: r = A + Bv; break;
+            case OP_SUB: r = A - Bv; break;
+            case OP_MUL: r = A * Bv; break;
+            case OP_AND: r = A & Bv; break;
+            case OP_OR:  r = A | Bv; break;
+            case OP_XOR: r = A ^ Bv; break;
+            case OP_UDIV: r = Bv ? A / Bv : 0; break;
+            case OP_UREM: r = Bv ? A % Bv : 0; break;
+            case OP_SDIV: case OP_SREM: {
+                if (Bv == 0) { r = 0; break; }
+                __int128 sa = (__int128)A, sb = (__int128)Bv;
+                unsigned __int128 ua = sa < 0 ? (unsigned __int128)0 - (unsigned __int128)A : A;
+                unsigned __int128 ub = sb < 0 ? (unsigned __int128)0 - (unsigned __int128)Bv : Bv;
+                unsigned __int128 q = (op == OP_SDIV) ? ua / ub : ua % ub;
+                bool neg = (op == OP_SDIV) ? ((sa < 0) != (sb < 0)) : (sa < 0);
+                r = neg ? (unsigned __int128)0 - q : q;
+                break;
+            }
+            case OP_SHL:  r = A << (unsigned)(Bv % 128); break;
+            case OP_LSHR: r = A >> (unsigned)(Bv % 128); break;
+            case OP_ASHR: r = (unsigned __int128)((__int128)A >> (unsigned)(Bv % 128)); break;
+            default: ok = false; break;
+            }
+            if (ok) return K128(r);
+        }
+        if (ac) {
+            switch (op) {
+            case OP_NEG: return K128((unsigned __int128)0 - A);
+            case OP_NOT: return K128(~A);
+            case OP_POPCOUNT: return emit_pure(f, blk, ins_iconst(t, __builtin_popcountll((unsigned long long)A) + __builtin_popcountll((unsigned long long)(A >> 64))));
+            case OP_CLZ: {
+                unsigned long long hi = (unsigned long long)(A >> 64), lo = (unsigned long long)A;
+                return emit_pure(f, blk, ins_iconst(t, hi ? __builtin_clzll(hi) : 64 + (lo ? __builtin_clzll(lo) : 64)));
+            }
+            case OP_CTZ: {
+                unsigned long long hi = (unsigned long long)(A >> 64), lo = (unsigned long long)A;
+                return emit_pure(f, blk, ins_iconst(t, lo ? __builtin_ctzll(lo) : 64 + (hi ? __builtin_ctzll(hi) : 64)));
+            }
+            case OP_BSWAP: return K128(((unsigned __int128)__builtin_bswap64((unsigned long long)A) << 64) | __builtin_bswap64((unsigned long long)(A >> 64)));
+            case OP_ZEXT: return K128((unsigned __int128)av);
+            case OP_SEXT: {
+                int sb = func_value_type(f, in->a).bits;
+                uint64_t lo = sext_u64(av, sb);
+                return K128(((unsigned __int128)(lo >> 63 ? ~0ull : 0) << 64) | lo);
+            }
+            default: break;
+            }
+        }
+        #undef K128
+        return -1;
+    }
+
+    if (op == OP_ICMP && ac && bc && func_value_type(f, in->a).bits == 128) {
+        unsigned __int128 A  = ((unsigned __int128)f->cval_hi[in->a] << 64) | av;
+        unsigned __int128 Bv = ((unsigned __int128)f->cval_hi[in->b] << 64) | bv;
+        __int128 sa = (__int128)A, sb = (__int128)Bv;
+        bool r = false;
+        switch (in->pred) {
+        case IC_EQ: r = A == Bv; break; case IC_NE: r = A != Bv; break;
+        case IC_ULT: r = A < Bv; break; case IC_ULE: r = A <= Bv; break;
+        case IC_UGT: r = A > Bv; break; case IC_UGE: r = A >= Bv; break;
+        case IC_SLT: r = sa < sb; break; case IC_SLE: r = sa <= sb; break;
+        case IC_SGT: r = sa > sb; break; case IC_SGE: r = sa >= sb; break;
+        }
+        return emit_pure(f, blk, ins_iconst(ty_i1(), r ? 1 : 0));
+    }
 
     if (t.kind == TY_INT && op != OP_ICONST) {
         int bits = t.bits;
@@ -501,6 +601,7 @@ int emit_pure(Func *f, int blk, Instr in) {
             Type t = in.ty;
             f->isconst[r] = 1;
             f->cval[r] = (uint64_t)in.imm & mask_for(t.bits);
+            f->cval_hi[r] = (uint64_t)in.imm2;
         } else if (in.op == OP_FCONST) {
             f->isconst[r] = 1;
             f->cval[r] = (uint64_t)in.imm;
@@ -520,6 +621,7 @@ void func_rebuild_constants(Func *f) {
             if (in->op == OP_ICONST && in->result >= 0 && in->result < f->nvalues) {
                 f->isconst[in->result] = 1;
                 f->cval[in->result] = (uint64_t)in->imm & mask_for(in->ty.bits);
+                f->cval_hi[in->result] = (uint64_t)in->imm2;
             } else if (in->op == OP_FCONST && in->result >= 0 && in->result < f->nvalues) {
                 f->isconst[in->result] = 1;
                 f->cval[in->result] = (uint64_t)in->imm;

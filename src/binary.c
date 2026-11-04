@@ -30,12 +30,43 @@ static void btype(Buf *b, Type t) {
 static void bname(Buf *b, const char *s) { size_t n = strlen(s); buleb(b, n); bputn(b, s, n); }
 static void bval(Buf *b, int32_t v) { buleb(b, (uint64_t)(v + 1)); }
 
+/* format version of the module currently being encoded/decoded:
+ * v2 differs from v1 only in the i128 iconst payload (16-byte
+ * little-endian) and, once indirect calls land, the signature section.
+ * Everything else is byte-identical, so a module that needs no v2
+ * feature encodes as v1 and stays readable by v2.x toolchains. */
+static int fmt_ver = 1;
+
+static bool ty_is_i128(Type t) { return t.kind == TY_INT && t.bits == 128; }
+static bool mod_needs_v2(Module *m) {
+    for (int i = 0; i < m->nexts; i++) {
+        for (int j = 0; j < m->exts[i].nparams; j++) if (ty_is_i128(m->exts[i].params[j])) return true;
+        if (ty_is_i128(m->exts[i].ret)) return true;
+    }
+    for (int i = 0; i < m->nfuncs; i++) {
+        Func *f = &m->funcs[i];
+        if (ty_is_i128(f->ret)) return true;
+        for (int j = 0; j < f->nvalues; j++) if (ty_is_i128(f->vtypes[j])) return true;
+        for (int bi = 0; bi < f->nblocks; bi++)
+            for (int ii = 0; ii < f->blocks[bi].nins; ii++)
+                if (ty_is_i128(f->blocks[bi].ins[ii].ety)) return true;
+    }
+    return false;
+}
+
 static void bins(Buf *b, const Instr *in) {
     bput(b, in->op);
     buleb(b, (uint64_t)(in->result + 1));
     btype(b, in->ty);
     int op = in->op;
-    if (op == OP_ICONST) { bsleb(b, in->imm); return; }
+    if (op == OP_ICONST) {
+        if (fmt_ver >= 2 && ty_is_i128(in->ty)) {
+            uint64_t lo = (uint64_t)in->imm, hi = (uint64_t)in->imm2;
+            for (int i = 0; i < 8; i++) bput(b, (uint8_t)(lo >> (8 * i)));
+            for (int i = 0; i < 8; i++) bput(b, (uint8_t)(hi >> (8 * i)));
+        } else bsleb(b, in->imm);
+        return;
+    }
     if (op == OP_FCONST) { buleb(b, (uint64_t)in->imm); return; }
     if (op == OP_BR) {
         buleb(b, (uint64_t)in->blk); buleb(b, in->nargs);
@@ -80,8 +111,9 @@ static void bins(Buf *b, const Instr *in) {
 
 uint8_t *mod_encode(Module *m, size_t *out_len) {
     Buf b = { 0 };
+    fmt_ver = mod_needs_v2(m) ? 2 : 1;
     bputn(&b, "KREL", 4);
-    bput(&b, 1); bput(&b, 0); /* version u16 LE */
+    bput(&b, (uint8_t)fmt_ver); bput(&b, 0); /* version u16 LE */
     /* section 2: externs */
     {
         Buf s = { 0 };
@@ -184,7 +216,15 @@ static void rins(Rd *r, Instr *in) {
     in->result = (int32_t)ruleb(r) - 1;
     in->ty = rtype(r);
     int op = in->op;
-    if (op == OP_ICONST) { in->imm = rsleb(r); return; }
+    if (op == OP_ICONST) {
+        if (fmt_ver >= 2 && ty_is_i128(in->ty)) {
+            uint64_t lo = 0, hi = 0;
+            for (int i = 0; i < 8; i++) lo |= (uint64_t)rbyte(r) << (8 * i);
+            for (int i = 0; i < 8; i++) hi |= (uint64_t)rbyte(r) << (8 * i);
+            in->imm = (int64_t)lo; in->imm2 = (int64_t)hi;
+        } else in->imm = rsleb(r);
+        return;
+    }
     if (op == OP_FCONST) { in->imm = (int64_t)ruleb(r); return; }
     if (op == OP_BR) {
         in->blk = (int32_t)ruleb(r); in->nargs = (uint16_t)ruleb(r);
@@ -237,8 +277,9 @@ static void reg_value(Func *f, int32_t id, Type t) {
         while (nc <= id) nc *= 2;
         f->vtypes  = realloc(f->vtypes,  (size_t)nc * sizeof(Type));
         f->cval    = realloc(f->cval,    (size_t)nc * sizeof(uint64_t));
+        f->cval_hi = realloc(f->cval_hi, (size_t)nc * sizeof(uint64_t));
         f->isconst = realloc(f->isconst, (size_t)nc);
-        for (int i = f->vcap; i < nc; i++) { f->cval[i] = 0; f->isconst[i] = 0; }
+        for (int i = f->vcap; i < nc; i++) { f->cval[i] = 0; f->cval_hi[i] = 0; f->isconst[i] = 0; }
         f->vcap = nc;
     }
     f->vtypes[id] = t;
@@ -250,7 +291,8 @@ Module *mod_decode(const uint8_t *buf, size_t len, char *err, size_t errcap) {
     if (len < 6 || memcmp(buf, "KREL", 4) != 0) { snprintf(err, errcap, "bad magic"); return NULL; }
     r.p += 4;
     int ver = rbyte(&r) | (rbyte(&r) << 8);
-    if (ver != 1) { snprintf(err, errcap, "bad version %d", ver); return NULL; }
+    if (ver != 1 && ver != 2) { snprintf(err, errcap, "bad version %d", ver); return NULL; }
+    fmt_ver = ver;
     Module *m = mod_new();
     while (r.p < r.end && !r.bad) {
         int id = rbyte(&r);
@@ -320,6 +362,10 @@ Module *mod_decode(const uint8_t *buf, size_t len, char *err, size_t errcap) {
                                 (in.ty.bits == 1 || in.ty.bits == 8 || in.ty.bits == 16 || in.ty.bits == 32 || in.ty.bits == 64)) {
                                 f->isconst[in.result] = 1;
                                 f->cval[in.result] = (uint64_t)in.imm & (in.ty.bits >= 64 ? ~0ull : ((1ull << in.ty.bits) - 1ull));
+                            } else if (in.op == OP_ICONST && ty_is_i128(in.ty)) {
+                                f->isconst[in.result] = 1;
+                                f->cval[in.result] = (uint64_t)in.imm;
+                                f->cval_hi[in.result] = (uint64_t)in.imm2;
                             } else if (in.op == OP_FCONST) {
                                 f->isconst[in.result] = 1;
                                 f->cval[in.result] = (uint64_t)in.imm;

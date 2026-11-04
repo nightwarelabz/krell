@@ -30,6 +30,7 @@ static inline Type ty_i8(void) { return ty_int(8); }
 static inline Type ty_i16(void) { return ty_int(16); }
 static inline Type ty_i32(void) { return ty_int(32); }
 static inline Type ty_i64(void) { return ty_int(64); }
+static inline Type ty_i128(void) { return ty_int(128); }
 static inline Type ty_f32(void) { Type t = { TY_FLOAT, 32, 0, 0, 0 }; return t; }
 static inline Type ty_f64(void) { Type t = { TY_FLOAT, 64, 0, 0, 0 }; return t; }
 static inline Type ty_ptr(void) { Type t = { TY_PTR, 64, 0, 0, 0 }; return t; }
@@ -95,6 +96,7 @@ typedef struct {
     Type     ty;          /* result type (TY_VOID if none) */
     int32_t  a, b, c;     /* value operands, -1 if unused */
     int64_t  imm;         /* iconst payload / fconst bits / size / lane / data idx */
+    int64_t  imm2;        /* iconst high half (i128 only; 0 otherwise) */
     uint8_t  pred;        /* icmp/fcmp predicate */
     uint8_t  aux;         /* atomic ordering, call flags */
     int32_t  result;      /* value id of result, -1 if none */
@@ -129,6 +131,7 @@ typedef struct Func {
     void *cons;
     /* integer/float constant tracking per value (bit patterns) */
     uint64_t *cval; uint8_t *isconst; int cvalcap;
+    uint64_t *cval_hi;    /* high half of an i128 constant (cval holds the low) */
     /* per-value type table */
     Type    *vtypes; int vcap;
 } Func;
@@ -167,6 +170,7 @@ int     emit(Func *f, int blk, Instr in);            /* returns result id or -1 
 int     emit_pure(Func *f, int blk, Instr in);       /* hash-consed + folded */
 /* convenience constructors */
 Instr   ins_iconst(Type ty, int64_t v);
+Instr   ins_iconst128(int64_t lo, int64_t hi);
 Instr   ins_fconst(Type ty, uint64_t bits);
 Instr   ins_bin(uint8_t op, Type ty, int a, int b);
 Instr   ins_un(uint8_t op, Type ty, int a);

@@ -21,6 +21,7 @@ struct Interp {
 };
 
 int ty_lanes(Type t, int vl_i32) {
+    if (t.kind == TY_INT && t.bits == 128) return 2;   /* i128 scalar: (lo, hi) lanes */
     if (t.kind != TY_VEC) return 1;
     int per = (vl_i32 * 32) / t.elem_bits;   /* lanes per vscale unit */
     return per * t.n;
@@ -75,6 +76,8 @@ static int ierr(Interp *it, const char *msg) { snprintf(it->err, sizeof it->err,
 
 /* ---------- scalar helpers ---------- */
 static uint64_t msk(int bits) { return bits >= 64 ? ~0ull : ((1ull << bits) - 1ull); }
+static unsigned __int128 val128(const uint64_t *L) { return ((unsigned __int128)L[1] << 64) | (unsigned __int128)L[0]; }
+static void put128(uint64_t *L, unsigned __int128 v) { L[0] = (uint64_t)v; L[1] = (uint64_t)(v >> 64); }
 static int64_t sx(uint64_t v, int bits) {
     if (bits >= 64) return (int64_t)v;
     uint64_t m = 1ull << (bits - 1);
@@ -157,21 +160,33 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
         uint64_t *C = in->c >= 0 ? fr->lanes[in->c] : NULL;
         Type ta = in->a >= 0 ? f->vtypes[in->a] : ty_void();
         switch (op) {
-        case OP_ICONST: R[0] = (uint64_t)in->imm & msk(in->ty.bits); break;
+        case OP_ICONST: R[0] = (uint64_t)in->imm & msk(in->ty.bits); if (in->ty.bits == 128) R[1] = (uint64_t)in->imm2; break;
         case OP_FCONST: R[0] = (uint64_t)in->imm; break;
         case OP_FREEZE: val_copy(f, fr, in->result, in->a); break;
-        case OP_ADD: R[0] = (A[0] + B[0]) & msk(in->ty.bits); break;
-        case OP_SUB: R[0] = (A[0] - B[0]) & msk(in->ty.bits); break;
-        case OP_MUL: R[0] = (A[0] * B[0]) & msk(in->ty.bits); break;
-        case OP_NEG: R[0] = (0 - A[0]) & msk(in->ty.bits); break;
-        case OP_AND: R[0] = A[0] & B[0]; break;
-        case OP_OR:  R[0] = A[0] | B[0]; break;
-        case OP_XOR: R[0] = A[0] ^ B[0]; break;
-        case OP_NOT: R[0] = ~A[0] & msk(in->ty.bits); break;
-        case OP_UDIV: R[0] = B[0] ? (A[0] / B[0]) & msk(in->ty.bits) : 0; break;
-        case OP_UREM: R[0] = B[0] ? (A[0] % B[0]) & msk(in->ty.bits) : 0; break;
+        case OP_ADD: if (in->ty.bits == 128) put128(R, val128(A) + val128(B)); else R[0] = (A[0] + B[0]) & msk(in->ty.bits); break;
+        case OP_SUB: if (in->ty.bits == 128) put128(R, val128(A) - val128(B)); else R[0] = (A[0] - B[0]) & msk(in->ty.bits); break;
+        case OP_MUL: if (in->ty.bits == 128) put128(R, val128(A) * val128(B)); else R[0] = (A[0] * B[0]) & msk(in->ty.bits); break;
+        case OP_NEG: if (in->ty.bits == 128) put128(R, (unsigned __int128)0 - val128(A)); else R[0] = (0 - A[0]) & msk(in->ty.bits); break;
+        case OP_AND: R[0] = A[0] & B[0]; if (in->ty.bits == 128) R[1] = A[1] & B[1]; break;
+        case OP_OR:  R[0] = A[0] | B[0]; if (in->ty.bits == 128) R[1] = A[1] | B[1]; break;
+        case OP_XOR: R[0] = A[0] ^ B[0]; if (in->ty.bits == 128) R[1] = A[1] ^ B[1]; break;
+        case OP_NOT: R[0] = ~A[0] & msk(in->ty.bits); if (in->ty.bits == 128) R[1] = ~A[1]; break;
+        case OP_UDIV: if (in->ty.bits == 128) { unsigned __int128 d = val128(B); put128(R, d ? val128(A) / d : 0); } else R[0] = B[0] ? (A[0] / B[0]) & msk(in->ty.bits) : 0; break;
+        case OP_UREM: if (in->ty.bits == 128) { unsigned __int128 d = val128(B); put128(R, d ? val128(A) % d : 0); } else R[0] = B[0] ? (A[0] % B[0]) & msk(in->ty.bits) : 0; break;
         case OP_SDIV: {
             int bits = in->ty.bits;
+            if (bits == 128) {
+                /* unsigned magnitudes: INT_MIN / -1 wraps, /0 yields 0 */
+                __int128 sa = (__int128)val128(A), sb = (__int128)val128(B);
+                unsigned __int128 r = 0;
+                if (sb != 0) {
+                    unsigned __int128 ua = sa < 0 ? (unsigned __int128)0 - val128(A) : val128(A);
+                    unsigned __int128 ub = sb < 0 ? (unsigned __int128)0 - val128(B) : val128(B);
+                    unsigned __int128 q = ua / ub;
+                    r = ((sa < 0) != (sb < 0)) ? (unsigned __int128)0 - q : q;
+                }
+                put128(R, r); break;
+            }
             int64_t sa = sx(A[0], bits), sb = sx(B[0], bits);
             int64_t r = 0;
             if (sb != 0) r = (sb == -1 && sa == (bits == 64 ? INT64_MIN : -(1ll << (bits - 1)))) ? sa : sa / sb;
@@ -179,19 +194,42 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
         }
         case OP_SREM: {
             int bits = in->ty.bits;
+            if (bits == 128) {
+                __int128 sa = (__int128)val128(A), sb = (__int128)val128(B);
+                unsigned __int128 r = 0;
+                if (sb != 0) {
+                    unsigned __int128 ua = sa < 0 ? (unsigned __int128)0 - val128(A) : val128(A);
+                    unsigned __int128 ub = sb < 0 ? (unsigned __int128)0 - val128(B) : val128(B);
+                    unsigned __int128 q = ua % ub;
+                    r = sa < 0 ? (unsigned __int128)0 - q : q;
+                }
+                put128(R, r); break;
+            }
             int64_t sa = sx(A[0], bits), sb = sx(B[0], bits);
             int64_t r = 0;
             if (sb != 0) r = (sb == -1 && sa == (bits == 64 ? INT64_MIN : -(1ll << (bits - 1)))) ? 0 : sa % sb;
             R[0] = (uint64_t)r & msk(bits); break;
         }
-        case OP_SHL: R[0] = (A[0] << (B[0] % (uint64_t)in->ty.bits)) & msk(in->ty.bits); break;
-        case OP_LSHR: R[0] = (A[0] & msk(in->ty.bits)) >> (B[0] % (uint64_t)in->ty.bits); break;
-        case OP_ASHR: R[0] = (uint64_t)(sx(A[0], in->ty.bits) >> (B[0] % (uint64_t)in->ty.bits)) & msk(in->ty.bits); break;
+        case OP_SHL: if (in->ty.bits == 128) put128(R, val128(A) << (unsigned)(val128(B) % 128)); else R[0] = (A[0] << (B[0] % (uint64_t)in->ty.bits)) & msk(in->ty.bits); break;
+        case OP_LSHR: if (in->ty.bits == 128) put128(R, val128(A) >> (unsigned)(val128(B) % 128)); else R[0] = (A[0] & msk(in->ty.bits)) >> (B[0] % (uint64_t)in->ty.bits); break;
+        case OP_ASHR: if (in->ty.bits == 128) put128(R, (unsigned __int128)((__int128)val128(A) >> (unsigned)(val128(B) % 128))); else R[0] = (uint64_t)(sx(A[0], in->ty.bits) >> (B[0] % (uint64_t)in->ty.bits)) & msk(in->ty.bits); break;
         case OP_ICMP: {
             int bits = ta.bits;
+            bool r = false;
+            if (bits == 128) {
+                unsigned __int128 ua = val128(A), ub = val128(B);
+                __int128 sa = (__int128)ua, sb = (__int128)ub;
+                switch (in->pred) {
+                case IC_EQ: r = ua == ub; break; case IC_NE: r = ua != ub; break;
+                case IC_ULT: r = ua < ub; break; case IC_ULE: r = ua <= ub; break;
+                case IC_UGT: r = ua > ub; break; case IC_UGE: r = ua >= ub; break;
+                case IC_SLT: r = sa < sb; break; case IC_SLE: r = sa <= sb; break;
+                case IC_SGT: r = sa > sb; break; case IC_SGE: r = sa >= sb; break;
+                }
+                R[0] = r ? 1 : 0; break;
+            }
             uint64_t ua = A[0] & msk(bits), ub = B[0] & msk(bits);
             int64_t sa = sx(ua, bits), sb = sx(ub, bits);
-            bool r = false;
             switch (in->pred) {
             case IC_EQ: r = ua == ub; break; case IC_NE: r = ua != ub; break;
             case IC_ULT: r = ua < ub; break; case IC_ULE: r = ua <= ub; break;
@@ -201,18 +239,24 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
             }
             R[0] = r ? 1 : 0; break;
         }
-        case OP_POPCOUNT: { int c = 0; uint64_t x = A[0] & msk(in->ty.bits); while (x) { x &= x - 1; c++; } R[0] = (uint64_t)c; break; }
-        case OP_CLZ: { int bits = in->ty.bits, c = 0; uint64_t x = A[0] & msk(bits);
-                       for (int i = bits - 1; i >= 0; i--) { if ((x >> i) & 1) break; c++; } R[0] = (uint64_t)c; break; }
-        case OP_CTZ: { int bits = in->ty.bits, c = 0; uint64_t x = A[0] & msk(bits);
-                       for (int i = 0; i < bits; i++) { if ((x >> i) & 1) break; c++; } R[0] = (uint64_t)c; break; }
+        case OP_POPCOUNT: { int c = 0; if (in->ty.bits == 128) { uint64_t x0 = A[0], x1 = A[1]; while (x0) { x0 &= x0 - 1; c++; } while (x1) { x1 &= x1 - 1; c++; } } else { uint64_t x = A[0] & msk(in->ty.bits); while (x) { x &= x - 1; c++; } } R[0] = (uint64_t)c; break; }
+        case OP_CLZ: { int bits = in->ty.bits, c = 0;
+                       if (bits == 128) { if (A[1]) { uint64_t x = A[1]; for (int i = 63; i >= 0; i--) { if ((x >> i) & 1) break; c++; } } else { c = 64; uint64_t x = A[0]; for (int i = 63; i >= 0; i--) { if ((x >> i) & 1) break; c++; } } }
+                       else { uint64_t x = A[0] & msk(bits); for (int i = bits - 1; i >= 0; i--) { if ((x >> i) & 1) break; c++; } } R[0] = (uint64_t)c; break; }
+        case OP_CTZ: { int bits = in->ty.bits, c = 0;
+                       if (bits == 128) { if (A[0]) { uint64_t x = A[0]; for (int i = 0; i < 64; i++) { if ((x >> i) & 1) break; c++; } } else { c = 64; uint64_t x = A[1]; for (int i = 0; i < 64; i++) { if ((x >> i) & 1) break; c++; } } }
+                       else { uint64_t x = A[0] & msk(bits); for (int i = 0; i < bits; i++) { if ((x >> i) & 1) break; c++; } } R[0] = (uint64_t)c; break; }
         case OP_BSWAP: {
+            if (in->ty.bits == 128) {
+                put128(R, ((unsigned __int128)__builtin_bswap64(A[0]) << 64) | (unsigned __int128)__builtin_bswap64(A[1]));
+                break;
+            }
             uint64_t x = A[0]; int n = in->ty.bits / 8; uint64_t r = 0;
             for (int i = 0; i < n; i++) r = (r << 8) | ((x >> (8 * i)) & 0xff);
             R[0] = r; break;
         }
-        case OP_TRUNC: case OP_ZEXT: R[0] = A[0] & msk(in->ty.bits); break;
-        case OP_SEXT: R[0] = (uint64_t)sx(A[0], ta.bits) & msk(in->ty.bits); break;
+        case OP_TRUNC: case OP_ZEXT: R[0] = A[0] & msk(in->ty.bits); if (in->ty.bits == 128) R[1] = 0; break;
+        case OP_SEXT: R[0] = (uint64_t)sx(A[0], ta.bits) & msk(in->ty.bits); if (in->ty.bits == 128) R[1] = sx(A[0], ta.bits) < 0 ? ~0ull : 0; break;
         case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FDIV: {
             if (in->ty.bits == 32) {
                 float x = as_f32(A[0]), y = as_f32(B[0]), r = 0;
@@ -313,6 +357,10 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
                     uint64_t v = 0; memcpy(&v, it->mem + addr + (size_t)i * eb, (size_t)eb);
                     R[i] = v;
                 }
+            } else if (n > 8) {
+                /* wide scalar (i128): copy lane-wise; a single u64
+                 * temporary would overflow (and did, latently) */
+                memcpy(R, it->mem + addr, n);
             } else {
                 uint64_t v = 0; memcpy(&v, it->mem + addr, n);
                 R[0] = in->ty.kind == TY_INT ? v & msk(in->ty.bits) : v;
@@ -323,8 +371,8 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
             uint64_t addr = A[0];
             size_t n = mem_ty_size(in->ty);
             if (addr + n > MEM_SIZE) return ierr(it, "interp: store out of range");
-            uint64_t v = B[0];
-            memcpy(it->mem + addr, &v, n);
+            if (n > 8) memcpy(it->mem + addr, B, n);
+            else { uint64_t v = B[0]; memcpy(it->mem + addr, &v, n); }
             break;
         }
         case OP_VLOAD: {

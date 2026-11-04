@@ -55,11 +55,13 @@ static int opt_new_value(Opt *o, Type t) {
         f->vcap = f->vcap ? f->vcap * 2 : 32;
         f->vtypes  = realloc(f->vtypes,  (size_t)f->vcap * sizeof(Type));
         f->cval    = realloc(f->cval,    (size_t)f->vcap * sizeof(uint64_t));
+        f->cval_hi = realloc(f->cval_hi, (size_t)f->vcap * sizeof(uint64_t));
         f->isconst = realloc(f->isconst, (size_t)f->vcap);
     }
     int v = f->nvalues++;
     f->vtypes[v] = t;
     f->cval[v] = 0;
+    f->cval_hi[v] = 0;
     f->isconst[v] = 0;
     opt_grow(o, v);
     return v;
@@ -2710,11 +2712,13 @@ static int lr_new_value(Func *f, Type t) {
         f->vcap = f->vcap ? f->vcap * 2 : 32;
         f->vtypes  = realloc(f->vtypes,  (size_t)f->vcap * sizeof(Type));
         f->cval    = realloc(f->cval,    (size_t)f->vcap * sizeof(uint64_t));
+        f->cval_hi = realloc(f->cval_hi, (size_t)f->vcap * sizeof(uint64_t));
         f->isconst = realloc(f->isconst, (size_t)f->vcap);
     }
     int v = f->nvalues++;
     f->vtypes[v] = t;
     f->cval[v] = 0;
+    f->cval_hi[v] = 0;
     f->isconst[v] = 0;
     return v;
 }

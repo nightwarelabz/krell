@@ -252,8 +252,81 @@ int main(void) {
             mod_free(fm);
         }
     }
-    /* binary round-trip */
+    /* i128 (v3.0): arithmetic with cross-word carries, shifts,
+     * signed/unsigned compares, and a memory round trip, in the
+     * interpreter (backends gate i128 until the lowering step).
+     * The module must encode as format v2, the main PROG as v1. */
+    {
+        static const char *W128 =
+        "fn add128(i128, i128) -> i128 {\n"
+        "  entry(a: i128, b: i128):\n"
+        "    %s = add i128 a, b\n"
+        "    ret %s\n"
+        "}\n"
+        "fn shl128(i128) -> i128 {\n"
+        "  entry(a: i128):\n"
+        "    %s = shl i128 a, 100\n"
+        "    ret %s\n"
+        "}\n"
+        "fn lt128(i128, i128) -> i1 {\n"
+        "  entry(a: i128, b: i128):\n"
+        "    %c = icmp.slt i128 a, b\n"
+        "    ret %c\n"
+        "}\n"
+        "fn mem128(ptr, i128) -> i128 {\n"
+        "  entry(p: ptr, v: i128):\n"
+        "    store i128 p, v\n"
+        "    %l = load i128, p\n"
+        "    %o = add i128 %l, 1\n"
+        "    ret %o\n"
+        "}\n";
+        Module *wm = surface_parse(W128, err, sizeof err);
+        if (!wm) { printf("FAIL w128 parse: %s\n", err); failures++; }
+        else {
+            const char *wve = mod_verify(wm);
+            if (wve) { printf("FAIL w128 verify: %s\n", wve); failures++; }
+            /* backend gate: no target accepts i128 yet */
+            const char *tg = mod_verify_target(wm, "x86_64");
+            if (!tg) { printf("FAIL w128 gate: x86_64 accepted i128\n"); failures++; }
+            size_t wl; uint8_t *wb = mod_encode(wm, &wl);
+            if (!wb || wb[4] != 2) { printf("FAIL w128: encoding version is not 2\n"); failures++; }
+            Module *wm2 = wb ? mod_decode(wb, wl, err, sizeof err) : NULL;
+            if (!wm2) { printf("FAIL w128 decode: %s\n", err); failures++; }
+            Interp *wit = interp_new(wm2 ? wm2 : wm);
+            uint64_t ab[2][2], rb[2];
+            IVal av[2], rv; av[0].lanes = ab[0]; av[1].lanes = ab[1]; rv.lanes = rb;
+            /* (2^64-1) + 1 = 2^64: lo 0, hi 1 (carry across the seam) */
+            ab[0][0] = ~0ull; ab[0][1] = 0; ab[1][0] = 1; ab[1][1] = 0; rb[0] = rb[1] = 0;
+            if (interp_call(wit, "add128", av, 2, &rv) != 0 || rb[0] != 0 || rb[1] != 1)
+                { printf("FAIL w128 add carry: got %llx:%llx want 1:0\n", (unsigned long long)rb[1], (unsigned long long)rb[0]); failures++; }
+            /* (2^64-1) * 2 via add of the value to itself: hi 1, lo 2^64-2 */
+            ab[1][0] = ~0ull; ab[1][1] = 0; rb[0] = rb[1] = 0;
+            if (interp_call(wit, "add128", av, 2, &rv) != 0 || rb[0] != ~0ull - 1 || rb[1] != 1)
+                { printf("FAIL w128 add2: got %llx:%llx\n", (unsigned long long)rb[1], (unsigned long long)rb[0]); failures++; }
+            /* 1 << 100 = hi 2^36, lo 0 */
+            ab[0][0] = 1; ab[0][1] = 0; rb[0] = rb[1] = 0;
+            if (interp_call(wit, "shl128", av, 1, &rv) != 0 || rb[0] != 0 || rb[1] != (1ull << 36))
+                { printf("FAIL w128 shl: got %llx:%llx\n", (unsigned long long)rb[1], (unsigned long long)rb[0]); failures++; }
+            /* signed: -1 < 1; the same bits unsigned-compare the other way
+             * is covered by the icmp fold tests in kernels; here slt only */
+            ab[0][0] = ~0ull; ab[0][1] = ~0ull; ab[1][0] = 1; ab[1][1] = 0; rb[0] = 0;
+            if (interp_call(wit, "lt128", av, 2, &rv) != 0 || rb[0] != 1)
+                { printf("FAIL w128 slt: got %llx want 1\n", (unsigned long long)rb[0]); failures++; }
+            /* memory round trip: store (5,7), load, add 1 -> (6,7) */
+            size_t msz; interp_mem(wit, &msz);
+            uint64_t cell = interp_alloc(wit, 16, 16);
+            ab[0][0] = cell; ab[0][1] = 0; ab[1][0] = 5; ab[1][1] = 7; rb[0] = rb[1] = 0;
+            if (interp_call(wit, "mem128", av, 2, &rv) != 0 || rb[0] != 6 || rb[1] != 7)
+                { printf("FAIL w128 mem: got %llx:%llx want 7:6\n", (unsigned long long)rb[1], (unsigned long long)rb[0]); failures++; }
+            interp_free(wit);
+            if (wm2) mod_free(wm2);
+            free(wb);
+            mod_free(wm);
+        }
+    }
+    /* binary round-trip (the main PROG uses no v2 feature: version 1) */
     size_t blen; uint8_t *bytes = mod_encode(m, &blen);
+    if (!bytes || bytes[4] != 1) { printf("FAIL: v1 module encoded as version %d\n", bytes ? bytes[4] : -1); failures++; }
     Module *m2 = mod_decode(bytes, blen, err, sizeof err);
     if (!m2) { printf("FAIL decode: %s\n", err); failures++; }
     else {

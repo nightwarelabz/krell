@@ -55,9 +55,11 @@ static const char *check_instr(Module *m, Func *f, Block *b, Instr *in, int idx)
     case OP_FTRUNC: NEED(in->ty.bits == 32 && VT(in->a).bits == 64, "ftrunc must be f64->f32"); break;
     case OP_FEXT:   NEED(in->ty.bits == 64 && VT(in->a).bits == 32, "fext must be f32->f64"); break;
     case OP_FPTOSI: case OP_FPTOUI:
-        NEED(ty_is_float(VT(in->a)) && ty_is_int(in->ty), "fptoi mismatch"); break;
+        NEED(ty_is_float(VT(in->a)) && ty_is_int(in->ty), "fptoi mismatch");
+        NEED(in->ty.bits != 128, "float-to-i128 conversion is not part of v3.0"); break;
     case OP_SITOFP: case OP_UITOFP:
-        NEED(ty_is_int(VT(in->a)) && ty_is_float(in->ty), "itofp mismatch"); break;
+        NEED(ty_is_int(VT(in->a)) && ty_is_float(in->ty), "itofp mismatch");
+        NEED(VT(in->a).bits != 128, "i128-to-float conversion is not part of v3.0"); break;
     case OP_BITCAST: {
         Type s = VT(in->a);
         int sb = s.kind == TY_VEC ? 0 : ty_bytes(s), db = in->ty.kind == TY_VEC ? 0 : ty_bytes(in->ty);
@@ -121,16 +123,19 @@ static const char *check_instr(Module *m, Func *f, Block *b, Instr *in, int idx)
         break;
     case OP_ALOAD:
         NEED(VT(in->a).kind == TY_PTR && ty_is_int(in->ty), "aload mismatch");
+        NEED(in->ty.bits <= 64, "atomic ops on i128 are not part of v3.0");
         NEED(in->aux == AO_RELAXED || in->aux == AO_ACQUIRE || in->aux == AO_ACQREL || in->aux == AO_SEQCST,
              "aload ordering must be relaxed, acquire, acqrel or seqcst");
         break;
     case OP_ASTORE:
         NEED(VT(in->a).kind == TY_PTR && ty_is_int(VT(in->b)), "astore mismatch");
+        NEED(VT(in->b).bits <= 64, "atomic ops on i128 are not part of v3.0");
         NEED(in->aux == AO_RELAXED || in->aux == AO_RELEASE || in->aux == AO_ACQREL || in->aux == AO_SEQCST,
              "astore ordering must be relaxed, release, acqrel or seqcst");
         break;
     case OP_AADD:
         NEED(VT(in->a).kind == TY_PTR && ty_is_int(VT(in->b)) && ty_is_int(in->ty), "aadd mismatch");
+        NEED(in->ty.bits <= 64, "atomic ops on i128 are not part of v3.0");
         NEED(in->aux <= AO_RELEASE, "atomic ordering out of range");
         break;
     case OP_ACMPXCHG:
@@ -208,6 +213,15 @@ const char *mod_verify(Module *m) {
     for (int fi = 0; fi < m->nfuncs; fi++) {
         Func *f = &m->funcs[fi];
         if (f->nblocks == 0) return failf("verifier: function %s has no blocks", f->name, 0);
+        /* type legality for every value in the function */
+        for (int vi = 0; vi < f->nvalues; vi++) {
+            Type vt = f->vtypes[vi];
+            if (vt.kind == TY_INT &&
+                !(vt.bits == 1 || vt.bits == 8 || vt.bits == 16 || vt.bits == 32 || vt.bits == 64 || vt.bits == 128))
+                return fail("verifier: integer width must be 1, 8, 16, 32, 64 or 128");
+            if (vt.kind == TY_VEC && vt.elem_bits > 64)
+                return fail("verifier: vector element width must be at most 64 (no i128 elements)");
+        }
         /* definition map: value -> (block, position) ; position -1 = block arg */
         int nv = f->nvalues;
         int *defblk = malloc(sizeof(int) * (size_t)nv);
@@ -313,6 +327,14 @@ const char *mod_verify_target(Module *m, const char *target) {
     if (!c) return fail("verifier: cost file for target not found");
     for (int fi = 0; fi < m->nfuncs; fi++) {
         Func *f = &m->funcs[fi];
+        /* v3.0 step 5 gate: i128 semantics, encoding and the interpreter
+         * exist, but no backend lowers it yet, so every target rejects
+         * i128 modules uniformly. The next step replaces this blanket
+         * rejection with per-op cost rows (admitted ops priced, division
+         * and remainder cliff-gated). */
+        for (int vi = 0; vi < f->nvalues; vi++)
+            if (f->vtypes[vi].kind == TY_INT && f->vtypes[vi].bits == 128)
+                { cost_free(c); return fail("verifier: i128 has no backend lowering yet (v3.0 gate)"); }
         for (int bi = 0; bi < f->nblocks; bi++) {
             Block *b = &f->blocks[bi];
             for (int ii = 0; ii < b->nins; ii++) {
