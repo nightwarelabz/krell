@@ -125,6 +125,8 @@ against 6,452,910 ns for C -O2 (the native fib row varies with
 bench-binary layout; the kernel's emitted code is unchanged
 since the WP15 record's 24.7 ns).
 
+![Krell v2.2 speed compared with other fast languages](brand/krell-v22-speed-vs-fast-languages.png)
+
 Per-kernel speedups (native / LLVM): saxpy 3.15× / 2.32×,
 copy 3.06× / 3.19×, bytesum 2.89× / 3.15×, fill32 2.01× / 1.94×,
 sumsq 2.01× / 1.79×, span 1.76× / 1.53×, histo 1.21× / 1.22×,
