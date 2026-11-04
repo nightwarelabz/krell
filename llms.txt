@@ -1,0 +1,26 @@
+# Krell
+
+> Krell is a machine-facing portable assembly: a program representation between assembly and C, designed for machines — not humans — to produce and consume. Typed SSA with block arguments, a hash-consed graph, scalable vectors only, a canonical binary encoding with SHA-256 identity, total / SMT-encodable semantics, a verifier with a no-cliff rule, an optimizer and bounded fragment superoptimizer, and backends for x86_64, AArch64, RISC-V 64, and LLVM. One program, written once, runs at native speed on every target. License: Apache-2.0 with the Krell Encoding Exception — Krell-encoded programs are not derivative works and carry no license obligations.
+
+Krell is built and maintained by NIGHTWARE LABZ. The differential battery passes 4,662 / 0 on the x86_64 and LLVM lanes. Measured against C (gcc -O2) on the twelve KRELLPROOF kernels, Krell is faster than C on both the native and LLVM lanes; the full record, methodology, and charts live in the krellproof repository.
+
+## Project
+
+- [Krell repository](https://github.com/nightwarelabz/krell): source, specification, examples, and releases
+- [Specification](https://github.com/nightwarelabz/krell/blob/main/docs/SPEC.md): language and binary-format specification
+- [Examples](https://github.com/nightwarelabz/krell/tree/main/examples): example Krell programs
+- [Releases](https://github.com/nightwarelabz/krell/releases): v1, v1.1, v2.0, v2.1, and v2.2
+
+## Related projects
+
+- [KRELLPROOF](https://github.com/nightwarelabz/krellproof): benchmark harness, C references, methodology, and recorded results
+- [K0](https://github.com/nightwarelabz/k0): a kernel written in pure Krell for x86_64 and AArch64
+- [Krellophone](https://github.com/nightwarelabz/krellophone): the pure-Krell music engine and example compositions
+- [Krellinux](https://github.com/nightwarelabz/krellinux): the Linux kernel converted from C to Krell
+- [krellstd](https://github.com/nightwarelabz/krellstd): zstd in Krell
+
+## Build
+
+- Build: `make` (clean under -Werror)
+- Test: `make tests`
+- Compiler: `krellc <cmd> <module> [opts]` — `krellc build` also requires `-o <out>`
