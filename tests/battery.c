@@ -12,6 +12,10 @@
 
 Module *build_battery(void) {
     Module *m = mod_new();
+    /* externs exercised by the alchk functions: the driver provides
+     * probes that report the AL value they were called with */
+    mod_add_extern(m, "alprobe", (Type[]){ ty_f64() }, 1, ty_i64());
+    mod_add_extern(m, "alprobe2", (Type[]){ ty_f64(), ty_f64() }, 2, ty_i64());
     static const uint32_t tab[4] = { 11, 22, 33, 44 };
     mod_add_data(m, "tab", 4, tab, sizeof tab);
 
@@ -610,6 +614,23 @@ Module *build_battery(void) {
         Instr sl = ins_make(OP_SELECT, ty_ptr()); sl.a = cond; sl.b = pb; sl.c = pa;
         int fp = emit(f, b, sl);
         emit(f, b, ins_calli(ty_i64(), sg, fp, ids_dup((int32_t[]){ x, K(f, b, ty_i64(), 7) }, 2), 2, true));
+    }
+    /* 37 alchk / alchk1: extern calls with FP arguments - on x86_64
+     * the caller must set AL to the number of FP registers used by
+     * the fixed signature; the probes return what they observed */
+    {
+        Func *f = mod_add_func(m, "alchk", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_f64(), ty_f64() }, 2);
+        emit(f, b, ins_ret(emit(f, b, ins_call(ty_i64(),
+            mod_find_extern(m, "alprobe2"), true,
+            ids_dup((int32_t[]){ ARG(f, b, 0), ARG(f, b, 1) }, 2), 2, false))));
+    }
+    {
+        Func *f = mod_add_func(m, "alchk1", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_f64() }, 1);
+        emit(f, b, ins_ret(emit(f, b, ins_call(ty_i64(),
+            mod_find_extern(m, "alprobe"), true,
+            ids_dup((int32_t[]){ ARG(f, b, 0) }, 1), 1, false))));
     }
     return m;
 }

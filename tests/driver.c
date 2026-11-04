@@ -92,8 +92,31 @@ static uint64_t sh_manyargs(const uint64_t *a) {
     return manyargs(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], dfrom(a[8]), dfrom(a[9]));
 }
 static uint64_t sh_spills(const uint64_t *a) { return spills(a[0]); }
+/* AL probes: tiny asm stubs (not C functions - a C prologue may
+ * itself use AL) that return the AL value the caller set, which for
+ * a fixed-signature extern call must equal the number of FP
+ * registers used by the signature */
+#if defined(__x86_64__)
+__asm__(
+".text\n"
+".globl alprobe\n"
+"alprobe:\n"
+"  movzbq %al, %rax\n"
+"  ret\n"
+".globl alprobe2\n"
+"alprobe2:\n"
+"  movzbq %al, %rax\n"
+"  ret\n");
+extern uint64_t alprobe(double);
+extern uint64_t alprobe2(double, double);
+#endif
+/* the battery calls the Krell wrappers, which call the probes */
+extern uint64_t alchk(double, double);
+extern uint64_t alchk1(double);
 extern uint64_t w128(uint64_t, uint64_t);
 static uint64_t sh_w128(const uint64_t *a) { return w128(a[0], a[1]); }
+static uint64_t sh_alchk_k(const uint64_t *a) { double d1, d2; memcpy(&d1, &a[0], 8); memcpy(&d2, &a[1], 8); return alchk(d1, d2); }
+static uint64_t sh_alchk1_k(const uint64_t *a) { double d1; memcpy(&d1, &a[0], 8); return alchk1(d1); }
 extern uint64_t vtable(uint64_t, uint64_t);
 static uint64_t sh_vtable(const uint64_t *a) { return vtable(a[0], a[1]); }
 extern uint64_t vtail(uint64_t, uint64_t);
@@ -113,6 +136,7 @@ static const SEntry SCALARS[] = {
     { "manyargs", sh_manyargs }, { "spills", sh_spills },
     { "w128", sh_w128 },
     { "vtable", sh_vtable }, { "vtail", sh_vtail },
+    { "alchk", sh_alchk_k }, { "alchk1", sh_alchk1_k },
 };
 
 static int failures = 0, total = 0;

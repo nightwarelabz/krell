@@ -483,6 +483,11 @@ static void emit_instr(Ctx *c, Instr *in) {
             op_str(c, in->args[i], ob, sizeof ob);
             pos += snprintf(args + pos, sizeof args - (size_t)pos, "%s%s %s", i ? ", " : "", pb, ob);
         }
+        /* the type is variadic: the target may be an extern, and a
+         * variadic-typed call makes the backend set AL (x86_64) to the
+         * FP register count of the fixed prefix, exactly like the
+         * native lanes; fixed callees observe no other difference */
+        fpos += snprintf(fty + fpos, sizeof fty - (size_t)fpos, "%s...", g->nparams ? ", " : "");
         char fp[80]; op_str(c, in->a, fp, sizeof fp);
         const char *tail = in->op == OP_TAILCALLI ? "tail " : "";
         if (g->ret.kind == TY_VOID) {
@@ -511,6 +516,29 @@ static void emit_instr(Ctx *c, Instr *in) {
         }
         const char *cc = (in->callee_extern || (c->addrtaken && in->callee >= 0 && c->addrtaken[in->callee])) ? "" : "fastcc ";
         const char *tail = in->op == OP_TAILCALL ? "tail " : "";
+        if (in->callee_extern) {
+            /* extern calls carry an explicit variadic function type
+             * (see OP_CALLI): the fixed prefix is passed identically,
+             * and the backend sets AL on x86_64 */
+            char fty[1024]; int fpos = 0; fty[0] = 0;
+            int np2 = in->callee_extern ? c->m->exts[in->callee].nparams : 0;
+            for (int i = 0; i < np2; i++) {
+                char pb[48]; ty_str(c, ps[i], pb, sizeof pb);
+                fpos += snprintf(fty + fpos, sizeof fty - (size_t)fpos, "%s%s", i ? ", " : "", pb);
+            }
+            fpos += snprintf(fty + fpos, sizeof fty - (size_t)fpos, "%s...", np2 ? ", " : "");
+            (void)fpos;
+            if (rt.kind == TY_VOID) {
+                E(c, "  %scall void (%s) @%s(%s)", tail, fty, name, args);
+                if (in->op == OP_TAILCALL) E(c, "  ret void");
+            } else if (in->op == OP_TAILCALL) {
+                int n = emit_tmp(c, "%scall %s (%s) @%s(%s)", tail, rtb, fty, name, args);
+                E(c, "  ret %s %%t%d", rtb, n);
+            } else {
+                E(c, "  %s = %scall %s (%s) @%s(%s)", R, tail, rtb, fty, name, args);
+            }
+            break;
+        }
         if (rt.kind == TY_VOID) {
             E(c, "  %scall %svoid @%s(%s)", tail, cc, name, args);
             if (in->op == OP_TAILCALL) E(c, "  ret void");

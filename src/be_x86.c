@@ -308,7 +308,9 @@ static void restore_regs(Ctx *c) {
 
 /* move call arguments into the ABI; tail calls write stack args through
  * the outgoing area then to the caller's stack-arg region */
-static void emit_call_args(Ctx *c, Instr *in, const Type *params, bool tail) {
+/* returns the number of FP arguments placed in registers (the SysV
+ * AL value for extern calls) */
+static int emit_call_args(Ctx *c, Instr *in, const Type *params, bool tail) {
     int np = in->nargs;
     Loc *gs = malloc(sizeof(Loc) * (size_t)(np ? np : 1));
     Loc *gd = malloc(sizeof(Loc) * (size_t)(np ? np : 1));
@@ -372,6 +374,7 @@ static void emit_call_args(Ctx *c, Instr *in, const Type *params, bool tail) {
     parallel_moves(c, gs, gd, ng, BCLS_GP);
     parallel_moves(c, fs, fd, nf, BCLS_FP);
     free(gs); free(gd); free(fs); free(fd); free(sa);
+    return fi2;
 }
 
 static void emit_epilogue(Ctx *c) {
@@ -1899,7 +1902,11 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         if (in->callee_extern) { ps = c->m->exts[in->callee].params; np = c->m->exts[in->callee].nparams; name = c->m->exts[in->callee].name; }
         else { Func *g = &c->m->funcs[in->callee]; ps = g->blocks[0].arg_types; np = g->blocks[0].nargs; name = g->name; }
         (void)np;
-        emit_call_args(c, in, ps, false);
+        /* SysV: an extern call must set AL to the number of FP
+         * registers used by the fixed signature - variadic callees
+         * (and some non-variadic ones) read it */
+        int nf = emit_call_args(c, in, ps, false);
+        if (in->callee_extern) E(c, "  mov eax, %d", nf);
         E(c, "  call %s", name);
         if (t.kind != TY_VOID) {
             if (be_class_of(t) == BCLS_FP) store_fp(c, in->result, 0);
@@ -1915,7 +1922,8 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         const Type *ps; const char *name;
         if (in->callee_extern) { ps = c->m->exts[in->callee].params; name = c->m->exts[in->callee].name; }
         else { Func *g = &c->m->funcs[in->callee]; ps = g->blocks[0].arg_types; name = g->name; }
-        emit_call_args(c, in, ps, true);
+        int nf = emit_call_args(c, in, ps, true);
+        if (in->callee_extern) E(c, "  mov eax, %d", nf);
         emit_epilogue(c);
         E(c, "  jmp %s", name);
         break;
@@ -1930,8 +1938,11 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         break;
     }
     case OP_CALLI: {
+        /* the target may be an extern: always set AL from the
+         * signature's FP register count */
         Sig *g = &c->m->sigs[in->callee];
-        emit_call_args(c, in, g->params, false);
+        int nf = emit_call_args(c, in, g->params, false);
+        E(c, "  mov eax, %d", nf);
         load_gp(c, R11, in->a);
         E(c, "  call r11");
         if (t.kind != TY_VOID) {
@@ -1951,8 +1962,9 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         Sig *g = &c->m->sigs[in->callee];
         load_gp(c, R11, in->a);
         E(c, "  push r11");
-        emit_call_args(c, in, g->params, true);
+        int nf = emit_call_args(c, in, g->params, true);
         E(c, "  pop r11");
+        E(c, "  mov eax, %d", nf);
         emit_epilogue(c);
         E(c, "  jmp r11");
         break;
