@@ -110,27 +110,28 @@ Measured against C (gcc 13.3, `-O2`) on the twelve
 the same workloads written once in Krell and once in C, timings
 recorded only where the implementations' checksums agree. S is the
 per-kernel speedup T_C / T_Krell; the figures below are geometric
-means of S from the recorded run of 2026-11-03 (bench host: AMD
+means of S from the recorded run of 2026-11-04 (bench host: AMD
 EPYC 9D25; the LLVM lane of that run was built with clang 18).
+
+![Krell WP18 speed](brand/krell-wp18-speed-vs-fast-languages.png)
 
 | lane | S, all twelve kernels | S, excluding fib |
 |---|---|---|
-| x86_64 native | 4.21× — 321% faster than C | 1.66× — 66% faster than C |
-| LLVM | 4.59× — 359% faster than C | 1.58× — 58% faster than C |
+| x86_64 native | 4.91× — 391% faster than C | 1.81× — 81% faster than C |
+| LLVM | 4.67× — 367% faster than C | 1.59× — 59% faster than C |
 
 fib is quoted both ways because it dominates any mean it joins:
 the optimizer lowers its two-term recurrence to an O(n) loop —
-53.4 ns native and 11.3 ns through the LLVM lane in this run,
-against 6,452,910 ns for C -O2 (the native fib row varies with
-bench-binary layout; the kernel's emitted code is unchanged
-since the WP15 record's 24.7 ns).
+22.7 ns native and 10.0 ns through the LLVM lane in this run,
+against 6,435,777 ns for C -O2 (the native fib row varies with
+bench-binary layout; the WP17 record read 53.4 ns on unchanged
+emitted code).
 
-Per-kernel speedups (native / LLVM): saxpy 3.15× / 2.32×,
-copy 3.06× / 3.19×, bytesum 2.89× / 3.15×, fill32 2.01× / 1.94×,
-sumsq 2.01× / 1.79×, span 1.76× / 1.53×, histo 1.21× / 1.22×,
-parse 1.11× / 0.97×, mix 1.07× / 1.18×, fnv1a 1.00× / 0.99×,
-dot 0.91× / 0.91× (dot's ratio varies by bench process on the
-bench host; isolated fixed-layout runs measure it ahead of C).
+Per-kernel speedups (native / LLVM): copy 3.67× / 1.79×,
+saxpy 3.63× / 1.77×, bytesum 3.40× / 3.70×, fill32 3.13× / 3.15×,
+sumsq 1.95× / 1.80×, span 1.69× / 1.38×, dot 1.29× / 1.79×,
+parse 1.07× / 1.03×, mix 1.06× / 0.98×, fnv1a 1.00× / 1.00×,
+histo 1.00× / 1.01×.
 
 The full record — kernels, C references, methodology, per-run
 results and charts — lives in the
