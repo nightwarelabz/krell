@@ -87,6 +87,15 @@ static const char *PROG =
 "    ret %x\n"
 "}\n"
 "\n"
+"fn vround(ptr, i32) -> i32 {\n"
+"  entry(dst: ptr, val: i32):\n"
+"    storev i32 dst, val\n"
+"    %a = loadv i32, dst\n"
+"    %b = loadv i32, dst\n"
+"    %s = add i32 %a, %b\n"
+"    ret %s\n"
+"}\n"
+"\n"
 "fn maybe_set(ptr, i32, i1) -> void {\n"
 "  entry(dst: ptr, val: i32, flag: i1):\n"
 "    condbr flag, set(dst, val), skip()\n"
@@ -152,6 +161,12 @@ int main(void) {
         av[0].lanes[0] = base; av[1].lanes[0] = 999; av[2].lanes[0] = 0;
         if (interp_call(it, "maybe_set", av, 3, NULL) != 0) { printf("FAIL maybe_set interp 2\n"); failures++; }
         else if (img[0] != 123) { printf("FAIL maybe_set skip: got %u want 123\n", img[0]); failures++; }
+        /* vround: volatile store then two volatile loads of the same
+         * cell; both loads must observe the stored value (77 + 77) */
+        av[0].lanes[0] = base; av[1].lanes[0] = 77;
+        rv.lanes = lb[0] + 16;
+        if (interp_call(it, "vround", av, 2, &rv) != 0) { printf("FAIL vround interp\n"); failures++; }
+        else if (rv.lanes[0] != 154 || img[0] != 77) { printf("FAIL vround: got %llu cell %u want 154/77\n", (unsigned long long)rv.lanes[0], img[0]); failures++; }
     }
     interp_free(it);
     /* a condbr to a block that does not exist is a parse error,

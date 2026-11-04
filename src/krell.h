@@ -69,6 +69,7 @@ enum {
     OP_ALOAD, OP_ASTORE, OP_AADD,
     OP_BR, OP_CONDBR, OP_RET, OP_CALL, OP_TAILCALL, OP_SELECT, OP_ASSUME,
     OP_VLSHR,   /* appended: existing opcode numbers are binary-format */
+    OP_LOADV, OP_STOREV,  /* v3: volatile load/store (appended, v2 numbers unchanged) */
     OP_COUNT
 };
 /* icmp predicates */

@@ -977,7 +977,10 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         store_gp(c, in->result, R11);
         break;
     }
-    case OP_LOAD: {
+    case OP_LOAD: case OP_LOADV: {
+        /* volatile lowers to the same single memory access; the
+         * emitter never caches memory contents, and the access is
+         * emitted exactly once, in program order */
         X86Addr addr;
         if (c->folded_ins && in->a >= 0 && in->a < f->nvalues && c->folded_ins[in->a]) {
             resolve_x86_addr(c, in->a, &addr);
@@ -1003,7 +1006,7 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         }
         break;
     }
-    case OP_STORE: {
+    case OP_STORE: case OP_STOREV: {
         X86Addr addr;
         if (c->folded_ins && in->a >= 0 && in->a < f->nvalues && c->folded_ins[in->a]) {
             resolve_x86_addr(c, in->a, &addr);
@@ -1013,7 +1016,10 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         char mstr[64];
         format_x86_addr(c, mstr, sizeof mstr, &addr);
         Type vt = f->vtypes[in->b];
-        if (in->b >= 0 && in->b < f->nvalues && c->folded_ins && c->folded_ins[in->b]) {
+        /* the folded `inc` shortcut below turns the store into a
+         * read-modify-write of the target cell; that is not a volatile
+         * store, so it is restricted to OP_STORE */
+        if (in->op == OP_STORE && in->b >= 0 && in->b < f->nvalues && c->folded_ins && c->folded_ins[in->b]) {
             const char *szp = vt.bits == 8 ? "BYTE PTR" : vt.bits == 16 ? "WORD PTR" : vt.bits == 32 ? "DWORD PTR" : "QWORD PTR";
             E(c, "  inc %s %s", szp, mstr);
             break;

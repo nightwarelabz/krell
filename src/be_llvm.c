@@ -309,9 +309,17 @@ static void emit_instr(Ctx *c, Instr *in) {
     case OP_LOAD:
         E(c, "  %s = load %s, ptr %s, align 1", R, tb, ab);
         break;
+    case OP_LOADV:
+        E(c, "  %s = load volatile %s, ptr %s, align 1", R, tb, ab);
+        break;
     case OP_STORE: {
         char stb[48]; ty_str(c, f->vtypes[in->b], stb, sizeof stb);
         E(c, "  store %s %s, ptr %s, align 1", stb, bb, ab);
+        break;
+    }
+    case OP_STOREV: {
+        char stb[48]; ty_str(c, f->vtypes[in->b], stb, sizeof stb);
+        E(c, "  store volatile %s %s, ptr %s, align 1", stb, bb, ab);
         break;
     }
     case OP_VLOAD:

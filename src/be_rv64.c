@@ -609,7 +609,7 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         store_gp(c, in->result, T0);
         break;
     }
-    case OP_LOAD: {
+    case OP_LOAD: case OP_LOADV: {
         load_gp(c, T0, in->a);
         if (t.kind == TY_FLOAT) {
             E(c, "  %s f31, 0(x%d)", t.bits == 32 ? "flw" : "fld", T0);
@@ -622,7 +622,7 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         }
         break;
     }
-    case OP_STORE: {
+    case OP_STORE: case OP_STOREV: {
         load_gp(c, T0, in->a);
         Type vt = f->vtypes[in->b];
         if (vt.kind == TY_FLOAT) {

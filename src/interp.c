@@ -298,7 +298,11 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
             R[0] = A[0] + (uint64_t)(i2 * (int64_t)mem_ty_size(in->ety));
             break;
         }
-        case OP_LOAD: {
+        case OP_LOAD: case OP_LOADV: {
+            /* volatile: in the single-threaded reference interpreter a
+             * volatile access has the same value semantics as a plain
+             * one; its ordering/non-elimination force applies to the
+             * optimizer and the backends, which treat it as opaque. */
             uint64_t addr = A[0];
             size_t n = mem_ty_size(in->ty);
             if (addr + n > MEM_SIZE) return ierr(it, "interp: load out of range");
@@ -314,7 +318,7 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
             }
             break;
         }
-        case OP_STORE: {
+        case OP_STORE: case OP_STOREV: {
             uint64_t addr = A[0];
             size_t n = mem_ty_size(in->ty);
             if (addr + n > MEM_SIZE) return ierr(it, "interp: store out of range");

@@ -884,7 +884,11 @@ static void optimize_func(Opt *o) {
                 bool root = op_is_terminator(in->op)
                     || in->op == OP_STORE || in->op == OP_VSTORE || in->op == OP_CALL
                     || in->op == OP_MEMCPY || in->op == OP_MEMSET
-                    || in->op == OP_ASTORE || in->op == OP_AADD;
+                    || in->op == OP_ASTORE || in->op == OP_AADD
+                    /* volatile accesses are observable even when the
+                     * loaded value is unused: root them so neither the
+                     * access nor its operands can be eliminated */
+                    || in->op == OP_LOADV || in->op == OP_STOREV;
                 if (root && !bmark[bi][ii]) { bmark[bi][ii] = 1; PUSH(bi, ii); }
             }
         }

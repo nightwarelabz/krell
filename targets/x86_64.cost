@@ -45,7 +45,9 @@ op uitofp.f lat 6 thr 2
 op bitcast.i lat 1 thr 1
 op alloca.i lat 0 thr 1
 op load.i lat 4 thr 1
+op loadv.i lat 4 thr 1
 op store.i lat 1 thr 1
+op storev.i lat 1 thr 1
 op gep.i lat 1 thr 1
 op memcpy.i lat 30 thr 10
 op memset.i lat 30 thr 10

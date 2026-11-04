@@ -407,7 +407,7 @@ static bool parse_instr(P *p, Func *f, int blk) {
         }
         break;
     }
-    case OP_LOAD: case OP_VLOAD: {
+    case OP_LOAD: case OP_VLOAD: case OP_LOADV: {
         if (!parse_type(p, &ty)) return false;
         if (!eat_ch(p, ',')) { perr(p, "load ,"); return false; }
         int a = parse_value(p, f, blk, ty_ptr());
@@ -415,7 +415,7 @@ static bool parse_instr(P *p, Func *f, int blk) {
         result = emit(f, blk, in);
         break;
     }
-    case OP_STORE: case OP_VSTORE: {
+    case OP_STORE: case OP_VSTORE: case OP_STOREV: {
         if (!parse_type(p, &ty)) return false;
         int a = parse_value(p, f, blk, ty_ptr());
         if (!eat_ch(p, ',')) { perr(p, "store ,"); return false; }

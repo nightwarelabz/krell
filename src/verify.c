@@ -73,13 +73,13 @@ static const char *check_instr(Module *m, Func *f, Block *b, Instr *in, int idx)
         NEED(in->ty.kind == TY_PTR, "alloca result must be ptr");
         NEED(in->imm >= 0 && in->c >= 1 && in->c <= 4096, "alloca size/align invalid");
         break;
-    case OP_LOAD:
+    case OP_LOAD: case OP_LOADV:
         NEED(VT(in->a).kind == TY_PTR, "load address must be ptr");
         break;
     case OP_VLOAD:
         NEED(VT(in->a).kind == TY_PTR && ty_is_vec(in->ty), "vload mismatch");
         break;
-    case OP_STORE:
+    case OP_STORE: case OP_STOREV:
         NEED(VT(in->a).kind == TY_PTR, "store address must be ptr");
         NEED(same_ty(VT(in->b), in->ty), "store value type mismatch");
         break;
@@ -302,7 +302,7 @@ const char *mod_verify_target(Module *m, const char *target) {
                 default: break;
                 }
                 Type t = in->ty;
-                if (in->op == OP_STORE || in->op == OP_VSTORE) t = f->vtypes[in->b];
+                if (in->op == OP_STORE || in->op == OP_VSTORE || in->op == OP_STOREV) t = f->vtypes[in->b];
                 if (cost_lat(c, in->op, t) < 0)
                      { cost_free(c); return failf("verifier: op %s has no cost entry for target (no-cliff gate)", op_name(in->op), 0); }
                 if (cost_cliff(c, in->op, t))
