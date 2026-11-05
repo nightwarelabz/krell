@@ -2026,13 +2026,11 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                     if (sl->is_reg) sreg = sl->idx;
                     else load_fp(c, 14, db->a);
                     if (v512(c)) {
-                        /* per-64-bit-lane decomposition, zmm forms */
-                        E(c, "  vmovdqa64 zmm15, zmm%d", sreg);
-                        E(c, "  vpsrlq zmm15, zmm15, 32");
-                        E(c, "  vpmuludq zmm15, zmm15, zmm%d", sreg);
-                        E(c, "  vpsllq zmm15, zmm15, 33");
-                        E(c, "  vpmuludq zmm%d, zmm%d, zmm%d", sreg, sreg, sreg);
-                        E(c, "  vpaddq zmm%d, zmm%d, zmm%d", dreg, dreg, sreg);
+                        /* AVX512DQ: one full 64x64 low multiply.
+                         * The square lands in the zmm15 scratch, so
+                         * the source home is preserved (the old
+                         * decomposition clobbered it). */
+                        E(c, "  vpmullq zmm15, zmm%d, zmm%d", sreg, sreg);
                         E(c, "  vpaddq zmm%d, zmm%d, zmm15", dreg, dreg);
                     } else if (vwide(c)) {
                         /* per-64-bit-lane decomposition, ymm forms */
@@ -2057,26 +2055,15 @@ static void emit_instr(Ctx *c, int bi, int ii) {
             }
             if (in->op == OP_VMUL && et.kind == TY_INT && et.bits == 64) {
                 if (v512(c)) {
+                    /* AVX512DQ vpmullq: the full 64x64 low product
+                     * in one instruction (the vl-4/vl-8 tiers keep
+                     * the pmuludq decomposition below). */
                     if (in->a == in->b) {
-                        E(c, "  vmovdqa64 zmm15, zmm%d", dreg);
-                        E(c, "  vpsrlq zmm15, zmm15, 32");
-                        E(c, "  vpmuludq zmm15, zmm15, zmm%d", dreg);
-                        E(c, "  vpsllq zmm15, zmm15, 33");
-                        E(c, "  vpmuludq zmm%d, zmm%d, zmm%d", dreg, dreg, dreg);
-                        E(c, "  vpaddq zmm%d, zmm%d, zmm15", dreg, dreg);
+                        E(c, "  vpmullq zmm%d, zmm%d, zmm%d", dreg, dreg, dreg);
                     } else {
                         int breg = bl->is_reg ? bl->idx : 14;
                         if (!bl->is_reg) E(c, "  vmovups zmm14, [rbp - %d]", bl->off);
-                        E(c, "  vmovdqa64 zmm15, zmm%d", dreg);
-                        E(c, "  vpsrlq zmm15, zmm15, 32");
-                        E(c, "  vpmuludq zmm15, zmm15, zmm%d", breg);
-                        E(c, "  vmovdqa64 zmm13, zmm%d", breg);
-                        E(c, "  vpsrlq zmm13, zmm13, 32");
-                        E(c, "  vpmuludq zmm13, zmm13, zmm%d", dreg);
-                        E(c, "  vpaddq zmm15, zmm15, zmm13");
-                        E(c, "  vpsllq zmm15, zmm15, 32");
-                        E(c, "  vpmuludq zmm%d, zmm%d, zmm%d", dreg, dreg, breg);
-                        E(c, "  vpaddq zmm%d, zmm%d, zmm15", dreg, dreg);
+                        E(c, "  vpmullq zmm%d, zmm%d, zmm%d", dreg, dreg, breg);
                     }
                     break;
                 }
