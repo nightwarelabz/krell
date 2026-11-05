@@ -1127,5 +1127,57 @@ Module *build_battery(void) {
                                            B(f, b, OP_ADD, ty_i64(), t[2], t[3]));
         emit(f, b, ins_ret(B(f, b, OP_ADD, ty_i64(), sum, r)));
     }
+    /* 47 chainpress(i64 v, i64 c) -> i64 : add-chain root-liveness
+     * witness (WP36). Four chains root at the argument v: an add
+     * chain (a0 = v+11 executes -- it feeds a shift; a4 = a0+5 and
+     * a8 = a4+9 and a12 = a8+13 are chain-skipped and materialized
+     * at their consumers from the root as v+16 / v+25 / v+38), plus
+     * xor, mul and sub chains whose links all execute. Between the
+     * chain definitions and the consumers sits a3 = sub v, 4444: an
+     * in-place-eligible definition. When the allocator's folded-use
+     * walk expanded a chain use to the chain add's operands (a0)
+     * instead of the recorded root (v), v's interval ended at a3,
+     * a3 took v's register in place, and the t3/t5/t6
+     * materializations read a3 back as v (native result off by a
+     * constant). Chain uses now expand to the root. Fails on the
+     * pre-WP36 compiler in the x86 lane. */
+    {
+        Func *f = mod_add_func(m, "chainpress", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_i64(), ty_i64() }, 2);
+        int v = ARG(f, b, 0), c = ARG(f, b, 1);
+        int a0 = B(f, b, OP_ADD, ty_i64(), v, K(f, b, ty_i64(), 11));
+        int a1 = B(f, b, OP_XOR, ty_i64(), v, K(f, b, ty_i64(), 222));
+        int a2 = B(f, b, OP_MUL, ty_i64(), v, K(f, b, ty_i64(), 3));
+        int a3 = B(f, b, OP_SUB, ty_i64(), v, K(f, b, ty_i64(), 4444));
+        int a4 = B(f, b, OP_ADD, ty_i64(), a0, K(f, b, ty_i64(), 5));
+        int a5 = B(f, b, OP_XOR, ty_i64(), a1, K(f, b, ty_i64(), 66));
+        int a6 = B(f, b, OP_MUL, ty_i64(), a2, K(f, b, ty_i64(), 7));
+        int a7 = B(f, b, OP_SUB, ty_i64(), a3, K(f, b, ty_i64(), 8888));
+        int a8 = B(f, b, OP_ADD, ty_i64(), a4, K(f, b, ty_i64(), 9));
+        int a9 = B(f, b, OP_XOR, ty_i64(), a5, K(f, b, ty_i64(), 1010));
+        int a10 = B(f, b, OP_MUL, ty_i64(), a6, K(f, b, ty_i64(), 11));
+        int a11 = B(f, b, OP_SUB, ty_i64(), a7, K(f, b, ty_i64(), 1212));
+        int a12 = B(f, b, OP_ADD, ty_i64(), a8, K(f, b, ty_i64(), 13));
+        int a13 = B(f, b, OP_XOR, ty_i64(), a9, K(f, b, ty_i64(), 1414));
+        int s0 = B(f, b, OP_SHL, ty_i64(), a0, c);
+        int s1 = B(f, b, OP_LSHR, ty_i64(), a5, c);
+        int s2 = B(f, b, OP_ASHR, ty_i64(), a9, c);
+        int s3 = B(f, b, OP_SHL, ty_i64(), a13, s1);
+        int t0 = B(f, b, OP_ADD, ty_i64(), s0, s1);
+        int t1 = B(f, b, OP_ADD, ty_i64(), s2, s3);
+        int t2 = B(f, b, OP_ADD, ty_i64(), a1, a2);
+        int t3 = B(f, b, OP_ADD, ty_i64(), a3, a4);
+        int t4 = B(f, b, OP_ADD, ty_i64(), a6, a7);
+        int t5 = B(f, b, OP_ADD, ty_i64(), a8, a10);
+        int t6 = B(f, b, OP_ADD, ty_i64(), a11, a12);
+        int t7 = B(f, b, OP_ADD, ty_i64(), a13, s0);
+        int u0 = B(f, b, OP_ADD, ty_i64(), t0, t1);
+        int u1 = B(f, b, OP_ADD, ty_i64(), t2, t3);
+        int u2 = B(f, b, OP_ADD, ty_i64(), t4, t5);
+        int u3 = B(f, b, OP_ADD, ty_i64(), t6, t7);
+        int w0 = B(f, b, OP_ADD, ty_i64(), u0, u1);
+        int w1 = B(f, b, OP_ADD, ty_i64(), u2, u3);
+        emit(f, b, ins_ret(B(f, b, OP_ADD, ty_i64(), w0, w1)));
+    }
     return m;
 }

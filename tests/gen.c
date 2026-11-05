@@ -45,6 +45,7 @@ static const FSpec FUNCS[] = {
     { "tail",    2, { AK_GP, AK_GP }, RK_GP },
     { "alloca",  1, { AK_GP }, RK_GP },
     { "allocsave", 1, { AK_GP }, RK_GP },
+    { "chainpress", 2, { AK_GP, AK_GP }, RK_GP },
     { "data_load", 0, { 0 }, RK_GP },
     { "bitcast_df", 1, { AK_F64 }, RK_GP },
     { "bitcast_id", 1, { AK_GP }, RK_F64 },
@@ -308,6 +309,8 @@ static void gen_cases(void) {
         push_bcase("rmw8", (uint64_t[]){ 0, rnd() });
     for (int i = 0; i < 12; i++)
         push_scalar("allocsave", (uint64_t[]){ (uint64_t)(uint32_t)rnd() });
+    for (int i = 0; i < 12; i++)
+        push_scalar("chainpress", (uint64_t[]){ (uint64_t)(int64_t)(int32_t)rnd(), (uint64_t)(rnd() % 64) });
     for (int i = 0; i < 12; i++)
         push_scalar("w128", (uint64_t[]){ rnd(), rnd() });
     for (int i = 0; i < 12; i++)

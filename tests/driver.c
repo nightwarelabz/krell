@@ -102,6 +102,8 @@ static uint64_t sh_tail(const uint64_t *a) { return tail(a[0], a[1]); }
 static uint64_t sh_alloca(const uint64_t *a) { return (uint64_t)(uint32_t)krell_alloca((int32_t)a[0]); }
 extern int64_t allocsave(int64_t);
 static uint64_t sh_allocsave(const uint64_t *a) { return (uint64_t)allocsave((int64_t)a[0]); }
+extern int64_t chainpress(int64_t, int64_t);
+static uint64_t sh_chainpress(const uint64_t *a) { return (uint64_t)chainpress((int64_t)a[0], (int64_t)a[1]); }
 static uint64_t sh_data_load(const uint64_t *a) { (void)a; return (uint64_t)(uint32_t)data_load(); }
 static uint64_t sh_bitcast_df(const uint64_t *a) { return bitcast_df(dfrom(a[0])); }
 static uint64_t sh_bitcast_id(const uint64_t *a) { return dbits(bitcast_id(a[0])); }
@@ -153,7 +155,7 @@ static const SEntry SCALARS[] = {
     { "cvt_uf", sh_cvt_uf }, { "cvt_f32i", sh_cvt_f32i }, { "cmp64", sh_cmp64 },
     { "fcmp64", sh_fcmp64 }, { "sel", sh_sel }, { "branch", sh_branch },
     { "loop", sh_loop }, { "caller", sh_caller }, { "fact", sh_fact },
-    { "tail", sh_tail }, { "alloca", sh_alloca }, { "allocsave", sh_allocsave }, { "data_load", sh_data_load },
+    { "tail", sh_tail }, { "alloca", sh_alloca }, { "allocsave", sh_allocsave }, { "chainpress", sh_chainpress }, { "data_load", sh_data_load },
     { "bitcast_df", sh_bitcast_df }, { "bitcast_id", sh_bitcast_id },
     { "fround", sh_fround }, { "fround2", sh_fround2 },
     { "manyargs", sh_manyargs }, { "spills", sh_spills },
