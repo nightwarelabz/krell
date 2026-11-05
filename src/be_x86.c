@@ -38,6 +38,11 @@ typedef struct {
     int fi;
     int lbl;
     int vl;
+    int fuse_val;   /* WP28: value of a mul-by-10 whose first LEA has
+                     * been emitted and whose verified consuming add
+                     * must emit the fused second LEA; -1 when unarmed */
+    int fuse_reg;   /* register holding the mul's x5 intermediate */
+    int fuse_res;   /* result value of the verified consuming add */
     int vzero;   /* WP21-B: this function uses ymm state (vl >= 8) and
                   * must vzeroupper on every exit path */
 } Ctx;
@@ -1158,11 +1163,91 @@ static bool emit_i128(Ctx *c, Instr *in) {
     }
 }
 
+static int x86_uses_of(Func *f, int v) {
+    int n = 0;
+    for (int b = 0; b < f->nblocks; b++) {
+        Block *bl = &f->blocks[b];
+        for (int i = 0; i < bl->nins; i++) {
+            Instr *in = &bl->ins[i];
+            if (in->a == v) n++;
+            if (in->b == v) n++;
+            if (in->c == v && in->op != OP_ALLOCA) n++;
+            for (int k = 0; k < in->nargs; k++) if (in->args[k] == v) n++;
+            for (int k = 0; k < in->nargs2; k++) if (in->args2[k] == v) n++;
+        }
+    }
+    return n;
+}
+
+/* WP28: digit-fused multiply-add. The WP19 strength reduction emits
+ * x*10 as lea(x*5) + lea(x*10); when the mul's sole consumer is the
+ * immediately following add of a register-homed value d, the second
+ * LEA can take d as its base: lea [d + x5*2] computes x*10 + d in one
+ * instruction (the parse kernel's cur = cur*10 + d is the measured
+ * case; the hand-written ASM column uses exactly this form). This
+ * check runs at the mul site and arms the fusion only when every
+ * condition is verified: the add is the next instruction in the same
+ * block, it is not folded/chain-skipped/span-matched (so its
+ * emit_instr call really is the next one), the mul result has exactly
+ * one use in the whole function, and d is a non-constant value homed
+ * in a GP register distinct from the mul's input value (whose home
+ * the mul result may share). */
+static bool x86_mul10_fuse_ok(Ctx *c, int bi, int ii, Instr *in, int dreg) {
+    Func *f = c->f;
+    if (dreg < 0 || in->result < 0) return false;
+    Block *bl = &f->blocks[bi];
+    if (ii + 1 >= bl->nins) return false;
+    Instr *nxt = &bl->ins[ii + 1];
+    if (nxt->op != OP_ADD || nxt->ty.kind != TY_INT || nxt->ty.bits != 64)
+        return false;
+    if (nxt->result < 0) return false;
+    int d;
+    if (nxt->a == in->result && nxt->b != in->result) d = nxt->b;
+    else if (nxt->b == in->result && nxt->a != in->result) d = nxt->a;
+    else return false;
+    if (d < 0 || d == in->a) return false;
+    Loc *dloc = &c->bf->loc[d];
+    if (!dloc->is_reg || dloc->cls != BCLS_GP) return false;
+    if (c->defins && c->defins[d] && c->defins[d]->op == OP_ICONST)
+        return false;
+    if (c->folded_ins && c->folded_ins[nxt->result]) return false;
+    if (c->chain_skip && (c->chain_skip[nxt->result] || c->chain_skip[d]))
+        return false;
+    for (int s2 = 0; s2 < c->nspan; s2++)
+        if (nxt == c->span_or[s2]) return false;
+    if (x86_uses_of(f, in->result) != 1) return false;
+    c->fuse_val = in->result;
+    c->fuse_reg = dreg;
+    c->fuse_res = nxt->result;
+    return true;
+}
+
 static void emit_instr(Ctx *c, int bi, int ii) {
     Func *f = c->f;
     Instr *in = &f->blocks[bi].ins[ii];
     if (in->result >= 0 && c->folded_ins && c->folded_ins[in->result]) return;
     if (in->result >= 0 && c->chain_skip && c->chain_skip[in->result]) return;
+    if (c->fuse_val >= 0) {
+        /* The first emit_instr call after an armed mul site: either
+         * the verified consuming add (emit the fused LEA) or, if the
+         * site checks were somehow bypassed, complete the mul with
+         * its second LEA before anything else emits code, so the
+         * mul result's home holds x*10 for its real consumer. */
+        int fv = c->fuse_val, freg = c->fuse_reg, fres = c->fuse_res;
+        c->fuse_val = -1;
+        int d = (in->a == fv) ? in->b : (in->b == fv) ? in->a : -1;
+        if (in->op == OP_ADD && in->result == fres && d >= 0 &&
+            c->bf->loc[d].is_reg && c->bf->loc[d].cls == BCLS_GP) {
+            Loc *dl = &c->bf->loc[in->result];
+            int dreg = (dl->is_reg && dl->cls == BCLS_GP) ? dl->idx : -1;
+            int dreg_use = (dreg >= 0) ? dreg : R11;
+            E(c, "  lea %s, [%s + %s*2]", G64[dreg_use],
+              G64[c->bf->loc[d].idx], G64[freg]);
+            if (dreg < 0) store_gp(c, in->result, R11);
+            return;
+        }
+        E(c, "  lea %s, [%s + %s*1]", G64[freg], G64[freg], G64[freg]);
+    }
     if (ty128(in->ty) || ty128(in->ety) ||
         (in->a >= 0 && ty128(f->vtypes[in->a])) || (in->b >= 0 && ty128(f->vtypes[in->b])))
         if (emit_i128(c, in)) return;
@@ -1287,7 +1372,11 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                 E(c, "  lea %s, [%s + %s*%d]", G64[dreg_use], G64[dreg_use], G64[dreg_use], mul_form - 1);
             else if (mul_form == 10) {
                 E(c, "  lea %s, [%s + %s*4]", G64[dreg_use], G64[dreg_use], G64[dreg_use]);
-                E(c, "  lea %s, [%s + %s*1]", G64[dreg_use], G64[dreg_use], G64[dreg_use]);
+                /* WP28: if the mul's sole consumer is the next
+                 * instruction's add, that add emits the second LEA
+                 * in fused form (see x86_mul10_fuse_ok). */
+                if (!x86_mul10_fuse_ok(c, bi, ii, in, dreg))
+                    E(c, "  lea %s, [%s + %s*1]", G64[dreg_use], G64[dreg_use], G64[dreg_use]);
             }
             else if (mul_form == -1)
                 E(c, "  shl %s, %d", G64[dreg_use], mul_shift);
@@ -3340,6 +3429,7 @@ static int emit_func(Ctx *c, int fi) {
         }
     }
     c->nspan = 0;
+    c->fuse_val = -1; c->fuse_reg = -1; c->fuse_res = -1;
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = &f->blocks[bi];
         Instr *s_rb = NULL, *s_rb_shr = NULL, *s_rb_mul = NULL, *s_rb_and = NULL;
