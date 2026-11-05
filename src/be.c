@@ -983,14 +983,26 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
                 Instr *in = &f->blocks[b].ins[i];
                 if ((in->op == OP_CALL || in->op == OP_TAILCALL || in->op == OP_CALLI || in->op == OP_TAILCALLI) && in->nargs * 8 > outb) outb = in->nargs * 8;
             }
-        int frame = slot_base + total_scalar_slots * 8 + vec_unit_total * 16 + alloca_bytes + outb;
+        /* The vector area must begin at a 16-byte boundary from the
+         * frame base: slot chunks are addressed in 16-byte units from
+         * vec_base, and vector ops may fold a slot operand as an SSE
+         * memory operand, which faults (#GP, delivered as SIGSEGV
+         * with no fault address) unless 16-byte aligned. The frame
+         * base register is 16-byte aligned (frame_bytes is a multiple
+         * of 16 over an ABI-aligned entry stack), so aligning vec_base
+         * here aligns every vector slot. slot_base + scalar slots is
+         * a multiple of 8, so the pad is 0 or 8; with an odd
+         * (nsave + scalar slots) count every vector slot used to sit
+         * at offset 8 mod 16 and any folded vector op crashed. */
+        int vec_base = slot_base + total_scalar_slots * 8;
+        vec_base = (vec_base + 15) & ~15;
+        int allo_base = vec_base + vec_unit_total * 16;
+        int frame = vec_base + vec_unit_total * 16 + alloca_bytes + outb;
         frame = (frame + 15) & ~15;
         bf->frame_bytes = frame;
         bf->out_bytes = outb;
         bf->nalloca = alloca_bytes;
         /* now compute byte offsets */
-        int vec_base = slot_base + total_scalar_slots * 8;
-        int allo_base = vec_base + vec_unit_total * 16;
         for (int v = 0; v < f->nvalues; v++) {
             if ((bf->loc[v].cls == BCLS_VEC || bf->loc[v].cls == BCLS_MEM128) && !bf->loc[v].is_reg) {
                 /* Emitters address a vector value's bytes as
