@@ -3832,16 +3832,27 @@ static int emit_func(Ctx *c, int fi) {
     /* the allocator must see chain adds as folded so the chain
      * roots' live ranges extend to the consumption points (the
      * folded-use walk in be.c); the emitter's own folded_ins is
-     * left untouched. */
+     * left untouched. WP36: the walk must expand a chain use to the
+     * chain's recorded ROOT -- that is what every materialization
+     * site reads (root + accumulated offset) -- not to the chain
+     * add's defining operands: an intermediate add on the chain may
+     * execute and hold its own value, and expanding to it left the
+     * root's interval ending at its last direct use, so a 2-address
+     * definition in between took the root's register and later
+     * materializations read the new value as the root. */
     bool *alloc_folded = c->folded_ins;
     bool merged_folded = false;
+    int *alloc_fold_root = NULL;
     if (c->chain_skip) {
         bool any = false;
         for (int v = 0; v < f->nvalues; v++) if (c->chain_skip[v]) { any = true; break; }
         if (any) {
             alloc_folded = malloc((size_t)(f->nvalues > 0 ? f->nvalues : 1) * sizeof(bool));
-            for (int v = 0; v < f->nvalues; v++)
+            alloc_fold_root = malloc((size_t)(f->nvalues > 0 ? f->nvalues : 1) * sizeof(int));
+            for (int v = 0; v < f->nvalues; v++) {
                 alloc_folded[v] = (c->folded_ins && c->folded_ins[v]) || c->chain_skip[v];
+                alloc_fold_root[v] = c->chain_skip[v] ? c->chain_root[v] : -1;
+            }
             merged_folded = true;
         }
     }
@@ -3858,8 +3869,8 @@ static int emit_func(Ctx *c, int fi) {
         for (int v = 0; v < f->nvalues; v++)
             if (f->vtypes[v].kind == TY_VEC) { c->vzero = 1; break; }
     }
-    BeFunc *bf = be_analyze_ext(m, f, &pools, alloc_folded);
-    if (merged_folded) free(alloc_folded);
+    BeFunc *bf = be_analyze_ext(m, f, &pools, alloc_folded, alloc_fold_root);
+    if (merged_folded) { free(alloc_folded); free(alloc_fold_root); }
     if (!bf) { free(c->defins); c->defins = NULL; free(c->folded_ins); c->folded_ins = NULL; free(c->cmp_fuse); c->cmp_fuse = NULL; free(c->cond_fuse); c->cond_fuse = NULL; return -1; }
     c->bf = bf;
     EarlyReturn er = detect_early_return(f);
