@@ -296,7 +296,7 @@ int main(int argc, char **argv) {
         FILE *o = fopen(out, "w");
         if (!o) { perror("krellc: output"); return 1; }
         char err[512]; int rc;
-        if (strcmp(tgt, "x86_64") == 0 || strcmp(tgt, "x86_64_avx2") == 0) rc = be_x86_64(m, cost, o, err, sizeof err);
+        if (strcmp(tgt, "x86_64") == 0 || strcmp(tgt, "x86_64_avx2") == 0 || strcmp(tgt, "x86_64_avx512") == 0) rc = be_x86_64(m, cost, o, err, sizeof err);
         else if (strcmp(tgt, "aarch64") == 0) rc = be_aarch64(m, cost, o, err, sizeof err);
         else if (strcmp(tgt, "riscv64") == 0) rc = be_riscv64(m, cost, o, err, sizeof err);
         else if (strcmp(tgt, "llvm") == 0) rc = be_llvm(m, cost, o, err, sizeof err);

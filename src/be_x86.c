@@ -48,6 +48,20 @@ typedef struct {
  * what it was. */
 static int vwide(Ctx *c) { return c->vl >= 8; }
 
+/* WP27: the AVX-512 target (vl >= 16) widens every vector value to a
+ * 512-bit zmm home, one tier above the ymm model. Emission branches
+ * on v512() ahead of vwide(); the vl-4 and vl-8 paths are untouched.
+ * The EVEX forms used here need AVX512F + AVX512BW only (byte/word
+ * packed ops and psadbw at 512 bits are BW; everything else is F).
+ * All 512-bit memory traffic uses unaligned-tolerant forms (vmovups
+ * moves, folded arithmetic operands) — vmovaps/vmovdqa appear only
+ * register-to-register — so the frame's 16-byte vector-slot
+ * alignment guarantee is sufficient and unchanged. Lane staging
+ * generalizes the ymm high-half model: a 512-bit home is staged in
+ * 128-bit quarters via vextracti32x4/vextractf32x4 into xmm15 (the
+ * FP scratch) and vinserti32x4/vinsertf32x4 on the way back. */
+static int v512(Ctx *c) { return c->vl >= 16; }
+
 static void E(Ctx *c, const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     vfprintf(c->out, fmt, ap);
@@ -254,13 +268,15 @@ static void load_fp(Ctx *c, int xmm, int v) {
     if (l->is_reg && l->cls == BCLS_FP && l->idx == xmm) return;
     if (l->is_reg && l->cls == BCLS_FP) {
         if (t.kind == TY_VEC) {
-            if (vwide(c)) E(c, "  vmovaps ymm%d, ymm%d", xmm, l->idx);
+            if (v512(c)) E(c, "  vmovaps zmm%d, zmm%d", xmm, l->idx);
+            else if (vwide(c)) E(c, "  vmovaps ymm%d, ymm%d", xmm, l->idx);
             else E(c, "  movaps xmm%d, xmm%d", xmm, l->idx);
         }
         else E(c, "  %s xmm%d, xmm%d", op, xmm, l->idx);
         return;
     }
     char b[64]; locstr(c, b, sizeof b, v, 8);
+    if (t.kind == TY_VEC && v512(c)) { E(c, "  vmovups zmm%d, %s", xmm, b); return; }
     if (t.kind == TY_VEC && vwide(c)) { E(c, "  vmovups ymm%d, %s", xmm, b); return; }
     E(c, "  %s xmm%d, %s", op, xmm, b);
 }
@@ -272,7 +288,8 @@ static void store_fp(Ctx *c, int v, int xmm) {
     if (l->is_reg && l->cls == BCLS_FP && l->idx == xmm) return;
     if (l->is_reg && l->cls == BCLS_FP) {
         if (t.kind == TY_VEC) {
-            if (vwide(c)) E(c, "  vmovaps ymm%d, ymm%d", l->idx, xmm);
+            if (v512(c)) E(c, "  vmovaps zmm%d, zmm%d", l->idx, xmm);
+            else if (vwide(c)) E(c, "  vmovaps ymm%d, ymm%d", l->idx, xmm);
             else E(c, "  movaps xmm%d, xmm%d", l->idx, xmm);
         }
         else E(c, "  %s xmm%d, xmm%d", op, l->idx, xmm);
@@ -280,6 +297,7 @@ static void store_fp(Ctx *c, int v, int xmm) {
     }
     if (!l->is_reg && l->idx < 0) return;
     char b[64]; locstr(c, b, sizeof b, v, 8);
+    if (t.kind == TY_VEC && v512(c)) { E(c, "  vmovups %s, zmm%d", b, xmm); return; }
     if (t.kind == TY_VEC && vwide(c)) { E(c, "  vmovups %s, ymm%d", b, xmm); return; }
     E(c, "  %s %s, xmm%d", op, b, xmm);
 }
@@ -300,7 +318,8 @@ static void copy_value(Ctx *c, int dst, int src) {
     else if (cls == BCLS_FP) {
         Loc *dl = &c->bf->loc[dst], *sl = &c->bf->loc[src];
         if (dl->is_reg && sl->is_reg) {
-            if (t.kind == TY_VEC && vwide(c)) E(c, "  vmovaps ymm%d, ymm%d", dl->idx, sl->idx);
+            if (t.kind == TY_VEC && v512(c)) E(c, "  vmovaps zmm%d, zmm%d", dl->idx, sl->idx);
+            else if (t.kind == TY_VEC && vwide(c)) E(c, "  vmovaps ymm%d, ymm%d", dl->idx, sl->idx);
             else E(c, "  movaps xmm%d, xmm%d", dl->idx, sl->idx);
         } else {
             load_fp(c, 15, src); store_fp(c, dst, 15);
@@ -322,12 +341,15 @@ static void copy_value(Ctx *c, int dst, int src) {
             }
         }
     }
-    else { /* vector: chunk copy through xmm15/ymm15 */
+    else { /* vector: chunk copy through xmm15/ymm15/zmm15 */
         Loc *dl = &c->bf->loc[dst], *sl = &c->bf->loc[src];
         int bytes = mem_size_of(t, c->vl);
-        int step = vwide(c) ? 32 : 16;
+        int step = v512(c) ? 64 : vwide(c) ? 32 : 16;
         for (int off = 0; off < bytes; off += step) {
-            if (vwide(c)) {
+            if (v512(c)) {
+                E(c, "  vmovups zmm15, [rbp - %d]", sl->off - off);
+                E(c, "  vmovups [rbp - %d], zmm15", dl->off - off);
+            } else if (vwide(c)) {
                 E(c, "  vmovups ymm15, [rbp - %d]", sl->off - off);
                 E(c, "  vmovups [rbp - %d], ymm15", dl->off - off);
             } else {
@@ -343,6 +365,24 @@ typedef struct { Ctx *c; } MvCtx;
 static void x86_mv(void *p, Loc dst, Loc src) {
     MvCtx *mc = p; Ctx *c = mc->c;
     char db[64], sb[64];
+    if (dst.cls == BCLS_VEC && v512(c)) {
+        /* WP27: a 512-bit vector move is one 64-byte chunk (n == 1
+         * enforced by the target guard). Register names are zmm;
+         * the parallel-move scratch for this class is zmm15. */
+        char dr[16], sr[16];
+        if (dst.is_reg) snprintf(dr, sizeof dr, "zmm%d", dst.idx);
+        else snprintf(dr, sizeof dr, "[rbp - %d]", dst.off);
+        if (src.is_reg) snprintf(sr, sizeof sr, "zmm%d", src.idx);
+        else snprintf(sr, sizeof sr, "[rbp - %d]", src.off);
+        if (dst.is_reg && src.is_reg) E(c, "  vmovaps %s, %s", dr, sr);
+        else if (dst.is_reg) E(c, "  vmovups %s, %s", dr, sr);
+        else if (src.is_reg) E(c, "  vmovups %s, %s", dr, sr);
+        else {
+            E(c, "  vmovups zmm15, %s", sr);
+            E(c, "  vmovups %s, zmm15", dr);
+        }
+        return;
+    }
     if (dst.cls == BCLS_VEC && vwide(c)) {
         /* WP21-B: a wide vector move is one 32-byte chunk (n == 1 is
          * enforced by the avx2 target guard). Register names are
@@ -725,6 +765,18 @@ static bool is_span_blend(Ctx *c, Instr *in, int *out_px, int *out_light,
 static void vec_lane_gp(Ctx *c, Loc *lp, int i, Type et, const char *d64, const char *d32) {
     int eb = et.bits / 8;
     Loc ll = *lp; Loc *l = &ll;
+    if (v512(c) && l->is_reg && i >= 128 / (int)et.bits) {
+        /* WP27: stage the lane's 128-bit quarter of the zmm home
+         * into the xmm15 scratch; the within-quarter extraction
+         * below then proceeds exactly as for a 128-bit home. The
+         * result lands in a GP register, so reusing xmm15 inside
+         * the extraction patterns is safe (same argument as the
+         * ymm high-half staging). */
+        int per = 128 / (int)et.bits;
+        E(c, "  vextracti32x4 xmm15, zmm%d, %d", l->idx, i / per);
+        l->idx = 15;
+        i -= (i / per) * per;
+    }
     if (vwide(c) && l->is_reg && i >= 128 / (int)et.bits) {
         /* WP21-B: high-half lane — pull the top 128 bits into the
          * xmm15 scratch, then extract from there. The result lands
@@ -757,6 +809,15 @@ static void vec_lane_gp(Ctx *c, Loc *lp, int i, Type et, const char *d64, const 
 static void vec_lane_fp(Ctx *c, Loc *lp, int i, Type et, int reg) {
     int eb = et.bits / 8;
     Loc ll = *lp; Loc *l = &ll;
+    if (v512(c) && l->is_reg && i >= 128 / (int)et.bits) {
+        /* WP27: quarter staging, as in vec_lane_gp. Callers
+         * extracting two operands must take the xmm14-side operand
+         * first — its extraction may occupy xmm15. */
+        int per = 128 / (int)et.bits;
+        E(c, "  vextractf32x4 xmm15, zmm%d, %d", l->idx, i / per);
+        l->idx = 15;
+        i -= (i / per) * per;
+    }
     if (vwide(c) && l->is_reg && i >= 128 / (int)et.bits) {
         /* WP21-B: high-half lane via xmm15 scratch (see vec_lane_gp).
          * Callers extracting two operands must take the xmm14-side
@@ -776,6 +837,30 @@ static void vec_lane_fp(Ctx *c, Loc *lp, int i, Type et, int reg) {
     } else {
         E(c, "  %s xmm%d, [rbp - %d]", et.bits == 32 ? "movss" : "movsd", reg, l->off - i * eb);
     }
+}
+
+/* WP27: insert lane i (value in r11; eb = element bytes) into the
+ * register-resident zmm vector dl. Lanes are grouped in 128-bit
+ * quarters of 16/eb lanes; quarter 0 inserts go at the xmm name of
+ * the home, higher quarters are staged in the scratch register
+ * `stage` (xmm14 on the GP side, xmm13 on the FP side — never
+ * xmm15, the extraction scratch), inserted lane by lane, and
+ * written back at the quarter's last lane. Callers insert every
+ * lane in ascending order, so the staged quarter's untouched lanes
+ * are always written before the write-back. fp selects the float
+ * extract/insert forms. */
+static void vec_insert_reg512(Ctx *c, Loc *dl, int i, int eb, int stage, int fp) {
+    int per = 16 / eb;
+    int q = i / per, j = i - q * per;
+    if (q > 0 && j == 0)
+        E(c, fp ? "  vextractf32x4 xmm%d, zmm%d, %d" : "  vextracti32x4 xmm%d, zmm%d, %d", stage, dl->idx, q);
+    int tgt = q > 0 ? stage : dl->idx;
+    if (eb == 1) E(c, "  pinsrb xmm%d, r11d, %d", tgt, j);
+    else if (eb == 2) E(c, "  pinsrw xmm%d, r11d, %d", tgt, j);
+    else if (eb == 4) E(c, "  pinsrd xmm%d, r11d, %d", tgt, j);
+    else E(c, "  pinsrq xmm%d, r11, %d", tgt, j);
+    if (q > 0 && j == per - 1)
+        E(c, fp ? "  vinsertf32x4 zmm%d, zmm%d, xmm%d, %d" : "  vinserti32x4 zmm%d, zmm%d, xmm%d, %d", dl->idx, dl->idx, stage, q);
 }
 
 /* ---- i128 (v3.0): memory-resident values, 16-byte slots holding
@@ -1682,7 +1767,12 @@ static void emit_instr(Ctx *c, int bi, int ii) {
             const char *env_al = getenv("KRELL_VECTOR_ALIGN");
             if (env_al && strcmp(env_al, "aligned") == 0) vop = "movaps";
             else if (env_al && strcmp(env_al, "streaming") == 0) vop = in->op == OP_VSTORE ? "movntdq" : "movaps";
-            if (vwide(c)) {
+            if (v512(c)) {
+                const char *vvop = strcmp(vop, "movntdq") == 0 ? "vmovntdq" : strcmp(vop, "movaps") == 0 ? "vmovaps" : "vmovups";
+                if (in->op == OP_VLOAD) E(c, "  %s zmm%d, %s", vvop, l->idx, mstr);
+                else E(c, "  %s %s, zmm%d", vvop, mstr, l->idx);
+            }
+            else if (vwide(c)) {
                 const char *vvop = strcmp(vop, "movntdq") == 0 ? "vmovntdq" : strcmp(vop, "movaps") == 0 ? "vmovaps" : "vmovups";
                 if (in->op == OP_VLOAD) E(c, "  %s ymm%d, %s", vvop, l->idx, mstr);
                 else E(c, "  %s %s, ymm%d", vvop, mstr, l->idx);
@@ -1693,13 +1783,21 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         }
         int bytes = mem_size_of(t, c->vl);
         if (in->op != OP_VLOAD) bytes = mem_size_of(f->vtypes[in->b], c->vl);
-        int step = vwide(c) ? 32 : 16;
+        int step = v512(c) ? 64 : vwide(c) ? 32 : 16;
         for (int off = 0; off < bytes; off += step) {
             char chunk_mstr[64];
             X86Addr chunk_addr = addr;
             chunk_addr.disp += off;
             format_x86_addr(c, chunk_mstr, sizeof chunk_mstr, &chunk_addr);
-            if (vwide(c)) {
+            if (v512(c)) {
+                if (in->op == OP_VLOAD) {
+                    E(c, "  vmovups zmm15, %s", chunk_mstr);
+                    E(c, "  vmovups [rbp - %d], zmm15", l->off - off);
+                } else {
+                    E(c, "  vmovups zmm15, [rbp - %d]", l->off - off);
+                    E(c, "  vmovups %s, zmm15", chunk_mstr);
+                }
+            } else if (vwide(c)) {
                 if (in->op == OP_VLOAD) {
                     E(c, "  vmovups ymm15, %s", chunk_mstr);
                     E(c, "  vmovups [rbp - %d], ymm15", l->off - off);
@@ -1722,6 +1820,32 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         Loc *l = &c->bf->loc[in->result];
         int eb = et.bits / 8;
         if (l->is_reg) {
+            if (v512(c)) {
+                /* WP27: one broadcast per element class (AVX-512),
+                 * staged in the low lane exactly as on AVX2, then
+                 * broadcast to zmm. */
+                if (et.kind == TY_FLOAT) {
+                    load_fp(c, l->idx, in->a);
+                    if (et.bits == 32) E(c, "  vbroadcastss zmm%d, xmm%d", l->idx, l->idx);
+                    else E(c, "  vbroadcastsd zmm%d, xmm%d", l->idx, l->idx);
+                } else {
+                    load_gp(c, R11, in->a);
+                    if (eb == 8) {
+                        E(c, "  vmovq xmm%d, r11", l->idx);
+                        E(c, "  vpbroadcastq zmm%d, xmm%d", l->idx, l->idx);
+                    } else if (eb == 4) {
+                        E(c, "  vmovd xmm%d, r11d", l->idx);
+                        E(c, "  vpbroadcastd zmm%d, xmm%d", l->idx, l->idx);
+                    } else if (eb == 2) {
+                        E(c, "  vmovd xmm%d, r11d", l->idx);
+                        E(c, "  vpbroadcastw zmm%d, xmm%d", l->idx, l->idx);
+                    } else {
+                        E(c, "  vmovd xmm%d, r11d", l->idx);
+                        E(c, "  vpbroadcastb zmm%d, xmm%d", l->idx, l->idx);
+                    }
+                }
+                break;
+            }
             if (vwide(c)) {
                 /* WP21-B: one broadcast per element class (AVX2). The
                  * scalar source is staged in the low lane of the
@@ -1797,10 +1921,12 @@ static void emit_instr(Ctx *c, int bi, int ii) {
             if (al->is_reg && al->idx == dreg) {
                 /* already in dreg */
             } else if (al->is_reg) {
-                if (vwide(c)) E(c, "  vmovaps ymm%d, ymm%d", dreg, al->idx);
+                if (v512(c)) E(c, "  vmovaps zmm%d, zmm%d", dreg, al->idx);
+                else if (vwide(c)) E(c, "  vmovaps ymm%d, ymm%d", dreg, al->idx);
                 else E(c, "  movaps xmm%d, xmm%d", dreg, al->idx);
             } else {
-                if (vwide(c)) E(c, "  vmovups ymm%d, [rbp - %d]", dreg, al->off);
+                if (v512(c)) E(c, "  vmovups zmm%d, [rbp - %d]", dreg, al->off);
+                else if (vwide(c)) E(c, "  vmovups ymm%d, [rbp - %d]", dreg, al->off);
                 else E(c, "  movups xmm%d, [rbp - %d]", dreg, al->off);
             }
             if (in->op == OP_VADD && et.kind == TY_INT && et.bits == 64 && in->b >= 0 && c->defins[in->b]) {
@@ -1810,7 +1936,16 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                     Loc *sl = &c->bf->loc[db->a];
                     if (sl->is_reg) sreg = sl->idx;
                     else load_fp(c, 14, db->a);
-                    if (vwide(c)) {
+                    if (v512(c)) {
+                        /* per-64-bit-lane decomposition, zmm forms */
+                        E(c, "  vmovdqa64 zmm15, zmm%d", sreg);
+                        E(c, "  vpsrlq zmm15, zmm15, 32");
+                        E(c, "  vpmuludq zmm15, zmm15, zmm%d", sreg);
+                        E(c, "  vpsllq zmm15, zmm15, 33");
+                        E(c, "  vpmuludq zmm%d, zmm%d, zmm%d", sreg, sreg, sreg);
+                        E(c, "  vpaddq zmm%d, zmm%d, zmm%d", dreg, dreg, sreg);
+                        E(c, "  vpaddq zmm%d, zmm%d, zmm15", dreg, dreg);
+                    } else if (vwide(c)) {
                         /* per-64-bit-lane decomposition, ymm forms */
                         E(c, "  vmovdqa ymm15, ymm%d", sreg);
                         E(c, "  vpsrlq ymm15, ymm15, 32");
@@ -1832,6 +1967,30 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                 }
             }
             if (in->op == OP_VMUL && et.kind == TY_INT && et.bits == 64) {
+                if (v512(c)) {
+                    if (in->a == in->b) {
+                        E(c, "  vmovdqa64 zmm15, zmm%d", dreg);
+                        E(c, "  vpsrlq zmm15, zmm15, 32");
+                        E(c, "  vpmuludq zmm15, zmm15, zmm%d", dreg);
+                        E(c, "  vpsllq zmm15, zmm15, 33");
+                        E(c, "  vpmuludq zmm%d, zmm%d, zmm%d", dreg, dreg, dreg);
+                        E(c, "  vpaddq zmm%d, zmm%d, zmm15", dreg, dreg);
+                    } else {
+                        int breg = bl->is_reg ? bl->idx : 14;
+                        if (!bl->is_reg) E(c, "  vmovups zmm14, [rbp - %d]", bl->off);
+                        E(c, "  vmovdqa64 zmm15, zmm%d", dreg);
+                        E(c, "  vpsrlq zmm15, zmm15, 32");
+                        E(c, "  vpmuludq zmm15, zmm15, zmm%d", breg);
+                        E(c, "  vmovdqa64 zmm13, zmm%d", breg);
+                        E(c, "  vpsrlq zmm13, zmm13, 32");
+                        E(c, "  vpmuludq zmm13, zmm13, zmm%d", dreg);
+                        E(c, "  vpaddq zmm15, zmm15, zmm13");
+                        E(c, "  vpsllq zmm15, zmm15, 32");
+                        E(c, "  vpmuludq zmm%d, zmm%d, zmm%d", dreg, dreg, breg);
+                        E(c, "  vpaddq zmm%d, zmm%d, zmm15", dreg, dreg);
+                    }
+                    break;
+                }
                 if (vwide(c)) {
                     if (in->a == in->b) {
                         E(c, "  vmovdqa ymm15, ymm%d", dreg);
@@ -1898,7 +2057,18 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                  * through to the scalarized lane loop instead. */
             }
             if (nm) {
-                if (vwide(c)) {
+                if (v512(c)) {
+                    char evnm[16];
+                    if (in->op == OP_VAND || in->op == OP_VOR || in->op == OP_VXOR) {
+                        /* EVEX spells the packed logic ops with a
+                         * d/q suffix (the op is bitwise either way) */
+                        snprintf(evnm, sizeof evnm, "%s%c", nm, et.bits == 64 ? 'q' : 'd');
+                        nm = evnm;
+                    }
+                    if (bl->is_reg) E(c, "  v%s zmm%d, zmm%d, zmm%d", nm, dreg, dreg, bl->idx);
+                    else E(c, "  v%s zmm%d, zmm%d, [rbp - %d]", nm, dreg, dreg, bl->off);
+                }
+                else if (vwide(c)) {
                     if (bl->is_reg) E(c, "  v%s ymm%d, ymm%d, ymm%d", nm, dreg, dreg, bl->idx);
                     else E(c, "  v%s ymm%d, ymm%d, [rbp - %d]", nm, dreg, dreg, bl->off);
                 }
@@ -1932,9 +2102,13 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                 if (in->op == OP_VMUL && et.bits == 64) nm = NULL;
                 else nm = tmp;
                 if (nm) {
-                    int bytes = mem_size_of(t, c->vl), step = vwide(c) ? 32 : 16;
+                    int bytes = mem_size_of(t, c->vl), step = v512(c) ? 64 : vwide(c) ? 32 : 16;
                     for (int off = 0; off < bytes; off += step) {
-                        if (vwide(c)) {
+                        if (v512(c)) {
+                            E(c, "  vmovups zmm15, [rbp - %d]", al->off - off);
+                            E(c, "  v%s zmm15, zmm15, [rbp - %d]", nm, bl->off - off);
+                            E(c, "  vmovups [rbp - %d], zmm15", dl->off - off);
+                        } else if (vwide(c)) {
                             E(c, "  vmovups ymm15, [rbp - %d]", al->off - off);
                             E(c, "  v%s ymm15, ymm15, [rbp - %d]", nm, bl->off - off);
                             E(c, "  vmovups [rbp - %d], ymm15", dl->off - off);
@@ -1949,9 +2123,19 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                 scalarize = true;
             }
             if (nm) {
-                int bytes = mem_size_of(t, c->vl), step = vwide(c) ? 32 : 16;
+                char evnm[16];
+                if (v512(c) && (in->op == OP_VAND || in->op == OP_VOR || in->op == OP_VXOR)) {
+                    /* EVEX logic-op suffix, as in the register path */
+                    snprintf(evnm, sizeof evnm, "%s%c", nm, et.bits == 64 ? 'q' : 'd');
+                    nm = evnm;
+                }
+                int bytes = mem_size_of(t, c->vl), step = v512(c) ? 64 : vwide(c) ? 32 : 16;
                 for (int off = 0; off < bytes; off += step) {
-                    if (vwide(c)) {
+                    if (v512(c)) {
+                        E(c, "  vmovups zmm15, [rbp - %d]", al->off - off);
+                        E(c, "  v%s zmm15, zmm15, [rbp - %d]", nm, bl->off - off);
+                        E(c, "  vmovups [rbp - %d], zmm15", dl->off - off);
+                    } else if (vwide(c)) {
                         E(c, "  vmovups ymm15, [rbp - %d]", al->off - off);
                         E(c, "  v%s ymm15, ymm15, [rbp - %d]", nm, bl->off - off);
                         E(c, "  vmovups [rbp - %d], ymm15", dl->off - off);
@@ -1985,7 +2169,12 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                 }
                 E(c, "  %s%s xmm15, xmm14", nm, et.bits == 32 ? "ss" : "sd");
                 if (dl->is_reg) {
-                    if (vwide(c) && i >= half) {
+                    if (v512(c)) {
+                        if (et.bits == 32) E(c, "  movd r11d, xmm15");
+                        else E(c, "  movq r11, xmm15");
+                        vec_insert_reg512(c, dl, i, et.bits / 8, 13, 1);
+                    }
+                    else if (vwide(c) && i >= half) {
                         /* insert into the high half, staged in xmm13 */
                         if (i == half) E(c, "  vextractf128 xmm13, ymm%d, 1", dl->idx);
                         if (et.bits == 32) { E(c, "  movd r11d, xmm15"); E(c, "  pinsrd xmm13, r11d, %d", i - half); }
@@ -2022,7 +2211,8 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                 }
                 mask_r11(c, et);
                 if (dl->is_reg) {
-                    if (vwide(c) && i >= half) {
+                    if (v512(c)) vec_insert_reg512(c, dl, i, eb, 14, 0);
+                    else if (vwide(c) && i >= half) {
                         /* insert into the high half, staged in xmm14
                          * (vec_lane_gp's scratch is xmm15) */
                         if (i == half) E(c, "  vextracti128 xmm14, ymm%d, 1", dl->idx);
@@ -2062,7 +2252,10 @@ static void emit_instr(Ctx *c, int bi, int ii) {
             if (dl->is_reg) {
                 int dreg = dl->idx;
                 load_fp(c, dreg, in->a);
-                if (vwide(c)) {
+                if (v512(c)) {
+                    E(c, "  vxorps zmm15, zmm15, zmm15");
+                    E(c, "  vpsadbw zmm%d, zmm%d, zmm15", dreg, dreg);
+                } else if (vwide(c)) {
                     E(c, "  vxorps ymm15, ymm15, ymm15");
                     E(c, "  vpsadbw ymm%d, ymm%d, ymm15", dreg, dreg);
                 } else {
@@ -2072,17 +2265,14 @@ static void emit_instr(Ctx *c, int bi, int ii) {
             } else {
                 load_fp(c, 15, in->a);
                 E(c, "  xor r11d, r11d");
-                E(c, "  push r11");
-                E(c, "  push r11");
-                if (vwide(c)) {
-                    E(c, "  push r11");
-                    E(c, "  push r11");
-                    E(c, "  vpsadbw ymm15, ymm15, [rsp]");
-                } else {
-                    E(c, "  psadbw xmm15, [rsp]");
-                }
-                if (vwide(c)) E(c, "  add rsp, 32");
-                else E(c, "  add rsp, 16");
+                /* transient zero block on the stack, one register
+                 * width wide (16/32/64 bytes by target tier) */
+                int nz = v512(c) ? 8 : vwide(c) ? 4 : 2;
+                for (int z = 0; z < nz; z++) E(c, "  push r11");
+                if (v512(c)) E(c, "  vpsadbw zmm15, zmm15, [rsp]");
+                else if (vwide(c)) E(c, "  vpsadbw ymm15, ymm15, [rsp]");
+                else E(c, "  psadbw xmm15, [rsp]");
+                E(c, "  add rsp, %d", nz * 8);
                 store_fp(c, in->result, 15);
             }
             break;
@@ -2105,7 +2295,8 @@ static void emit_instr(Ctx *c, int bi, int ii) {
             E(c, "  mov r11, rax");
             mask_r11(c, oet);
             if (dl->is_reg) {
-                if (vwide(c) && j >= half) {
+                if (v512(c)) vec_insert_reg512(c, dl, j, oeb, 14, 0);
+                else if (vwide(c) && j >= half) {
                     if (j == half) E(c, "  vextracti128 xmm14, ymm%d, 1", dl->idx);
                     if (oeb == 1) E(c, "  pinsrb xmm14, r11d, %d", j - half);
                     else if (oeb == 2) E(c, "  pinsrw xmm14, r11d, %d", j - half);
@@ -2132,6 +2323,14 @@ static void emit_instr(Ctx *c, int bi, int ii) {
              * operand, which for 64-bit lanes is exactly the lane's
              * own shift amount: the packed form is lane-exact. */
             int dreg = dl->idx;
+            if (v512(c)) {
+                if (al->is_reg && al->idx == dreg) { /* already in place */ }
+                else if (al->is_reg) E(c, "  vmovaps zmm%d, zmm%d", dreg, al->idx);
+                else E(c, "  vmovups zmm%d, [rbp - %d]", dreg, al->off);
+                if (bl->is_reg) E(c, "  vpsrlq zmm%d, zmm%d, xmm%d", dreg, dreg, bl->idx);
+                else E(c, "  vpsrlq zmm%d, zmm%d, [rbp - %d]", dreg, dreg, bl->off);
+                break;
+            }
             if (vwide(c)) {
                 if (al->is_reg && al->idx == dreg) { /* already in place */ }
                 else if (al->is_reg) E(c, "  vmovaps ymm%d, ymm%d", dreg, al->idx);
@@ -2163,7 +2362,11 @@ static void emit_instr(Ctx *c, int bi, int ii) {
              * register before the other operand is touched. */
             int asrc = al->is_reg ? al->idx : -1, ai = i;
             int bsrc = bl->is_reg ? bl->idx : -1, bi = i;
-            if (vwide(c) && al->is_reg && i >= half) {
+            if (v512(c) && al->is_reg && i >= half) {
+                E(c, "  vextracti32x4 xmm15, zmm%d, %d", asrc, i / half);
+                asrc = 15; ai = i - (i / half) * half;
+            }
+            else if (vwide(c) && al->is_reg && i >= half) {
                 E(c, "  vextracti128 xmm15, ymm%d, 1", asrc);
                 asrc = 15; ai = i - half;
             }
@@ -2182,7 +2385,11 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                 else if (eb == 4) E(c, "  mov r11d, DWORD PTR [rbp - %d]", al->off - i * eb);
                 else E(c, "  mov r11, QWORD PTR [rbp - %d]", al->off - i * eb);
             }
-            if (vwide(c) && bl->is_reg && i >= half) {
+            if (v512(c) && bl->is_reg && i >= half) {
+                E(c, "  vextracti32x4 xmm15, zmm%d, %d", bsrc, i / half);
+                bsrc = 15; bi = i - (i / half) * half;
+            }
+            else if (vwide(c) && bl->is_reg && i >= half) {
                 E(c, "  vextracti128 xmm15, ymm%d, 1", bsrc);
                 bsrc = 15; bi = i - half;
             }
@@ -2206,7 +2413,8 @@ static void emit_instr(Ctx *c, int bi, int ii) {
             E(c, "  shr r11, cl");
             mask_r11(c, et);
             if (dl->is_reg) {
-                if (vwide(c) && i >= half) {
+                if (v512(c)) vec_insert_reg512(c, dl, i, eb, 14, 0);
+                else if (vwide(c) && i >= half) {
                     if (i == half) E(c, "  vextracti128 xmm14, ymm%d, 1", dl->idx);
                     if (eb == 1) E(c, "  pinsrb xmm14, r11d, %d", i - half);
                     else if (eb == 2) E(c, "  pinsrw xmm14, r11d, %d", i - half);
@@ -2298,6 +2506,31 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         Type et = ty_elem(t);
         Loc *dl = &c->bf->loc[in->result];
         int imm = (int)in->imm;
+        if (dl->is_reg && v512(c)) {
+            /* WP27: same extract/insert/put-back discipline at the
+             * 128-bit quarter of the zmm home holding the lane. */
+            int per = 128 / (int)et.bits;
+            int q = imm / per;
+            int j = imm - q * per;
+            if (et.kind == TY_FLOAT) {
+                load_fp(c, 14, in->b);
+                E(c, "  vextractf32x4 xmm15, zmm%d, %d", dl->idx, q);
+                if (et.bits == 32) E(c, "  insertps xmm15, xmm14, %d", j << 4);
+                else if (j == 0) E(c, "  movsd xmm15, xmm14");
+                else E(c, "  movlhps xmm15, xmm14");
+                E(c, "  vinsertf32x4 zmm%d, zmm%d, xmm15, %d", dl->idx, dl->idx, q);
+            } else {
+                load_gp(c, R11, in->b);
+                int eb = et.bits / 8;
+                E(c, "  vextracti32x4 xmm15, zmm%d, %d", dl->idx, q);
+                if (eb == 1) E(c, "  pinsrb xmm15, r11d, %d", j);
+                else if (eb == 2) E(c, "  pinsrw xmm15, r11d, %d", j);
+                else if (eb == 4) E(c, "  pinsrd xmm15, r11d, %d", j);
+                else E(c, "  pinsrq xmm15, r11, %d", j);
+                E(c, "  vinserti32x4 zmm%d, zmm%d, xmm15, %d", dl->idx, dl->idx, q);
+            }
+            break;
+        }
         if (dl->is_reg && vwide(c)) {
             /* WP21-B: a 128-bit insert into a ymm home would zero the
              * other half (VEX-128 dest semantics), so the target half
@@ -3322,7 +3555,7 @@ static int emit_func(Ctx *c, int fi) {
             merged_folded = true;
         }
     }
-    Pools pools = { POOL_GP, 13, POOL_FP, 15, 1, vwide(c) ? 32 : 16, NULL, NULL, NULL, NULL, NULL };
+    Pools pools = { POOL_GP, 13, POOL_FP, 15, 1, v512(c) ? 64 : vwide(c) ? 32 : 16, NULL, NULL, NULL, NULL, NULL };
     pools.clob_mask = x86_clob_mask;
     pools.clob_bless = x86_clob_bless;
     pools.clob_defmask = x86_clob_defmask;
@@ -3570,17 +3803,21 @@ int be_x86_64(Module *m, const Cost *cost, FILE *out, char *err, size_t errcap) 
     if (ve) { be_err(err, errcap, ve); return -1; }
     Ctx c = { .out = out, .m = m, .vl = cost_vl_i32(cost) };
     if (vwide(&c)) {
-        /* WP21-B wide-target contract: the ymm model covers exactly
+        /* WP21-B wide-target contract: the wide model covers exactly
          * one shape — internal TY_VEC values with n == 1 (one ymm at
-         * vl 8). Vectors crossing the ABI (entry params, call args
-         * or results) and multi-part vectors are rejected with a
-         * clean backend error rather than miscompiled. */
+         * vl 8, one zmm at vl 16). Vectors crossing the ABI (entry
+         * params, call args or results) and multi-part vectors are
+         * rejected with a clean backend error rather than
+         * miscompiled. */
+        const char *tname = v512(&c) ? "x86_64_avx512" : "x86_64_avx2";
+        char ebuf[128];
         for (int i = 0; i < m->nfuncs; i++) {
             Func *f = &m->funcs[i];
             for (int v = 0; v < f->nvalues; v++) {
                 Type t = f->vtypes[v];
                 if (t.kind == TY_VEC && t.n != 1) {
-                    be_err(err, errcap, "x86_64_avx2: vector with n != 1 is not supported");
+                    snprintf(ebuf, sizeof ebuf, "%s: vector with n != 1 is not supported", tname);
+                    be_err(err, errcap, ebuf);
                     return -1;
                 }
             }
@@ -3588,7 +3825,8 @@ int be_x86_64(Module *m, const Cost *cost, FILE *out, char *err, size_t errcap) 
                 Block *b0 = &f->blocks[0];
                 for (int a = 0; a < b0->nargs; a++)
                     if (b0->arg_types[a].kind == TY_VEC) {
-                        be_err(err, errcap, "x86_64_avx2: vector entry parameter is not supported");
+                        snprintf(ebuf, sizeof ebuf, "%s: vector entry parameter is not supported", tname);
+                        be_err(err, errcap, ebuf);
                         return -1;
                     }
             }
@@ -3598,12 +3836,14 @@ int be_x86_64(Module *m, const Cost *cost, FILE *out, char *err, size_t errcap) 
                     if (in->op == OP_CALL || in->op == OP_TAILCALL || in->op == OP_CALLI || in->op == OP_TAILCALLI) {
                         Type rt = f->vtypes[in->result];
                         if (in->result >= 0 && rt.kind == TY_VEC) {
-                            be_err(err, errcap, "x86_64_avx2: vector call result is not supported");
+                            snprintf(ebuf, sizeof ebuf, "%s: vector call result is not supported", tname);
+                            be_err(err, errcap, ebuf);
                             return -1;
                         }
                         for (int a = 0; a < in->nargs; a++)
                             if (in->args[a] >= 0 && f->vtypes[in->args[a]].kind == TY_VEC) {
-                                be_err(err, errcap, "x86_64_avx2: vector call argument is not supported");
+                                snprintf(ebuf, sizeof ebuf, "%s: vector call argument is not supported", tname);
+                                be_err(err, errcap, ebuf);
                                 return -1;
                             }
                     }
