@@ -63,6 +63,8 @@ static const FSpec FUNCS[] = {
     { "rmw32",   2, { AK_PTR, AK_GP }, RK_GP },
     { "rmw8",    2, { AK_PTR, AK_GP }, RK_GP },
     { "vecadd",  2, { AK_PTR, AK_PTR }, RK_VOID },
+    { "vecstage", 2, { AK_PTR, AK_PTR }, RK_VOID },
+    { "vecstageu", 2, { AK_PTR, AK_PTR }, RK_VOID },
     { "vecf",    3, { AK_PTR, AK_PTR, AK_F32 }, RK_VOID },
     { "vecins",  3, { AK_PTR, AK_PTR, AK_GP }, RK_VOID },
     { "memcpy_", 3, { AK_PTR, AK_PTR, AK_GP }, RK_VOID },
@@ -317,6 +319,10 @@ static void gen_cases(void) {
     }
     for (int i = 0; i < 12; i++)
         push_bcase("vecadd", (uint64_t[]){ 128, 0 });
+    for (int i = 0; i < 12; i++)
+        push_bcase("vecstage", (uint64_t[]){ 96, 0 });
+    for (int i = 0; i < 12; i++)
+        push_bcase("vecstageu", (uint64_t[]){ 96, 0 });
     for (int i = 0; i < 12; i++)
         push_bcase("vecf", (uint64_t[]){ 128, 0, fbits(1.5f + (float)(i % 5)) });
     for (int i = 0; i < 12; i++)

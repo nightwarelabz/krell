@@ -55,6 +55,8 @@ extern uint64_t rmw(void *, uint64_t);
 extern uint32_t rmw32(void *, uint32_t);
 extern uint64_t rmw8(void *, uint64_t);
 extern void vecadd(void *, const void *);
+extern void vecstage(void *, const void *);
+extern void vecstageu(void *, const void *);
 extern void vecf(void *, const void *, float);
 extern void vecins(void *, const void *, int32_t);
 extern void memcpy_(void *, const void *, uint64_t);
@@ -196,6 +198,8 @@ static uint64_t run_bcase(const FInfo *fi, uint8_t *img, const uint64_t *args) {
     if (strcmp(fi->name, "rmw32") == 0) return (uint64_t)(uint32_t)rmw32(base + args[0], (uint32_t)args[1]);
     if (strcmp(fi->name, "rmw8") == 0) return rmw8(base + args[0], args[1]);
     if (strcmp(fi->name, "vecadd") == 0) { vecadd(base + args[0], base + args[1]); return 0; }
+    if (strcmp(fi->name, "vecstage") == 0) { vecstage(base + args[0], base + args[1]); return 0; }
+    if (strcmp(fi->name, "vecstageu") == 0) { vecstageu(base + args[0], base + args[1]); return 0; }
     if (strcmp(fi->name, "vecf") == 0) { vecf(base + args[0], base + args[1], ffrom(args[2])); return 0; }
     if (strcmp(fi->name, "vecins") == 0) { vecins(base + args[0], base + args[1], (int32_t)args[2]); return 0; }
     if (strcmp(fi->name, "memcpy_") == 0) { memcpy_(base + args[0], base + args[1], args[2]); return 0; }

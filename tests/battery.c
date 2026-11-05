@@ -979,5 +979,85 @@ Module *build_battery(void) {
         emit(f, b2, ins_br(b1, ids_dup((int32_t[]){ inext, states[0], states[1], contn, poffn, consn, bout, btab, bn, acc }, 10), 10));
         emit(f, b3, ins_ret(ARG(f, b3, 0)));
     }
+    /* 44 vecstage(ptr dst, ptr src) : FP-pool staging witness
+     * (WP29C). Eighteen live vec(i64,1) values; a[0] is stored
+     * early to free its home, then a register-result i64 VMUL --
+     * whose pmuludq decomposition stages partials through xmm13
+     * and a slot-resident operand through xmm14 -- and finally
+     * every value is stored out and image-checked. When xmm13 /
+     * xmm14 were FP pool homes (clob=0, and x86_clob_mask models
+     * GP classes only, so nothing ever forbade them), the value
+     * homed in xmm13 was silently destroyed by the decomposition.
+     * The pool now ends at xmm12; xmm13/14/15 are permanent
+     * emitter scratch. Discriminates in the standard x86 lane
+     * (the decomposition runs at every tier). */
+    {
+        Func *f = mod_add_func(m, "vecstage", ty_void(), 0);
+        int b = func_add_block(f, (Type[]){ ty_ptr(), ty_ptr() }, 2);
+        int dst = ARG(f, b, 0), src = ARG(f, b, 1);
+        Type vt = ty_vec(ty_i64(), 1);
+        int a[18];
+        for (int i = 0; i < 18; i++) {
+            Instr g = ins_make(OP_GEP, ty_ptr()); g.ety = ty_i64();
+            g.a = src; g.b = K(f, b, ty_i64(), i);
+            Instr vl = ins_make(OP_VLOAD, vt); vl.a = emit(f, b, g);
+            a[i] = emit(f, b, vl);
+        }
+        { Instr g = ins_make(OP_GEP, ty_ptr()); g.ety = ty_i64();
+          g.a = dst; g.b = K(f, b, ty_i64(), 0);
+          Instr vs = ins_make(OP_VSTORE, ty_void()); vs.a = emit(f, b, g); vs.b = a[0];
+          emit(f, b, vs); }
+        int z = B(f, b, OP_VMUL, vt, a[17], a[16]);
+        for (int i = 17; i >= 1; i--) {
+            Instr g = ins_make(OP_GEP, ty_ptr()); g.ety = ty_i64();
+            g.a = dst; g.b = K(f, b, ty_i64(), i);
+            Instr vs = ins_make(OP_VSTORE, ty_void()); vs.a = emit(f, b, g); vs.b = a[i];
+            emit(f, b, vs);
+        }
+        { Instr g = ins_make(OP_GEP, ty_ptr()); g.ety = ty_i64();
+          g.a = dst; g.b = K(f, b, ty_i64(), 18);
+          Instr vs = ins_make(OP_VSTORE, ty_void()); vs.a = emit(f, b, g); vs.b = z;
+          emit(f, b, vs); }
+        emit(f, b, ins_ret(-1));
+    }
+    /* 45 vecstageu(ptr dst, ptr src) : the WP29A stress shape --
+     * the same eighteen live vectors across a scalarized VUDIV,
+     * whose lane loop stages the result through xmm14 on the
+     * wide tiers (vec_insert_reg512 quarters at vl 16, the
+     * high-half insert at vl 8). At the battery's vl-4 x86 lane
+     * the int lane loop inserts directly and this shape does
+     * not discriminate; it pins the original repro in the
+     * corpus (it fails on the pre-WP29C compiler at vl 8/16,
+     * proven by the standalone probe) and covers the fixed
+     * pool on every lane that runs it. */
+    {
+        Func *f = mod_add_func(m, "vecstageu", ty_void(), 0);
+        int b = func_add_block(f, (Type[]){ ty_ptr(), ty_ptr() }, 2);
+        int dst = ARG(f, b, 0), src = ARG(f, b, 1);
+        Type vt = ty_vec(ty_i64(), 1);
+        int a[18];
+        for (int i = 0; i < 18; i++) {
+            Instr g = ins_make(OP_GEP, ty_ptr()); g.ety = ty_i64();
+            g.a = src; g.b = K(f, b, ty_i64(), i);
+            Instr vl = ins_make(OP_VLOAD, vt); vl.a = emit(f, b, g);
+            a[i] = emit(f, b, vl);
+        }
+        { Instr g = ins_make(OP_GEP, ty_ptr()); g.ety = ty_i64();
+          g.a = dst; g.b = K(f, b, ty_i64(), 0);
+          Instr vs = ins_make(OP_VSTORE, ty_void()); vs.a = emit(f, b, g); vs.b = a[0];
+          emit(f, b, vs); }
+        int z = B(f, b, OP_VUDIV, vt, a[17], a[16]);
+        for (int i = 17; i >= 1; i--) {
+            Instr g = ins_make(OP_GEP, ty_ptr()); g.ety = ty_i64();
+            g.a = dst; g.b = K(f, b, ty_i64(), i);
+            Instr vs = ins_make(OP_VSTORE, ty_void()); vs.a = emit(f, b, g); vs.b = a[i];
+            emit(f, b, vs);
+        }
+        { Instr g = ins_make(OP_GEP, ty_ptr()); g.ety = ty_i64();
+          g.a = dst; g.b = K(f, b, ty_i64(), 18);
+          Instr vs = ins_make(OP_VSTORE, ty_void()); vs.a = emit(f, b, g); vs.b = z;
+          emit(f, b, vs); }
+        emit(f, b, ins_ret(-1));
+    }
     return m;
 }
