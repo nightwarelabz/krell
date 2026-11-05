@@ -3661,6 +3661,102 @@ static void opt_unroll_loops(Func *f, OptStats *st) {
     free(defblk);
 }
 
+/* WP28: share the range-check fold's sub with a downstream duplicate.
+ * The range-check fold in optimize_func rewrites a classify test in
+ * block B into `%s = sub x, lo` + `icmp.ule %s, span` + condbr, but a
+ * successor that needs the digit value recomputes `sub x, lo` (parse's
+ * dig block is the measured case: the classification sub and the digit
+ * sub are the same computation in two blocks, and the emitted code
+ * subtracts twice per byte). When a successor S of B has B as its only
+ * predecessor, B dominates S, so a duplicate `sub x, lo` in S can be
+ * replaced by B's value and removed. The match is anchored on the
+ * folded pattern (a sub feeding the IC_ULE that drives B's condbr) so
+ * the pass cannot fire on unrelated code, and the duplicate must
+ * match on operand value, constant value, and result type. */
+static void replace_all_uses(Func *f, int oldv, int newv) {
+    for (int b = 0; b < f->nblocks; b++) {
+        Block *bl = &f->blocks[b];
+        for (int i = 0; i < bl->nins; i++) {
+            Instr *in = &bl->ins[i];
+            if (in->a == oldv) in->a = newv;
+            if (in->b == oldv) in->b = newv;
+            if (in->c == oldv) in->c = newv;
+            for (int k = 0; k < in->nargs; k++)
+                if (in->args[k] == oldv) in->args[k] = newv;
+            for (int k = 0; k < in->nargs2; k++)
+                if (in->args2[k] == oldv) in->args2[k] = newv;
+        }
+    }
+}
+
+static void opt_share_range_subs(Func *f, OptStats *st) {
+    int nb = f->nblocks;
+    if (nb <= 1) return;
+    int *npred = calloc((size_t)nb, sizeof(int));
+    int *sole = malloc(sizeof(int) * (size_t)nb);
+    for (int i = 0; i < nb; i++) sole[i] = -1;
+    for (int b = 0; b < nb; b++) {
+        Block *bl = &f->blocks[b];
+        if (bl->nins == 0) continue;
+        Instr *t = &bl->ins[bl->nins - 1];
+        int tg[2] = { -1, -1 };
+        if (t->op == OP_BR) tg[0] = t->blk;
+        else if (t->op == OP_CONDBR) { tg[0] = t->blk; tg[1] = t->blk2; }
+        for (int k = 0; k < 2; k++)
+            if (tg[k] >= 0 && tg[k] < nb) { npred[tg[k]]++; sole[tg[k]] = b; }
+    }
+    /* sole[s] names a predecessor; it is THE predecessor iff npred==1 */
+    for (int s = 0; s < nb; s++) {
+        if (npred[s] != 1) continue;
+        int b = sole[s];
+        if (b < 0 || b == s) continue;
+        Block *bb = &f->blocks[b];
+        if (bb->nins == 0) continue;
+        Instr *term = &bb->ins[bb->nins - 1];
+        if (term->op != OP_CONDBR) continue;
+        Instr *cmp = NULL, *sub = NULL;
+        for (int i = 0; i < bb->nins; i++)
+            if (bb->ins[i].result == term->a && bb->ins[i].op == OP_ICMP &&
+                bb->ins[i].pred == IC_ULE)
+                cmp = &bb->ins[i];
+        if (!cmp) continue;
+        for (int i = 0; i < bb->nins; i++)
+            if (bb->ins[i].result == cmp->a && bb->ins[i].op == OP_SUB)
+                sub = &bb->ins[i];
+        if (!sub) continue;
+        int64_t lo;
+        if (!opt_find_iconst(f, sub->b, &lo)) continue;
+        int x = sub->a;
+        int subv = sub->result;
+        Type sty = sub->ty;
+        Block *sb = &f->blocks[s];
+        int *hit = malloc(sizeof(int) * (size_t)(sb->nins > 0 ? sb->nins : 1));
+        int nhit = 0;
+        for (int i = 0; i < sb->nins; i++) {
+            Instr *in = &sb->ins[i];
+            if (in->op != OP_SUB || in->a != x) continue;
+            if (in->ty.kind != sty.kind || in->ty.bits != sty.bits) continue;
+            int64_t k2;
+            if (!opt_find_iconst(f, in->b, &k2) || k2 != lo) continue;
+            hit[nhit++] = i;
+        }
+        for (int h = nhit - 1; h >= 0; h--) {
+            Instr *in = &sb->ins[hit[h]];
+            int oldv = in->result;
+            if (oldv >= 0 && oldv != subv) {
+                replace_all_uses(f, oldv, subv);
+                st->rewritten++;
+            }
+            memmove(&sb->ins[hit[h]], &sb->ins[hit[h] + 1],
+                    (size_t)(sb->nins - hit[h] - 1) * sizeof(Instr));
+            sb->nins--;
+        }
+        free(hit);
+    }
+    free(npred);
+    free(sole);
+}
+
 void opt_optimize(Module *m, const Cost *cost, OptStats *st) {
     OptStats local = { 0, 0, 0, 0 };
     if (!st) st = &local;
@@ -3688,6 +3784,11 @@ void opt_optimize(Module *m, const Cost *cost, OptStats *st) {
         elim_identity_params(f);
         opt_rotate_loops(f, st);
         opt_eliminate_block_args(f, st);
+        /* WP28: runs last, on the final block structure: only after
+         * identity block-argument elimination does a successor's
+         * duplicate sub name the same value the fold's sub consumes
+         * (before that it reads the successor's own block parameter). */
+        opt_share_range_subs(f, st);
     }
     const char *ve = mod_verify(m);
     if (ve && snap) {
