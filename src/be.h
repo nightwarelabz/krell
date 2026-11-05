@@ -97,7 +97,7 @@ typedef struct {
 static inline int be_pos(const BeFunc *bf, int bi, int ii) { return bf->blkstart[bi] + 1 + ii; }
 
 BeFunc *be_analyze(Module *m, Func *f, const Pools *pools);
-BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folded);
+BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folded, const int *fold_root);
 void    be_free(BeFunc *bf);
 int     be_class_of(Type t);
 /* byte offset (below frame ptr) for a stack Loc / vector value */
