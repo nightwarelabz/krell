@@ -1323,6 +1323,73 @@ static void emit_cond_tree(Ctx *c, int v, int LT, int LF) {
     }
 }
 
+/* WP35: BMI2 three-operand variable shift (shlx/shrx/sarx), emitted
+ * only on the AVX2 and AVX-512 tiers (vwide): every CPU with AVX2 has
+ * BMI2 (Haswell and later), and every AVX-512 CPU does too. The forms
+ * read the count from any register, are non-destructive on the source,
+ * and do not write flags. Masking: the hardware masks the count to 6
+ * bits for a 64-bit operand and 5 bits for a 32-bit operand, which is
+ * exactly the IR's amount-mod-width rule at those widths (the stored
+ * count's low bits decide; higher bits of the count's home cannot
+ * change the masked result). Sub-32 widths need amount mod 8/16, which
+ * the hardware mask does not give, so the count still takes the legacy
+ * explicit `and` into RCX there.
+ * No consumer of a scalar shift in this backend reads flags the shift
+ * set: every flag reader (setcc/jcc/adc/sbb) is fed by a cmp/add/sub
+ * emitted inside the same IR op's sequence, and shift results are
+ * consumed as values. The clobber model is unchanged: RCX may still be
+ * written (the count scratch), and x86_clob_defmask still keeps a
+ * variable shift's result out of RCX, so RCX is a safe scratch --
+ * except when operand a itself is homed in RCX (x86_clob_bless: a is
+ * read out of RCX): then a is copied into dreg_use before RCX is
+ * loaded. The ASHR sub-32 sign-extension dance also runs in dreg_use,
+ * so a is materialized there on that path regardless of its home. */
+static void emit_shift_bmi2(Ctx *c, Instr *in, Type t, int dreg_use) {
+    const char *nm = in->op == OP_SHL ? "shlx" : in->op == OP_LSHR ? "shrx" : "sarx";
+    int bits = t.bits;
+    const char **GN = bits == 64 ? G64 : G32;
+    Loc *al = &c->bf->loc[in->a];
+    Loc *bl = &c->bf->loc[in->b];
+    bool a_reg = al->is_reg && al->cls == BCLS_GP;
+    bool b_reg = bl->is_reg && bl->cls == BCLS_GP;
+    bool need_mask = bits < 32;
+    bool cnt_scratch = !(b_reg && !need_mask);
+    bool dance = in->op == OP_ASHR && bits < 32;
+    char src[64];
+    if (dance || (cnt_scratch && a_reg && al->idx == RCX)) {
+        if (bits == 64) {
+            load_gp(c, dreg_use, in->a);
+        } else if (!(a_reg && al->idx == dreg_use)) {
+            char ab[64]; locstr(c, ab, sizeof ab, in->a, 4);
+            E(c, "  mov %s, %s", G32[dreg_use], ab);
+        }
+        snprintf(src, sizeof src, "%s", GN[dreg_use]);
+        if (dance) {
+            int sgn_k = 64 - bits;
+            E(c, "  shl %s, %d", G64[dreg_use], sgn_k);
+            E(c, "  sar %s, %d", G64[dreg_use], sgn_k);
+        }
+    } else if (a_reg) {
+        snprintf(src, sizeof src, "%s", GN[al->idx]);
+    } else {
+        locstr(c, src, sizeof src, in->a, bits == 64 ? 8 : 4);
+    }
+    const char *cnt;
+    if (!cnt_scratch) {
+        cnt = GN[bl->idx];
+    } else {
+        load_gp(c, RCX, in->b);
+        if (need_mask) E(c, "  and ecx, %d", bits - 1);
+        cnt = bits == 64 ? "rcx" : "ecx";
+    }
+    E(c, "  %s %s, %s, %s", nm, GN[dreg_use], src, cnt);
+    if (bits < 32) {
+        int k_bits = 64 - bits;
+        E(c, "  shl %s, %d", G64[dreg_use], k_bits);
+        E(c, "  shr %s, %d", G64[dreg_use], k_bits);
+    }
+}
+
 static void emit_instr(Ctx *c, int bi, int ii) {
     Func *f = c->f;
     Instr *in = &f->blocks[bi].ins[ii];
@@ -1537,13 +1604,19 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         int amt = t.bits ? (int)(((k % t.bits) + t.bits) % t.bits) : 0;
 
         if (t.bits == 64) {
-            load_gp(c, dreg_use, in->a);
-            if (in->op == OP_ASHR && t.bits < 64) sext_r11(c, t.bits);
-            if (is_const) E(c, "  %s %s, %d", nm, G64[dreg_use], amt);
-            else {
-                load_gp(c, RCX, in->b);
-                E(c, "  %s %s, cl", nm, G64[dreg_use]);
+            if (!is_const && vwide(c)) {
+                emit_shift_bmi2(c, in, t, dreg_use);
+            } else {
+                load_gp(c, dreg_use, in->a);
+                if (in->op == OP_ASHR && t.bits < 64) sext_r11(c, t.bits);
+                if (is_const) E(c, "  %s %s, %d", nm, G64[dreg_use], amt);
+                else {
+                    load_gp(c, RCX, in->b);
+                    E(c, "  %s %s, cl", nm, G64[dreg_use]);
+                }
             }
+        } else if (!is_const && vwide(c)) {
+            emit_shift_bmi2(c, in, t, dreg_use);
         } else {
             Loc *al = &c->bf->loc[in->a];
             if (al->is_reg && al->cls == BCLS_GP && al->idx == dreg_use) {
