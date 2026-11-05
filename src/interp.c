@@ -469,6 +469,21 @@ static int exec_block(Interp *it, Func *f, Frame *fr, int bi, int *next_blk,
             }
             break;
         }
+        case OP_VWIDEN: {
+            /* result lane j = sum of the group of consecutive operand
+             * lanes it widens (zero-extended; the operand lanes are
+             * already stored masked to their element width) */
+            Type ie = ty_elem(f->vtypes[in->a]), oe = ty_elem(in->ty);
+            int iln = ty_lanes(f->vtypes[in->a], 4), oln = ty_lanes(in->ty, 4);
+            int grp = (oln > 0) ? iln / oln : 0;
+            uint64_t m = msk(oe.bits);
+            for (int j = 0; j < oln; j++) {
+                uint64_t s = 0;
+                for (int t = 0; t < grp; t++) s += A[j * grp + t] & msk(ie.bits);
+                R[j] = s & m;
+            }
+            break;
+        }
         case OP_VEXTRACT: R[0] = A[in->imm]; break;
         case OP_VINSERT: val_copy(f, fr, in->result, in->a); R[in->imm] = B[0]; break;
         case OP_ALOAD: {
