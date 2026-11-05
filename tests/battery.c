@@ -1059,5 +1059,73 @@ Module *build_battery(void) {
           emit(f, b, vs); }
         emit(f, b, ins_ret(-1));
     }
+    /* 46 allocsave(i64 seed) -> i64 : alloca top-addressing witness
+     * (WP34). allocsave keeps sixteen values live across a call to
+     * acorrupt; three of them (the mul chain roots h2/h4/h6) sit in
+     * callee-saved homes r12/r13/r14. acorrupt keeps five values live
+     * across its own call (all five callee-saved homes used, nothing
+     * spilled) and stores four i64 constants into a 64-byte alloca at
+     * byte offsets 0/8/16/24, then reads them back. When be.c sampled
+     * allo_off at the region's cumulative START, the alloca value was
+     * the region's top edge: the stores at bytes 8/16/24 landed in
+     * acorrupt's own callee-save slots ([rbp-40]/[rbp-32]/[rbp-24])
+     * and its epilogue restored the constants into r14/r13/r12, so
+     * allocsave's h2/h4/h6 came back as poison (native result off by
+     * exactly (P1+P2+P3) - (h2+h4+h6)). allo_off is now the region's
+     * cumulative END — the lowest byte — and every store stays inside
+     * the region. Fails on the pre-WP34 compiler in the x86 lane. */
+    {
+        Func *f = mod_add_func(m, "awide5", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_i64(), ty_i64(), ty_i64(), ty_i64(), ty_i64() }, 5);
+        int s0 = B(f, b, OP_ADD, ty_i64(), ARG(f, b, 0), ARG(f, b, 1));
+        int s1 = B(f, b, OP_ADD, ty_i64(), ARG(f, b, 2), ARG(f, b, 3));
+        int t = B(f, b, OP_ADD, ty_i64(), s0, s1);
+        emit(f, b, ins_ret(B(f, b, OP_ADD, ty_i64(), t, ARG(f, b, 4))));
+    }
+    {
+        Func *f = mod_add_func(m, "acorrupt", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_i64() }, 1);
+        int s = ARG(f, b, 0);
+        static const int64_t POISON[4] = { 1111111111111111111LL, 2459565876494606882LL,
+                                           3689348814741910323LL, 4924975585200113572LL };
+        int a[5], q[4], l[4];
+        for (int i = 0; i < 5; i++) a[i] = B(f, b, OP_ADD, ty_i64(), s, K(f, b, ty_i64(), i + 1));
+        Instr al = ins_make(OP_ALLOCA, ty_ptr()); al.imm = 64; al.c = 8;
+        int cell = emit(f, b, al);
+        for (int j = 0; j < 4; j++) {
+            Instr g = ins_make(OP_GEP, ty_ptr()); g.a = cell; g.b = K(f, b, ty_i64(), j); g.ety = ty_i64();
+            q[j] = emit(f, b, g);
+            Instr st = ins_make(OP_STORE, ty_i64()); st.a = q[j]; st.b = K(f, b, ty_i64(), POISON[j]);
+            emit(f, b, st);
+        }
+        for (int j = 0; j < 4; j++) {
+            Instr ld = ins_make(OP_LOAD, ty_i64()); ld.a = q[j];
+            l[j] = emit(f, b, ld);
+        }
+        int ls = B(f, b, OP_ADD, ty_i64(), B(f, b, OP_ADD, ty_i64(), l[0], l[1]),
+                                          B(f, b, OP_ADD, ty_i64(), l[2], l[3]));
+        int fi_wide = mod_find_func(m, "awide5");
+        int t = emit(f, b, ins_call(ty_i64(), fi_wide, false,
+                                    ids_dup((int32_t[]){ a[0], a[1], a[2], a[3], a[4] }, 5), 5, false));
+        emit(f, b, ins_ret(B(f, b, OP_ADD, ty_i64(), t, ls)));
+    }
+    {
+        Func *f = mod_add_func(m, "allocsave", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_i64() }, 1);
+        int seed = ARG(f, b, 0);
+        int h[16];
+        for (int i = 0; i < 16; i++) {
+            if (i == 0 || (i & 1)) h[i] = B(f, b, OP_ADD, ty_i64(), seed, K(f, b, ty_i64(), (i + 1) * 100));
+            else h[i] = B(f, b, OP_MUL, ty_i64(), seed, K(f, b, ty_i64(), i + 1));
+        }
+        int fi_cor = mod_find_func(m, "acorrupt");
+        int r = emit(f, b, ins_call(ty_i64(), fi_cor, false, ids_dup((int32_t[]){ seed }, 1), 1, false));
+        int s[8], t[4];
+        for (int i = 0; i < 8; i++) s[i] = B(f, b, OP_ADD, ty_i64(), h[2 * i], h[2 * i + 1]);
+        for (int i = 0; i < 4; i++) t[i] = B(f, b, OP_ADD, ty_i64(), s[2 * i], s[2 * i + 1]);
+        int sum = B(f, b, OP_ADD, ty_i64(), B(f, b, OP_ADD, ty_i64(), t[0], t[1]),
+                                           B(f, b, OP_ADD, ty_i64(), t[2], t[3]));
+        emit(f, b, ins_ret(B(f, b, OP_ADD, ty_i64(), sum, r)));
+    }
     return m;
 }

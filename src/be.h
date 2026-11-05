@@ -39,7 +39,9 @@ typedef struct BeFunc {
     int8_t *vclass;     /* BCLS_* per value, -1 for void */
     Loc   *loc;         /* allocation result per value */
     int   *blkstart;    /* position of each block's start */
-    int   *allo_off;    /* per position: alloca byte offset (or -1) */
+    int   *allo_off;    /* per position: frame offset of the alloca
+                         * region's lowest byte (or -1); emitters form
+                         * the alloca pointer as frame_base - allo_off */
     int    frame_bytes; /* total local frame (16-aligned) */
     int    out_bytes;   /* outgoing stack-args area size */
     int    nalloca;     /* bytes of alloca area */

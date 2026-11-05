@@ -969,9 +969,29 @@ BeFunc *be_analyze_ext(Module *m, Func *f, const Pools *pools, const bool *folde
                 Instr *in = &f->blocks[b].ins[i];
                 if (in->op == OP_ALLOCA) {
                     int al = in->c > 0 ? in->c : 1;
+                    /* Base addressing (WP34): the alloca value is the
+                     * region's LOWEST byte. Emitters form it as
+                     * frame_base - allo_off and accesses run upward
+                     * ([ptr + k] for k in [0, size)), so allo_off must
+                     * be the offset of the region's far edge: the
+                     * cumulative END of the region, rounded up to the
+                     * requested alignment so the pointer itself is
+                     * aligned (the interpreter's bump allocator
+                     * guarantees the same). The historical form sampled
+                     * the cumulative START — the region's top edge — so
+                     * a store at byte k >= 1 landed outside the region,
+                     * in whatever the frame keeps at smaller offsets:
+                     * vector area, scalar slots, and for k in 8..32 the
+                     * callee-save slots. A 64-byte alloca's stores at
+                     * bytes 8/16/24 overwrote the saved r14/r13/r12 and
+                     * the epilogue restored the stored values into
+                     * those registers (WP34 repro). Bounded now: byte k
+                     * of region j lands at allo_base + allo_off_j - k,
+                     * which stays within (allo_base + prev_end,
+                     * allo_base + allo_off_j] — inside region j. */
+                    alloca_bytes += (int)in->imm;
                     alloca_bytes = (alloca_bytes + al - 1) & ~(al - 1);
                     bf->allo_off[be_pos(bf, b, i)] = alloca_bytes;
-                    alloca_bytes += (int)in->imm;
                 }
             }
         /* max outgoing stack args (beyond the register file) — targets pass
