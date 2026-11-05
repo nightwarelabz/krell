@@ -72,7 +72,7 @@ op amaxu.i lat 26 thr 13
 op vsplat.v lat 4 thr 2
 op vadd.v lat 1 thr 1
 op vsub.v lat 1 thr 1
-op vmul.v lat 3 thr 1
+op vmul.v lat 5 thr 1
 op vudiv.v lat 100 thr 50 cliff 1
 op vfadd.v lat 4 thr 1
 op vfsub.v lat 4 thr 1
