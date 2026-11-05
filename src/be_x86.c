@@ -47,6 +47,9 @@ typedef struct {
     int *chain_root;
     int64_t *chain_off;
     bool *cmp_fuse;
+    bool *cond_fuse;   /* WP33: values consumed as a condbr condition
+                        * tree (icmp/and/or/xor-1 nodes) — materialization
+                        * suppressed; the terminator emits compare+branch */
     Instr *span_or[512];
     int span_px[512];
     int span_light[512];
@@ -181,10 +184,21 @@ static void resolve_x86_addr(Ctx *c, int ptr_v, X86Addr *out) {
     int64_t imm;
     int64_t pd = 0;
     int idxv = peeled_idx(c, d->b, esz, &pd);
+    /* WP33: the second-level decomposition below re-reads the inner
+     * gep's index operand at this load's emission point. That is sound
+     * only when the inner gep is itself folded: be.c's folded-use walk
+     * then keeps the index live at this point. When the inner gep is
+     * materialized it has a home the allocator maintains, and its index
+     * may be dead here (the WP22 doctrine: the home is authoritative).
+     * Field-load extraction (opt_fextract) is the first pass to place a
+     * clobbering wide load between an executing gep and a folded inner
+     * consumer; before it, the gap was empty in practice. */
+    bool inner_folded = d->a >= 0 && d->a < c->f->nvalues &&
+                        c->folded_ins && c->folded_ins[d->a];
     if (be_iconst_val(c->f, idxv, &imm)) {
         out->disp += (int)(imm * esz + pd);
         out->base_v = d->a;
-        if (d->a >= 0 && d->a < c->f->nvalues && c->defins[d->a] && c->defins[d->a]->op == OP_GEP) {
+        if (inner_folded && c->defins[d->a] && c->defins[d->a]->op == OP_GEP) {
             Instr *d2 = c->defins[d->a];
             int esz2 = (int)mem_size_of(d2->ety, c->vl);
             int64_t pd2 = 0;
@@ -204,7 +218,7 @@ static void resolve_x86_addr(Ctx *c, int ptr_v, X86Addr *out) {
         out->idx_v = idxv;
         out->scale = esz;
         out->disp += (int)pd;
-        if (d->a >= 0 && d->a < c->f->nvalues && c->defins[d->a] && c->defins[d->a]->op == OP_GEP) {
+        if (inner_folded && c->defins[d->a] && c->defins[d->a]->op == OP_GEP) {
             Instr *d2 = c->defins[d->a];
             int esz2 = (int)mem_size_of(d2->ety, c->vl);
             int64_t pd2 = 0;
@@ -1239,11 +1253,82 @@ static bool x86_mul10_fuse_ok(Ctx *c, int bi, int ii, Instr *in, int dreg) {
     return true;
 }
 
+/* WP33: emit only the compare of an OP_ICMP (no setcc/materialize).
+ * Shared by the OP_ICMP case (cmp_fuse path) and emit_cond_tree. */
+static void emit_icmp_cmp(Ctx *c, Instr *in) {
+    Func *f = c->f;
+    bool sgn = in->pred >= IC_SLT;
+    int bits = f->vtypes[in->a].bits;
+    Loc *al = &c->bf->loc[in->a];
+    int areg = (al->is_reg && al->cls == BCLS_GP) ? al->idx : -1;
+    int use_reg = -1;
+    if (areg >= 0 && (bits == 32 || bits == 64)) {
+        use_reg = areg;
+    } else {
+        load_gp(c, R11, in->a);
+        if (sgn) sext_r11(c, bits);
+        use_reg = R11;
+    }
+    const char *reg_str = (bits == 32) ? G32[use_reg] : G64[use_reg];
+    int64_t imm;
+    if (be_iconst_val(f, in->b, &imm) && imm >= -2147483648LL && imm <= 2147483647LL) {
+        E(c, "  cmp %s, %lld", reg_str, (long long)imm);
+    } else {
+        Loc *bl2 = &c->bf->loc[in->b];
+        int breg = (bl2->is_reg && bl2->cls == BCLS_GP) ? bl2->idx : -1;
+        if (breg >= 0 && (bits == 32 || bits == 64)) {
+            const char *breg_str = (bits == 32) ? G32[breg] : G64[breg];
+            E(c, "  cmp %s, %s", reg_str, breg_str);
+        } else {
+            load_gp(c, RAX, in->b);
+            if (sgn) sext_rax(c, bits);
+            const char *rax_str = (bits == 32) ? "eax" : "rax";
+            E(c, "  cmp %s, %s", reg_str, rax_str);
+        }
+    }
+}
+
+/* WP33: emit a branch-condition tree: control reaches LT iff the value
+ * is true, LF iff false. Tree nodes (marked cond_fuse) re-emit their
+ * compares here; any other value is a leaf tested through its home.
+ * R11/RAX are the compare scratch registers, free at a terminator. */
+static void emit_cond_tree(Ctx *c, int v, int LT, int LF) {
+    static const char *CC[10] = { "e","ne","b","be","a","ae","l","le","g","ge" };
+    Instr *d = (v >= 0 && v < c->f->nvalues && c->cond_fuse && c->cond_fuse[v])
+               ? c->defins[v] : NULL;
+    if (d && d->op == OP_ICMP) {
+        emit_icmp_cmp(c, d);
+        E(c, "  j%s .Lx%d_%d", CC[d->pred], c->fi, LT);
+        E(c, "  jmp .Lx%d_%d", c->fi, LF);
+    } else if (d && d->op == OP_AND) {
+        int LM = ++c->lbl;
+        emit_cond_tree(c, d->a, LM, LF);
+        E(c, ".Lx%d_%d:", c->fi, LM);
+        emit_cond_tree(c, d->b, LT, LF);
+    } else if (d && d->op == OP_OR) {
+        int LM = ++c->lbl;
+        emit_cond_tree(c, d->a, LT, LM);
+        E(c, ".Lx%d_%d:", c->fi, LM);
+        emit_cond_tree(c, d->b, LT, LF);
+    } else if (d && d->op == OP_XOR) {
+        int other = d->a;
+        int64_t imm;
+        if (be_iconst_val(c->f, d->a, &imm) && imm == 1) other = d->b;
+        emit_cond_tree(c, other, LF, LT);
+    } else {
+        load_gp(c, R11, v);
+        E(c, "  test r11, r11");
+        E(c, "  jne .Lx%d_%d", c->fi, LT);
+        E(c, "  jmp .Lx%d_%d", c->fi, LF);
+    }
+}
+
 static void emit_instr(Ctx *c, int bi, int ii) {
     Func *f = c->f;
     Instr *in = &f->blocks[bi].ins[ii];
     if (in->result >= 0 && c->folded_ins && c->folded_ins[in->result]) return;
     if (in->result >= 0 && c->chain_skip && c->chain_skip[in->result]) return;
+    if (in->result >= 0 && c->cond_fuse && c->cond_fuse[in->result]) return;
     if (c->fuse_val >= 0) {
         /* The first emit_instr call after an armed mul site: either
          * the verified consuming add (emit the fused LEA) or, if the
@@ -1535,35 +1620,7 @@ static void emit_instr(Ctx *c, int bi, int ii) {
     case OP_SREM: emit_div(c, in, true, true); break;
     case OP_ICMP: {
         static const char *CC[10] = { "e","ne","b","be","a","ae","l","le","g","ge" };
-        bool sgn = in->pred >= IC_SLT;
-        int bits = f->vtypes[in->a].bits;
-        Loc *al = &c->bf->loc[in->a];
-        int areg = (al->is_reg && al->cls == BCLS_GP) ? al->idx : -1;
-        int use_reg = -1;
-        if (areg >= 0 && (bits == 32 || bits == 64)) {
-            use_reg = areg;
-        } else {
-            load_gp(c, R11, in->a);
-            if (sgn) sext_r11(c, bits);
-            use_reg = R11;
-        }
-        const char *reg_str = (bits == 32) ? G32[use_reg] : G64[use_reg];
-        int64_t imm;
-        if (be_iconst_val(f, in->b, &imm) && imm >= -2147483648LL && imm <= 2147483647LL) {
-            E(c, "  cmp %s, %lld", reg_str, (long long)imm);
-        } else {
-            Loc *bl = &c->bf->loc[in->b];
-            int breg = (bl->is_reg && bl->cls == BCLS_GP) ? bl->idx : -1;
-            if (breg >= 0 && (bits == 32 || bits == 64)) {
-                const char *breg_str = (bits == 32) ? G32[breg] : G64[breg];
-                E(c, "  cmp %s, %s", reg_str, breg_str);
-            } else {
-                load_gp(c, RAX, in->b);
-                if (sgn) sext_rax(c, bits);
-                const char *rax_str = (bits == 32) ? "eax" : "rax";
-                E(c, "  cmp %s, %s", reg_str, rax_str);
-            }
-        }
+        emit_icmp_cmp(c, in);
         if (c->cmp_fuse && in->result >= 0 && c->cmp_fuse[in->result]) break;
         E(c, "  set%s al", CC[in->pred]);
         E(c, "  movzx eax, al");
@@ -2912,6 +2969,19 @@ static void emit_instr(Ctx *c, int bi, int ii) {
     case OP_CONDBR: {
         static const char *CC[10] = { "e","ne","b","be","a","ae","l","le","g","ge" };
         static const char *INV_CC[10] = { "ne","e","ae","a","be","b","ge","g","le","l" };
+        if (c->cond_fuse && in->a >= 0 && in->a < f->nvalues && c->cond_fuse[in->a]) {
+            /* WP33: compound condition — emit the compare tree, then
+             * both arms under fresh labels. */
+            int LT = ++c->lbl, LF = ++c->lbl, LE = ++c->lbl;
+            emit_cond_tree(c, in->a, LT, LF);
+            E(c, ".Lx%d_%d:", c->fi, LT);
+            emit_branch(c, in->blk, in->args, in->nargs);
+            E(c, "  jmp .Lx%d_%d", c->fi, LE);
+            E(c, ".Lx%d_%d:", c->fi, LF);
+            emit_branch(c, in->blk2, in->args2, in->nargs2);
+            E(c, ".Lx%d_%d:", c->fi, LE);
+            break;
+        }
         if (in->nargs == 0 && in->nargs2 == 0) {
             if (in->blk == bi + 1) {
                 if (c->cmp_fuse && in->a >= 0 && c->cmp_fuse[in->a]) {
@@ -3556,6 +3626,58 @@ static int emit_func(Ctx *c, int fi) {
             }
         }
     }
+    /* WP33 fix 2: compound branch conditions. When a condbr's condition
+     * is an and/or/xor-with-1 tree whose internal nodes are all defined
+     * in the condbr's own block and single-use, mark every tree node
+     * cond_fuse: the nodes emit nothing at their definition sites and
+     * the terminator emits a compare-and-branch tree (emit_cond_tree).
+     * A tree operand that is not itself a markable node (defined in
+     * another block, multi-use, or not an icmp/and/or/xor-1) stays a
+     * materialized leaf the tree tests through its home. A lone icmp
+     * condition keeps the cmp_fuse path above. A loop-carried boolean
+     * therefore never materializes at all on the branch path: no setcc,
+     * no boolean op, no frame-slot round trip. */
+    c->cond_fuse = calloc((size_t)(f->nvalues > 0 ? f->nvalues : 1), sizeof(bool));
+    bool no_condfuse = getenv("KRELL_NO_CONDFUSE") != NULL;
+    for (int bi = 0; bi < f->nblocks && !no_condfuse; bi++) {
+        Block *b = &f->blocks[bi];
+        if (b->nins == 0) continue;
+        Instr *term = &b->ins[b->nins - 1];
+        if (term->op != OP_CONDBR || term->a < 0 || term->a >= f->nvalues) continue;
+        Instr *rd = c->defins[term->a];
+        if (!rd || rd < b->ins || rd >= b->ins + b->nins) continue;
+        if (rd->op != OP_AND && rd->op != OP_OR && rd->op != OP_XOR) continue;
+        if (uses[term->a] != 1) continue;
+        int stack[64], nodes[64], sp = 0, nn = 0;
+        bool ok = true;
+        stack[sp++] = term->a;
+        while (sp > 0 && ok) {
+            int v = stack[--sp];
+            Instr *d = c->defins[v];
+            if (nn >= 64) { ok = false; break; }
+            nodes[nn++] = v;
+            if (d->op == OP_ICMP) continue;
+            int ops[2] = { d->a, d->b };
+            int nops = 2;
+            if (d->op == OP_XOR) {
+                int64_t imm;
+                if (be_iconst_val(f, d->a, &imm) && imm == 1) { ops[0] = d->b; nops = 1; }
+                else if (be_iconst_val(f, d->b, &imm) && imm == 1) { ops[0] = d->a; nops = 1; }
+                else { ok = false; break; }
+            }
+            for (int oi = 0; oi < nops; oi++) {
+                int ov = ops[oi];
+                if (ov < 0 || ov >= f->nvalues) continue;
+                Instr *od = c->defins[ov];
+                if (!od || od < b->ins || od >= b->ins + b->nins) continue;
+                if (od->op != OP_ICMP && od->op != OP_AND && od->op != OP_OR && od->op != OP_XOR) continue;
+                if (uses[ov] != 1) continue;   /* multi-use: leaf */
+                if (sp >= 64) { ok = false; break; }
+                stack[sp++] = ov;
+            }
+        }
+        if (ok) for (int k = 0; k < nn; k++) c->cond_fuse[nodes[k]] = true;
+    }
     for (int bi = 0; bi < f->nblocks; bi++) {
         Block *b = &f->blocks[bi];
         for (int ii = 0; ii < b->nins; ii++) {
@@ -3665,7 +3787,7 @@ static int emit_func(Ctx *c, int fi) {
     }
     BeFunc *bf = be_analyze_ext(m, f, &pools, alloc_folded);
     if (merged_folded) free(alloc_folded);
-    if (!bf) { free(c->defins); c->defins = NULL; free(c->folded_ins); c->folded_ins = NULL; free(c->cmp_fuse); c->cmp_fuse = NULL; return -1; }
+    if (!bf) { free(c->defins); c->defins = NULL; free(c->folded_ins); c->folded_ins = NULL; free(c->cmp_fuse); c->cmp_fuse = NULL; free(c->cond_fuse); c->cond_fuse = NULL; return -1; }
     c->bf = bf;
     EarlyReturn er = detect_early_return(f);
     int early_lbl = 0;
@@ -3890,6 +4012,8 @@ static int emit_func(Ctx *c, int fi) {
     c->chain_off = NULL;
     free(c->cmp_fuse);
     c->cmp_fuse = NULL;
+    free(c->cond_fuse);
+    c->cond_fuse = NULL;
     return 0;
 }
 

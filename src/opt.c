@@ -3689,6 +3689,430 @@ static void replace_all_uses(Func *f, int oldv, int newv) {
     }
 }
 
+/* ---- WP33 fix 1: field-load extraction ----
+ * When a scalar integer load's value feeds only constant shift / mask /
+ * trunc chains that isolate a byte-aligned field, replace each chain by a
+ * direct field load (gep i8 ptr, byteoff + load iN) inserted immediately
+ * after the original load. The new loads sit at the same program point as
+ * the wide load, so no intervening store is crossed and the bytes read
+ * are exactly the bytes the wide load read. Bit-offset fields map to byte
+ * ranges under little-endian layout: every Krell target (x86_64, aarch64,
+ * rv64, and the LLVM lane whose data layout follows the target) is
+ * little-endian, and the reference interpreter models integer loads over
+ * the same byte order, so the transform does not depend on the backend.
+ * Only naturally aligned fields convert ((byteoff % fieldbytes) == 0).
+ * Leading zexts of the load value are seen through transitively (the
+ * HUF table shape: load i16 -> zext i32 -> zext i64 -> extracts on the
+ * widened values; the meaningful span stays the load width). A chain
+ * converts when every use of the wide value is a convertible chain
+ * (the wide load then dies, so even a 1-op chain is a strict win), or
+ * when the chain has >= 3 ops. If the wide load survives for a direct
+ * use, a short chain trades its ALU ops for an extra load plus address
+ * materialization -- not a clear win, and it perturbs shapes that later
+ * passes pattern-match (the backend's packed-blend detector keys on
+ * the shift/and form of a sibling channel whose mask path keeps the
+ * wide value alive; converting that channel's 2-op extract regressed
+ * the span kernel 1.41x). Long chains still fold profitably against a
+ * surviving wide load. Volatile loads (OP_LOADV) never
+ * match; chains through sext are left to the ALU path.
+ * Disable with KRELL_NO_FEXTRACT=1. */
+#define FX_MAXNODES 8
+#define FX_MAXCHAINS 24
+
+typedef struct {
+    int   nodes[FX_MAXNODES];
+    int   nnodes;
+    int   term_val;
+    int   off, span;
+    int   pre_slot;       /* -1: head consumes the load value itself;
+                           * >= 0: head consumes pre_idx[pre_slot]'s zext */
+    bool  conv;
+    Instr news[3];        /* [gep?] load [zext?] */
+    int   nnews;
+} FxChain;
+
+#define FX_MAXPRE 8
+
+typedef struct {
+    int     load_idx;
+    int     pre_idx[FX_MAXPRE];   /* leading zexts of the load value */
+    bool    pre_drop[FX_MAXPRE];
+    int     npre;
+    int     nch;
+    FxChain ch[FX_MAXCHAINS];
+    bool    drop;         /* wide load dies */
+} FxLoadPlan;
+
+typedef struct {
+    FxLoadPlan *loads;
+    int         nloads;
+    Instr      *prefix;   /* entry-block iconsts (block 0 only) */
+    int         nprefix;
+} FxBlockPlan;
+
+typedef struct {
+    int *ucount;          /* references in a/b/c/args/args2 */
+    int *nabc;            /* references in a/b/c */
+    int *use_blk;         /* single a/b/c use: block */
+    int *use_idx;         /* single a/b/c use: instruction index */
+} FxUses;
+
+static void fx_count_uses(Func *f, FxUses *u) {
+    int nv = f->nvalues;
+    u->ucount = calloc((size_t)(nv > 0 ? nv : 1), sizeof(int));
+    u->nabc   = calloc((size_t)(nv > 0 ? nv : 1), sizeof(int));
+    u->use_blk = malloc(sizeof(int) * (size_t)(nv > 0 ? nv : 1));
+    u->use_idx = malloc(sizeof(int) * (size_t)(nv > 0 ? nv : 1));
+    for (int v = 0; v < nv; v++) { u->use_blk[v] = -1; u->use_idx[v] = -1; }
+    for (int b = 0; b < f->nblocks; b++) {
+        Block *bl = &f->blocks[b];
+        for (int i = 0; i < bl->nins; i++) {
+            Instr *in = &bl->ins[i];
+            int ops[3] = { in->a, in->b, in->c };
+            for (int k = 0; k < 3; k++)
+                if (ops[k] >= 0) {
+                    u->ucount[ops[k]]++;
+                    u->nabc[ops[k]]++;
+                    u->use_blk[ops[k]] = b;
+                    u->use_idx[ops[k]] = i;
+                }
+            for (int k = 0; k < in->nargs; k++)
+                if (in->args[k] >= 0) u->ucount[in->args[k]]++;
+            for (int k = 0; k < in->nargs2; k++)
+                if (in->args2[k] >= 0) u->ucount[in->args2[k]]++;
+        }
+    }
+}
+
+/* field validity: byte aligned, natural alignment, proper subfield */
+static bool fx_field_ok(int off, int span, int width) {
+    if (off % 8 != 0) return false;
+    if (span != 8 && span != 16 && span != 32) return false;
+    if (off == 0 && span == width) return false;
+    if ((off / 8) % (span / 8) != 0) return false;
+    return true;
+}
+
+/* Walk one extract chain starting at block instruction head_idx, which
+ * consumes cur_val (the load value or its leading-zext value). On success
+ * fills ch (nodes + field + terminal value) and returns true. */
+static bool fx_walk(Func *f, int bi, Block *bl, int width,
+                    const FxUses *u, int cur_val, int head_idx, FxChain *ch) {
+    ch->nnodes = 0;
+    ch->off = 0;
+    ch->span = width;
+    ch->term_val = -1;
+    int cur_idx = head_idx;
+    for (;;) {
+        Instr *in = &bl->ins[cur_idx];
+        bool step = false;
+        if (in->op == OP_LSHR && in->a == cur_val) {
+            int64_t k;
+            if (!opt_find_iconst(f, in->b, &k)) return false;
+            if (k <= 0 || k >= ch->span) return false;
+            ch->off += (int)k;
+            ch->span -= (int)k;
+            step = true;
+        } else if (in->op == OP_AND && (in->a == cur_val || in->b == cur_val)) {
+            int other = (in->a == cur_val) ? in->b : in->a;
+            int64_t m;
+            if (other == cur_val) return false;
+            if (!opt_find_iconst(f, other, &m)) return false;
+            uint64_t um = (uint64_t)m;
+            if ((um & (um + 1)) != 0) return false;   /* not a low mask */
+            int w = __builtin_popcountll((unsigned long long)um);
+            if (w < 1) return false;
+            if (w < ch->span) ch->span = w;
+            step = true;
+        } else if (in->op == OP_TRUNC && in->a == cur_val) {
+            int t = in->ty.bits;
+            if (t <= 0 || t > ch->span) return false;
+            ch->span = t;
+            step = true;
+        } else if (in->op == OP_ZEXT && in->a == cur_val) {
+            /* terminal step: field zero-extended to the zext type */
+            if (ch->nnodes >= FX_MAXNODES) return false;
+            ch->nodes[ch->nnodes++] = cur_idx;
+            ch->term_val = in->result;
+            return fx_field_ok(ch->off, ch->span, width);
+        } else {
+            /* non-extract consumer: the chain ends at cur_val */
+            if (ch->nnodes == 0) return false;        /* direct use */
+            ch->term_val = cur_val;
+            return fx_field_ok(ch->off, ch->span, width);
+        }
+        if (!step) return false;
+        if (ch->nnodes >= FX_MAXNODES) return false;
+        ch->nodes[ch->nnodes++] = cur_idx;
+        int nv = in->result;
+        if (nv < 0) return false;
+        if (u->ucount[nv] != 1 || u->nabc[nv] != 1) {
+            ch->term_val = nv;
+            return fx_field_ok(ch->off, ch->span, width);
+        }
+        if (u->use_blk[nv] != bi) {
+            ch->term_val = nv;
+            return fx_field_ok(ch->off, ch->span, width);
+        }
+        cur_val = nv;
+        cur_idx = u->use_idx[nv];
+    }
+}
+
+static void opt_fextract(Func *f, OptStats *st) {
+    const char *e = getenv("KRELL_NO_FEXTRACT");
+    if (e && e[0] && e[0] != '0') return;
+    if (f->nblocks <= 0) return;
+    FxUses u;
+    fx_count_uses(f, &u);
+    FxBlockPlan *bp = calloc((size_t)f->nblocks, sizeof(FxBlockPlan));
+    /* per-function iconst cache for byte offsets: off -> value */
+    int64_t coff[64];
+    int     cval_[64];
+    int     ncoff = 0;
+    bool any = false;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *bl = &f->blocks[bi];
+        if (bl->nins <= 0) continue;
+        FxLoadPlan *plans = malloc(sizeof(FxLoadPlan) * (size_t)bl->nins);
+        int nplans = 0;
+        for (int li = 0; li < bl->nins; li++) {
+            Instr *ld = &bl->ins[li];
+            if (ld->op != OP_LOAD || ld->result < 0) continue;
+            if (ld->ty.kind != TY_INT) continue;
+            int W = ld->ty.bits;
+            if (W != 16 && W != 32 && W != 64) continue;
+            /* Frontier values: the load result itself plus the results
+             * of any zexts that consume a frontier value in this block,
+             * transitively (the optimizer widens narrow extracts to
+             * zext + wide op, sometimes twice -- HUF's nbBits chain hangs
+             * off a zext of a zext of the i16 load). Block order is
+             * def-before-use, so one scan discovers parents before
+             * children. The meaningful span at every frontier value is
+             * W bits regardless of the container width. */
+            int srcs[FX_MAXPRE + 1];
+            int preidx[FX_MAXPRE];
+            int preparent[FX_MAXPRE];   /* frontier slot each pre consumes */
+            int npre = 0;
+            srcs[0] = ld->result;
+            bool bail = false;
+            for (int i = 0; i < bl->nins; i++) {
+                Instr *z = &bl->ins[i];
+                if (z->op != OP_ZEXT || z->result < 0) continue;
+                int parent = -1;
+                for (int s = 0; s <= npre; s++)
+                    if (srcs[s] == z->a) { parent = s; break; }
+                if (parent < 0) continue;
+                if (npre >= FX_MAXPRE) { bail = true; break; }
+                preidx[npre] = i;
+                preparent[npre] = parent;
+                srcs[npre + 1] = z->result;
+                npre++;
+            }
+            if (bail) continue;
+            int nchildren[FX_MAXPRE + 1];
+            for (int s = 0; s <= npre; s++) nchildren[s] = 0;
+            for (int k = 0; k < npre; k++) nchildren[preparent[k]]++;
+            FxLoadPlan *pl = &plans[nplans];
+            pl->load_idx = li;
+            pl->npre = npre;
+            pl->nch = 0;
+            pl->drop = false;
+            for (int k = 0; k < npre; k++) {
+                pl->pre_idx[k] = preidx[k];
+                pl->pre_drop[k] = false;
+            }
+            /* per-frontier accounting: head refs found in this block vs
+             * references anywhere else (args, other blocks) = direct */
+            bool slot_direct[FX_MAXPRE + 1];
+            bool slot_allok[FX_MAXPRE + 1];
+            int  slot_nch[FX_MAXPRE + 1];
+            for (int s = 0; s <= npre; s++) {
+                slot_direct[s] = false;
+                slot_allok[s] = true;
+                slot_nch[s] = 0;
+            }
+            bool multi_ref = false;
+            for (int s = 0; s <= npre && !multi_ref; s++) {
+                int src = srcs[s];
+                int total_refs = 0;
+                for (int i = 0; i < bl->nins; i++) {
+                    if (i == li) continue;
+                    bool ispre = false;
+                    for (int k = 0; k < npre; k++)
+                        if (preidx[k] == i) ispre = true;
+                    if (ispre) continue;
+                    Instr *in = &bl->ins[i];
+                    int refs = (in->a == src) + (in->b == src) + (in->c == src);
+                    if (refs > 1) { multi_ref = true; break; }
+                    if (refs == 1) {
+                        total_refs++;
+                        if (pl->nch >= FX_MAXCHAINS) { multi_ref = true; break; }
+                        FxChain *ch = &pl->ch[pl->nch];
+                        ch->conv = false;
+                        ch->nnews = 0;
+                        ch->pre_slot = s - 1;
+                        if (!fx_walk(f, bi, bl, W, &u, src, i, ch)) {
+                            slot_allok[s] = false;
+                            continue;
+                        }
+                        pl->nch++;
+                        slot_nch[s]++;
+                    }
+                }
+                int accounted = total_refs + nchildren[s];
+                if (u.ucount[src] - accounted != 0) slot_direct[s] = true;
+            }
+            if (multi_ref || pl->nch == 0) continue;
+            bool total_death = !slot_direct[0];
+            for (int s = 0; s <= npre; s++)
+                if (!slot_allok[s] || slot_direct[s]) total_death = false;
+            int nconv = 0;
+            for (int ci = 0; ci < pl->nch; ci++) {
+                FxChain *ch = &pl->ch[ci];
+                if (total_death || ch->nnodes >= 3) { ch->conv = true; nconv++; }
+            }
+            if (nconv == 0) continue;
+            /* drops, children before parents: a frontier zext dies iff
+             * all its chains converted, it has no direct refs, and every
+             * zext consuming it died; the load dies iff the same holds
+             * for its own chains and every zext died */
+            for (int k = npre - 1; k >= 0; k--) {
+                bool allc = slot_allok[k + 1] && !slot_direct[k + 1];
+                if (allc) {
+                    for (int ci = 0; ci < pl->nch; ci++)
+                        if (pl->ch[ci].pre_slot == k && !pl->ch[ci].conv)
+                            allc = false;
+                    for (int j = 0; j < npre; j++)
+                        if (preparent[j] == k + 1 && !pl->pre_drop[j])
+                            allc = false;
+                }
+                pl->pre_drop[k] = allc;
+            }
+            {
+                bool allc = slot_allok[0] && !slot_direct[0];
+                if (allc) {
+                    for (int ci = 0; ci < pl->nch; ci++)
+                        if (pl->ch[ci].pre_slot == -1 && !pl->ch[ci].conv)
+                            allc = false;
+                    for (int k = 0; k < npre; k++)
+                        if (!pl->pre_drop[k]) allc = false;
+                }
+                pl->drop = allc;
+            }
+            /* build the replacement instructions */
+            int ptr = ld->a;
+            for (int ci = 0; ci < pl->nch; ci++) {
+                FxChain *ch = &pl->ch[ci];
+                if (!ch->conv) continue;
+                int byteoff = ch->off / 8;
+                int p = ptr;
+                if (byteoff != 0) {
+                    int kv = -1;
+                    for (int k = 0; k < ncoff; k++)
+                        if (coff[k] == byteoff) { kv = cval_[k]; break; }
+                    if (kv < 0 && ncoff < 64) {
+                        kv = lr_new_value(f, ty_i64());
+                        Instr ic = ins_iconst(ty_i64(), byteoff);
+                        ic.result = kv;
+                        FxBlockPlan *b0 = &bp[0];
+                        b0->prefix = realloc(b0->prefix,
+                            sizeof(Instr) * (size_t)(b0->nprefix + 1));
+                        b0->prefix[b0->nprefix++] = ic;
+                        coff[ncoff] = byteoff;
+                        cval_[ncoff] = kv;
+                        ncoff++;
+                    }
+                    if (kv < 0) { ch->conv = false; continue; }
+                    int gv = lr_new_value(f, ty_ptr());
+                    Instr g = ins_bin(OP_GEP, ty_ptr(), ptr, kv);
+                    g.ety = ty_i8();
+                    g.result = gv;
+                    ch->news[ch->nnews++] = g;
+                    p = gv;
+                }
+                Type ft = ty_int(ch->span);
+                int lv = lr_new_value(f, ft);
+                Instr l = ins_un(OP_LOAD, ft, p);
+                l.result = lv;
+                ch->news[ch->nnews++] = l;
+                int repl = lv;
+                Type tt = f->vtypes[ch->term_val];
+                if (tt.kind == TY_INT && tt.bits > ch->span) {
+                    int zv = lr_new_value(f, tt);
+                    Instr z = ins_un(OP_ZEXT, tt, lv);
+                    z.result = zv;
+                    ch->news[ch->nnews++] = z;
+                    repl = zv;
+                }
+                replace_all_uses(f, ch->term_val, repl);
+                st->rewritten++;
+                any = true;
+            }
+            if (pl->nch > 0) {
+                bool anyconv = false;
+                for (int ci = 0; ci < pl->nch; ci++)
+                    if (pl->ch[ci].conv) anyconv = true;
+                if (anyconv) plans[nplans++] = *pl;
+            }
+        }
+        bp[bi].loads = plans;
+        bp[bi].nloads = nplans;
+    }
+    if (any) {
+        for (int bi = 0; bi < f->nblocks; bi++) {
+            Block *bl = &f->blocks[bi];
+            FxBlockPlan *bpl = &bp[bi];
+            if (bpl->nloads == 0 && bpl->nprefix == 0) continue;
+            bool *del = calloc((size_t)(bl->nins > 0 ? bl->nins : 1), 1);
+            int nnew = bpl->nprefix;
+            for (int p = 0; p < bpl->nloads; p++) {
+                FxLoadPlan *pl = &bpl->loads[p];
+                for (int ci = 0; ci < pl->nch; ci++) {
+                    FxChain *ch = &pl->ch[ci];
+                    if (!ch->conv) continue;
+                    nnew += ch->nnews;
+                    for (int n = 0; n < ch->nnodes; n++) del[ch->nodes[n]] = true;
+                }
+                if (pl->drop) del[pl->load_idx] = true;
+                for (int k = 0; k < pl->npre; k++)
+                    if (pl->pre_drop[k]) del[pl->pre_idx[k]] = true;
+            }
+            Instr *nb = malloc(sizeof(Instr) * (size_t)(bl->nins + nnew + 1));
+            int nn = 0;
+            for (int k = 0; k < bpl->nprefix; k++) nb[nn++] = bpl->prefix[k];
+            for (int i = 0; i < bl->nins; i++) {
+                /* insertions anchored at each plan's load position */
+                for (int p = 0; p < bpl->nloads; p++) {
+                    FxLoadPlan *pl = &bpl->loads[p];
+                    if (pl->load_idx != i) continue;
+                    if (!del[i]) nb[nn++] = bl->ins[i];
+                    for (int ci = 0; ci < pl->nch; ci++) {
+                        FxChain *ch = &pl->ch[ci];
+                        if (!ch->conv) continue;
+                        for (int n = 0; n < ch->nnews; n++)
+                            nb[nn++] = ch->news[n];
+                    }
+                    goto placed;
+                }
+                if (!del[i]) nb[nn++] = bl->ins[i];
+            placed:
+                continue;
+            }
+            free(bl->ins);
+            bl->ins = nb;
+            bl->nins = nn;
+            bl->cap = nn;
+        }
+    }
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        free(bp[bi].loads);
+        free(bp[bi].prefix);
+    }
+    free(bp);
+    free(u.ucount); free(u.nabc); free(u.use_blk); free(u.use_idx);
+}
+
 static void opt_share_range_subs(Func *f, OptStats *st) {
     int nb = f->nblocks;
     if (nb <= 1) return;
@@ -3789,6 +4213,11 @@ void opt_optimize(Module *m, const Cost *cost, OptStats *st) {
          * duplicate sub name the same value the fold's sub consumes
          * (before that it reads the successor's own block parameter). */
         opt_share_range_subs(f, st);
+        /* WP33 fix 1: field-load extraction; runs on the final block
+         * structure, after share_range_subs (its rewrites do not depend
+         * on block-argument identity, and nothing after it pattern-matches
+         * the load/extract shapes it removes). */
+        opt_fextract(f, st);
     }
     const char *ve = mod_verify(m);
     if (ve && snap) {
