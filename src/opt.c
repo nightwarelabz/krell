@@ -1594,8 +1594,18 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
                  * (the bench's mix kernel: 1.013 scalar, 1.189
                  * vectorized). Chains with a 64-bit multiply stay
                  * scalar; narrower multiplies are single packed
-                 * instructions and vectorize freely. */
-                if (!g_bad && g_mul && src_gep->ety.bits == 64) g_bad = true;
+                 * instructions and vectorize freely.
+                 * WP26: that measurement is a vl-4 balance (2 i64
+                 * lanes per decomposition). At vl >= 8 the same
+                 * decomposition covers 4 lanes and the balance
+                 * flips (LOCAL-ANALYSIS §1.3), so the rejection is
+                 * width- and price-gated: wide targets with a priced
+                 * vector multiply take the vector form. */
+                if (!g_bad && g_mul && src_gep->ety.bits == 64 &&
+                    !(cost_vl_i32(cost) >= 8 &&
+                      !cost_cliff(cost, OP_VMUL, ty_vec(src_gep->ety, 1)) &&
+                      cost_lat(cost, OP_VMUL, ty_vec(src_gep->ety, 1)) >= 0))
+                    g_bad = true;
                 /* chain operands and results must stay inside the chain */
                 for (int ci = 0; ci < g_nchain && !g_bad; ci++) {
                     Instr *in = g_chain[ci];
@@ -1607,11 +1617,18 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
                         bool ok = false;
                         for (int cj = 0; cj < ci; cj++) if (g_chain[cj]->result == v) { ok = true; break; }
                         if (ok) continue;
-                        /* constant defined by an iconst in B, or a
-                         * loop-invariant block argument: a splat source */
+                        /* constant defined by an iconst anywhere in
+                         * the function, or a loop-invariant block
+                         * argument: a splat source. The splat
+                         * emission re-materializes the constant in
+                         * the preheader from its immediate
+                         * (opt_find_iconst), so the defining block
+                         * is irrelevant — since the v3.0 entry-block
+                         * constant hoist, body constants normally
+                         * live outside B, and a B-local test would
+                         * reject every constant-bearing chain. */
                         bool is_iconst = false;
-                        for (int k = 0; k < B->nins - 1; k++)
-                            if (B->ins[k].op == OP_ICONST && B->ins[k].result == v) { is_iconst = true; break; }
+                        { int64_t cv_tmp; if (opt_find_iconst(f, v, &cv_tmp)) is_iconst = true; }
                         bool is_invar = false;
                         if (!is_iconst) {
                             for (int a = 0; a < B->nargs; a++) {
@@ -1907,10 +1924,22 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
                 is_vwiden = true;
         }
         if (is_vwiden) is_swar = false;
-        bool use_scalar_unroll = (is_reduce && elem_ty.kind == TY_INT && elem_ty.bits == 64) || is_histo || is_fnv || (is_widen && !is_vwiden);
-        bool use_scalar_reduce = is_reduce && ((elem_ty.kind == TY_INT && elem_ty.bits == 64) || (is_widen && !is_vwiden));
-
         int vl_i32 = cost_vl_i32(cost);
+        /* WP26: the i64 reduce class (dot/sumsq shape) takes the
+         * vector path when the target is wide enough for the
+         * pmuludq-decomposition multiply to pay (vl >= 8: 4 i64
+         * lanes per op) and prices VMUL; at vl 4 the WP19 scalar
+         * unroll stays — it measured at parity there and the
+         * decomposition does not (LOCAL-ANALYSIS §1.2). The price
+         * checks keep targets that cannot carry the vector form on
+         * the scalar path instead of losing the rewrite below. */
+        bool vec_i64 = elem_ty.kind == TY_INT && elem_ty.bits == 64 &&
+                       vl_i32 >= 8 &&
+                       !cost_cliff(cost, OP_VMUL, ty_vec(elem_ty, 1)) &&
+                       cost_lat(cost, OP_VMUL, ty_vec(elem_ty, 1)) >= 0;
+        bool use_scalar_unroll = (is_reduce && elem_ty.kind == TY_INT && elem_ty.bits == 64 && !vec_i64) || is_histo || is_fnv || (is_widen && !is_vwiden);
+        bool use_scalar_reduce = is_reduce && ((elem_ty.kind == TY_INT && elem_ty.bits == 64 && !vec_i64) || (is_widen && !is_vwiden));
+
         int lanes = use_scalar_unroll ? 1 : ((vl_i32 * 32) / elem_ty.bits);
         if (lanes < 1 || (!use_scalar_unroll && lanes < 2)) continue;
         Type vec_ty = ty_vec(elem_ty, 1);
@@ -2106,8 +2135,16 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
                     scalar = lr_new_value(f, elem_ty);
                     Instr ic = ins_iconst(elem_ty, (uint64_t)cv);
                     ic.result = scalar;
-                    if (pb->nins == pb->cap) {
+                    /* Two writes follow (the iconst and the restored
+                     * terminator) after pb->nins was decremented
+                     * above, so the array needs two free slots, not
+                     * one; the old nins == cap test overflowed the
+                     * block by one Instr whenever the preheader was
+                     * exactly full (WP26: reachable again now that
+                     * the gmap matcher accepts hoisted constants). */
+                    if (pb->nins + 2 > pb->cap) {
                         pb->cap = pb->cap ? pb->cap * 2 : 16;
+                        if (pb->cap < pb->nins + 2) pb->cap = pb->nins + 2;
                         pb->ins = realloc(pb->ins, (size_t)pb->cap * sizeof(Instr));
                     }
                     pb->ins[pb->nins++] = ic;
@@ -2584,26 +2621,65 @@ static void opt_vectorize_loops(Module *m, Func *f, const Cost *cost, OptStats *
                     }
                 }
             } else {
-                int cur_acc_sum = ve_acc[0];
-                for (int u = 1; u < num_acc; u++) {
-                    Instr a_u = ins_bin(OP_VADD, is_vwiden ? acc_ty : vec_ty, cur_acc_sum, ve_acc[u]);
-                    cur_acc_sum = emit(f, b_vexit, a_u);
-                }
                 /* WP25: the vwiden accumulator vector carries the
                  * widened element type, so the lane fold extracts
                  * widen_acc_ty lanes, not elem_ty lanes. */
                 int sum_lanes = is_vwiden ? ty_lanes(acc_ty, vl_i32) : lanes;
                 Type sum_ty = is_vwiden ? widen_acc_ty : elem_ty;
+                /* WP26: for integer reduces, wrapping add is
+                 * associative, so the accumulator combine and the
+                 * lane fold are emitted as balanced pairwise trees
+                 * (dependency depth log2(n) instead of a serial
+                 * chain). The vwiden fold keeps its WP25 shape
+                 * exactly, and float reduces keep the serial fold:
+                 * reassociation would change their results bit-wise. */
+                bool tree_fold = !is_vwiden && sum_ty.kind == TY_INT;
+                int cur_acc_sum;
+                if (tree_fold) {
+                    int accs[8];
+                    for (int u = 0; u < num_acc; u++) accs[u] = ve_acc[u];
+                    int n = num_acc;
+                    while (n > 1) {
+                        int m = 0;
+                        for (int u = 0; u + 1 < n; u += 2) {
+                            Instr a_u = ins_bin(OP_VADD, vec_ty, accs[u], accs[u + 1]);
+                            accs[m++] = emit(f, b_vexit, a_u);
+                        }
+                        if (n & 1) accs[m++] = accs[n - 1];
+                        n = m;
+                    }
+                    cur_acc_sum = accs[0];
+                } else {
+                    cur_acc_sum = ve_acc[0];
+                    for (int u = 1; u < num_acc; u++) {
+                        Instr a_u = ins_bin(OP_VADD, is_vwiden ? acc_ty : vec_ty, cur_acc_sum, ve_acc[u]);
+                        cur_acc_sum = emit(f, b_vexit, a_u);
+                    }
+                }
                 int lane_vals[16];
                 for (int l = 0; l < sum_lanes; l++) {
                     Instr ext = ins_un(OP_VEXTRACT, sum_ty, cur_acc_sum);
                     ext.imm = l;
                     lane_vals[l] = emit(f, b_vexit, ext);
                 }
-                cur_sum = lane_vals[0];
-                for (int l = 1; l < sum_lanes; l++) {
-                    Instr sadd = ins_bin(OP_ADD, sum_ty, cur_sum, lane_vals[l]);
-                    cur_sum = emit(f, b_vexit, sadd);
+                if (tree_fold) {
+                    int n = sum_lanes;
+                    while (n > 1) {
+                        int m = 0;
+                        for (int l = 0; l + 1 < n; l += 2) {
+                            Instr sadd = ins_bin(OP_ADD, sum_ty, lane_vals[l], lane_vals[l + 1]);
+                            lane_vals[m++] = emit(f, b_vexit, sadd);
+                        }
+                        if (n & 1) lane_vals[m++] = lane_vals[n - 1];
+                        n = m;
+                    }
+                    cur_sum = lane_vals[0];
+                } else {
+                    cur_sum = lane_vals[0];
+                    for (int l = 1; l < sum_lanes; l++) {
+                        Instr sadd = ins_bin(OP_ADD, sum_ty, cur_sum, lane_vals[l]);
+                        cur_sum = emit(f, b_vexit, sadd);
+                    }
                 }
             }
             Instr final_add = ins_bin(OP_ADD, comb_ty, orig_acc, cur_sum);
