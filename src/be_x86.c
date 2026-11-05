@@ -1,7 +1,10 @@
 /* Krell — x86_64 backend (System V, GNU as, Intel syntax).
  * Values: GP in 64-bit regs/slots, canonical zero-extended; FP in xmm;
  * vectors memory-resident, chunked through xmm15. Scratch: rax, rcx, rdx,
- * r11 (GP — excluded from the pool), xmm15 (FP). Division and float
+ * r11 (GP — excluded from the pool), xmm13, xmm14, xmm15 (FP — excluded
+ * from the pool; the emitter stages vector lanes, decomposition
+ * partials, span-pattern constants and insert quarters through them,
+ * so no value may ever be homed there). Division and float
  * conversion sequences implement the defined semantics of SEMANTICS.md. */
 #include "be.h"
 #include <stdarg.h>
@@ -14,9 +17,23 @@ static const char *G8[15]  = { "al","cl","dl","bl","sil","dil","r8b","r9b","r10b
 static const char **gname(int sz) { return sz == 8 ? G64 : sz == 4 ? G32 : sz == 2 ? G16 : G8; }
 static const int ARG_GP[6] = { RDI, RSI, RDX, RCX, R8, R9 };
 
+/* FP homes: xmm0-xmm12 only. xmm13, xmm14 and xmm15 are permanent
+ * emitter scratch, mirroring the GP side's exclusion of R11: the
+ * scalarized lane loops stage result quarters and operands in
+ * xmm13/xmm14 (vec_insert_reg512's stage registers, the vl-8
+ * high-half inserts, the float lane loop's second operand), the
+ * i64 multiply decomposition keeps partials in xmm13 and stages a
+ * slot-resident operand in xmm14, OP_VINSERT stages its scalar
+ * operand in xmm14 on the wide tiers, and the span pattern treats
+ * xmm14 as a permanent zero beside its xmm15 constant. All of
+ * those sites run with no clobber protection (POOL entries carry
+ * clob=0 and x86_clob_mask models GP classes only), so homing a
+ * value in xmm13/xmm14 was a live miscompile under register
+ * pressure (WP29C: >=14 live vectors across such an op destroyed
+ * the value homed there; battery cases vecstage/vecstageu). */
 static const PoolReg POOL_FP[] = {
     { 0, 0, 0 },{ 1, 0, 0 },{ 2, 0, 0 },{ 3, 0, 0 },{ 4, 0, 0 },{ 5, 0, 0 },{ 6, 0, 0 },{ 7, 0, 0 },
-    { 8, 0, 0 },{ 9, 0, 0 },{ 10, 0, 0 },{ 11, 0, 0 },{ 12, 0, 0 },{ 13, 0, 0 },{ 14, 0, 0 },
+    { 8, 0, 0 },{ 9, 0, 0 },{ 10, 0, 0 },{ 11, 0, 0 },{ 12, 0, 0 },
 };
 
 typedef struct {
@@ -2318,8 +2335,9 @@ static void emit_instr(Ctx *c, int bi, int ii) {
             in->ty.n == 1 && f->vtypes[in->a].n == 1) {
             /* psadbw against zero sums each group of 8 bytes into one
              * 64-bit lane: the op's exact semantics at this shape.
-             * Register discipline: xmm15 is the only FP scratch (the
-             * pool owns xmm0-14), so the zero lives in xmm15 and the
+             * Register discipline: xmm13, xmm14 and xmm15 are the
+             * FP scratch registers (the pool owns xmm0-xmm12), so
+             * the zero lives in xmm15 and the
              * operand is staged into the result register first (the
              * operand may itself live in xmm15; it is read before the
              * zero is materialized). A slot-resident result stages
@@ -3632,7 +3650,7 @@ static int emit_func(Ctx *c, int fi) {
             merged_folded = true;
         }
     }
-    Pools pools = { POOL_GP, 13, POOL_FP, 15, 1, v512(c) ? 64 : vwide(c) ? 32 : 16, NULL, NULL, NULL, NULL, NULL };
+    Pools pools = { POOL_GP, 13, POOL_FP, 13, 1, v512(c) ? 64 : vwide(c) ? 32 : 16, NULL, NULL, NULL, NULL, NULL };
     pools.clob_mask = x86_clob_mask;
     pools.clob_bless = x86_clob_bless;
     pools.clob_defmask = x86_clob_defmask;
