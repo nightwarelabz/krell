@@ -2154,7 +2154,56 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         Loc *dl = &c->bf->loc[in->result], *al = &c->bf->loc[in->a], *bl = &c->bf->loc[in->b];
         if (dl->is_reg) {
             int dreg = dl->idx;
-            if (al->is_reg && al->idx == dreg) {
+            /* The packed mnemonic is a pure function of op and
+             * element type; it is computed here, ahead of the
+             * operand staging, because the staging decision below
+             * needs to know whether the generic packed form will
+             * be the emission path. (OP_VUDIV deliberately has no
+             * packed form: it must fall through to the scalarized
+             * lane loop, so nm stays NULL for it.) */
+            const char *nm = NULL;
+            if (et.kind == TY_FLOAT) {
+                nm = in->op == OP_VFADD ? (et.bits == 32 ? "addps" : "addpd") :
+                     in->op == OP_VFSUB ? (et.bits == 32 ? "subps" : "subpd") :
+                     in->op == OP_VFMUL ? (et.bits == 32 ? "mulps" : "mulpd") :
+                     in->op == OP_VFDIV ? (et.bits == 32 ? "divps" : "divpd") : NULL;
+            } else if (in->op == OP_VAND) nm = "pand";
+            else if (in->op == OP_VOR) nm = "por";
+            else if (in->op == OP_VXOR) nm = "pxor";
+            else {
+                nm = in->op == OP_VADD ? (et.bits == 64 ? "paddq" : et.bits == 32 ? "paddd" : et.bits == 16 ? "paddw" : "paddb") :
+                     in->op == OP_VSUB ? (et.bits == 64 ? "psubq" : et.bits == 32 ? "psubd" : et.bits == 16 ? "psubw" : "psubb") :
+                     in->op == OP_VMUL ? (et.bits == 32 ? "pmulld" : et.bits == 16 ? "pmullw" : NULL) : NULL;
+            }
+            bool fused_sq = in->op == OP_VADD && et.kind == TY_INT && et.bits == 64
+                && in->b >= 0 && c->defins[in->b]
+                && c->defins[in->b]->op == OP_VMUL
+                && c->defins[in->b]->a == c->defins[in->b]->b
+                && c->folded_ins && c->folded_ins[in->b];
+            bool mul64 = in->op == OP_VMUL && et.kind == TY_INT && et.bits == 64;
+            /* WP37-A copy elision: on the VEX/EVEX tiers the packed
+             * forms and the i64 multiply decomposition are fully
+             * three-operand — the result can be written straight
+             * from operand a's home, so the staging copy of a into
+             * dreg is skipped and the sub-paths below read a from
+             * asrc. Elision is restricted to exactly those two
+             * paths (mul64, or nm != NULL without the fused-square
+             * pattern); the fused-square add keeps its materialized
+             * accumulator, OP_VUDIV and every nm == NULL shape keep
+             * the copy because they fall through to the scalarized
+             * lane loop, and the vl-4 tier (two-operand forms) is
+             * unchanged. Safety: asrc is an ordinary pool home —
+             * never an emitter scratch (xmm13/14/15) — every read
+             * of asrc in the elided paths precedes the single write
+             * to dreg, and a is never written before its last read,
+             * so a value live past this op keeps its home intact. */
+            bool elide = (vwide(c) || v512(c)) && al->is_reg && !fused_sq
+                && (mul64 || nm != NULL);
+            int asrc = elide ? al->idx : dreg;
+            if (elide) {
+                /* a is read from its home by the three-operand
+                 * forms below; nothing is staged into dreg */
+            } else if (al->is_reg && al->idx == dreg) {
                 /* already in dreg */
             } else if (al->is_reg) {
                 if (v512(c)) E(c, "  vmovaps zmm%d, zmm%d", dreg, al->idx);
@@ -2180,9 +2229,11 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                         E(c, "  vpmullq zmm15, zmm%d, zmm%d", sreg, sreg);
                         E(c, "  vpaddq zmm%d, zmm%d, zmm15", dreg, dreg);
                     } else if (vwide(c)) {
-                        /* per-64-bit-lane decomposition, ymm forms */
-                        E(c, "  vmovdqa ymm15, ymm%d", sreg);
-                        E(c, "  vpsrlq ymm15, ymm15, 32");
+                        /* per-64-bit-lane decomposition, ymm forms.
+                         * WP37-A: the high half is derived straight
+                         * from the source home with the three-
+                         * operand shift; no staging copy. */
+                        E(c, "  vpsrlq ymm15, ymm%d, 32", sreg);
                         E(c, "  vpmuludq ymm15, ymm15, ymm%d", sreg);
                         E(c, "  vpsllq ymm15, ymm15, 33");
                         E(c, "  vpmuludq ymm%d, ymm%d, ymm%d", sreg, sreg, sreg);
@@ -2204,36 +2255,49 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                 if (v512(c)) {
                     /* AVX512DQ vpmullq: the full 64x64 low product
                      * in one instruction (the vl-4/vl-8 tiers keep
-                     * the pmuludq decomposition below). */
+                     * the pmuludq decomposition below). WP37-A:
+                     * the multiplicand is read from asrc (a's home
+                     * when the staging copy was elided). */
                     if (in->a == in->b) {
-                        E(c, "  vpmullq zmm%d, zmm%d, zmm%d", dreg, dreg, dreg);
+                        E(c, "  vpmullq zmm%d, zmm%d, zmm%d", dreg, asrc, asrc);
                     } else {
                         int breg = bl->is_reg ? bl->idx : 14;
                         if (!bl->is_reg) E(c, "  vmovups zmm14, [rbp - %d]", bl->off);
-                        E(c, "  vpmullq zmm%d, zmm%d, zmm%d", dreg, dreg, breg);
+                        E(c, "  vpmullq zmm%d, zmm%d, zmm%d", dreg, asrc, breg);
                     }
                     break;
                 }
                 if (vwide(c)) {
+                    /* WP37-A: the decomposition reads a from asrc
+                     * and derives both high halves with three-
+                     * operand shifts straight out of the operand
+                     * homes — no staging copies. The multiplier's
+                     * high half (vpsrlq ymm13) is one instruction
+                     * where the old code spent a copy plus a shift;
+                     * a true hoist of that derivation out of loops
+                     * would need an allocator home for the derived
+                     * value, which the emitter cannot supply from
+                     * its scratch registers without breaking the
+                     * staging discipline, so the single shift is
+                     * what this layer can safely take. Every read
+                     * of asrc/breg precedes the first write to dreg;
+                     * ymm13/ymm15 remain pure scratch. */
                     if (in->a == in->b) {
-                        E(c, "  vmovdqa ymm15, ymm%d", dreg);
-                        E(c, "  vpsrlq ymm15, ymm15, 32");
-                        E(c, "  vpmuludq ymm15, ymm15, ymm%d", dreg);
+                        E(c, "  vpsrlq ymm15, ymm%d, 32", asrc);
+                        E(c, "  vpmuludq ymm15, ymm15, ymm%d", asrc);
                         E(c, "  vpsllq ymm15, ymm15, 33");
-                        E(c, "  vpmuludq ymm%d, ymm%d, ymm%d", dreg, dreg, dreg);
+                        E(c, "  vpmuludq ymm%d, ymm%d, ymm%d", dreg, asrc, asrc);
                         E(c, "  vpaddq ymm%d, ymm%d, ymm15", dreg, dreg);
                     } else {
                         int breg = bl->is_reg ? bl->idx : 14;
                         if (!bl->is_reg) E(c, "  vmovups ymm14, [rbp - %d]", bl->off);
-                        E(c, "  vmovdqa ymm15, ymm%d", dreg);
-                        E(c, "  vpsrlq ymm15, ymm15, 32");
+                        E(c, "  vpsrlq ymm15, ymm%d, 32", asrc);
                         E(c, "  vpmuludq ymm15, ymm15, ymm%d", breg);
-                        E(c, "  vmovdqa ymm13, ymm%d", breg);
-                        E(c, "  vpsrlq ymm13, ymm13, 32");
-                        E(c, "  vpmuludq ymm13, ymm13, ymm%d", dreg);
+                        E(c, "  vpsrlq ymm13, ymm%d, 32", breg);
+                        E(c, "  vpmuludq ymm13, ymm13, ymm%d", asrc);
                         E(c, "  vpaddq ymm15, ymm15, ymm13");
                         E(c, "  vpsllq ymm15, ymm15, 32");
-                        E(c, "  vpmuludq ymm%d, ymm%d, ymm%d", dreg, dreg, breg);
+                        E(c, "  vpmuludq ymm%d, ymm%d, ymm%d", dreg, asrc, breg);
                         E(c, "  vpaddq ymm%d, ymm%d, ymm15", dreg, dreg);
                     }
                     break;
@@ -2261,24 +2325,6 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                 }
                 break;
             }
-            const char *nm = NULL;
-            if (et.kind == TY_FLOAT) {
-                nm = in->op == OP_VFADD ? (et.bits == 32 ? "addps" : "addpd") :
-                     in->op == OP_VFSUB ? (et.bits == 32 ? "subps" : "subpd") :
-                     in->op == OP_VFMUL ? (et.bits == 32 ? "mulps" : "mulpd") :
-                                          (et.bits == 32 ? "divps" : "divpd");
-            } else if (in->op == OP_VAND) nm = "pand";
-            else if (in->op == OP_VOR) nm = "por";
-            else if (in->op == OP_VXOR) nm = "pxor";
-            else {
-                nm = in->op == OP_VADD ? (et.bits == 64 ? "paddq" : et.bits == 32 ? "paddd" : et.bits == 16 ? "paddw" : "paddb") :
-                     in->op == OP_VSUB ? (et.bits == 64 ? "psubq" : et.bits == 32 ? "psubd" : et.bits == 16 ? "psubw" : "psubb") :
-                     in->op == OP_VMUL ? (et.bits == 32 ? "pmulld" : et.bits == 16 ? "pmullw" : NULL) : NULL;
-                /* OP_VUDIV deliberately has no packed form here: the
-                 * fallthrough above once mapped it onto pmulld/pmullw,
-                 * so a register-resident vudiv MULTIPLIED. It falls
-                 * through to the scalarized lane loop instead. */
-            }
             if (nm) {
                 if (v512(c)) {
                     char evnm[16];
@@ -2288,12 +2334,12 @@ static void emit_instr(Ctx *c, int bi, int ii) {
                         snprintf(evnm, sizeof evnm, "%s%c", nm, et.bits == 64 ? 'q' : 'd');
                         nm = evnm;
                     }
-                    if (bl->is_reg) E(c, "  v%s zmm%d, zmm%d, zmm%d", nm, dreg, dreg, bl->idx);
-                    else E(c, "  v%s zmm%d, zmm%d, [rbp - %d]", nm, dreg, dreg, bl->off);
+                    if (bl->is_reg) E(c, "  v%s zmm%d, zmm%d, zmm%d", nm, dreg, asrc, bl->idx);
+                    else E(c, "  v%s zmm%d, zmm%d, [rbp - %d]", nm, dreg, asrc, bl->off);
                 }
                 else if (vwide(c)) {
-                    if (bl->is_reg) E(c, "  v%s ymm%d, ymm%d, ymm%d", nm, dreg, dreg, bl->idx);
-                    else E(c, "  v%s ymm%d, ymm%d, [rbp - %d]", nm, dreg, dreg, bl->off);
+                    if (bl->is_reg) E(c, "  v%s ymm%d, ymm%d, ymm%d", nm, dreg, asrc, bl->idx);
+                    else E(c, "  v%s ymm%d, ymm%d, [rbp - %d]", nm, dreg, asrc, bl->off);
                 }
                 else if (bl->is_reg) E(c, "  %s xmm%d, xmm%d", nm, dreg, bl->idx);
                 else E(c, "  %s xmm%d, [rbp - %d]", nm, dreg, bl->off);
@@ -2548,19 +2594,23 @@ static void emit_instr(Ctx *c, int bi, int ii) {
              * own shift amount: the packed form is lane-exact. */
             int dreg = dl->idx;
             if (v512(c)) {
-                if (al->is_reg && al->idx == dreg) { /* already in place */ }
-                else if (al->is_reg) E(c, "  vmovaps zmm%d, zmm%d", dreg, al->idx);
+                /* WP37-A: three-operand form reads a from its home;
+                 * a copy is staged only for a slot-resident a (the
+                 * count operand position cannot take the value
+                 * operand's memory form). */
+                int asrc = dreg;
+                if (al->is_reg) asrc = al->idx;
                 else E(c, "  vmovups zmm%d, [rbp - %d]", dreg, al->off);
-                if (bl->is_reg) E(c, "  vpsrlq zmm%d, zmm%d, xmm%d", dreg, dreg, bl->idx);
-                else E(c, "  vpsrlq zmm%d, zmm%d, [rbp - %d]", dreg, dreg, bl->off);
+                if (bl->is_reg) E(c, "  vpsrlq zmm%d, zmm%d, xmm%d", dreg, asrc, bl->idx);
+                else E(c, "  vpsrlq zmm%d, zmm%d, [rbp - %d]", dreg, asrc, bl->off);
                 break;
             }
             if (vwide(c)) {
-                if (al->is_reg && al->idx == dreg) { /* already in place */ }
-                else if (al->is_reg) E(c, "  vmovaps ymm%d, ymm%d", dreg, al->idx);
+                int asrc = dreg;
+                if (al->is_reg) asrc = al->idx;
                 else E(c, "  vmovups ymm%d, [rbp - %d]", dreg, al->off);
-                if (bl->is_reg) E(c, "  vpsrlq ymm%d, ymm%d, xmm%d", dreg, dreg, bl->idx);
-                else E(c, "  vpsrlq ymm%d, ymm%d, [rbp - %d]", dreg, dreg, bl->off);
+                if (bl->is_reg) E(c, "  vpsrlq ymm%d, ymm%d, xmm%d", dreg, asrc, bl->idx);
+                else E(c, "  vpsrlq ymm%d, ymm%d, [rbp - %d]", dreg, asrc, bl->off);
                 break;
             }
             if (al->is_reg && al->idx == dreg) { /* already in place */ }
