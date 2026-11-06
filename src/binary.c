@@ -319,7 +319,7 @@ static void reg_value(Func *f, int32_t id, Type t) {
         f->cval    = realloc(f->cval,    (size_t)nc * sizeof(uint64_t));
         f->cval_hi = realloc(f->cval_hi, (size_t)nc * sizeof(uint64_t));
         f->isconst = realloc(f->isconst, (size_t)nc);
-        for (int i = f->vcap; i < nc; i++) { f->cval[i] = 0; f->cval_hi[i] = 0; f->isconst[i] = 0; }
+        for (int i = f->vcap; i < nc; i++) { f->vtypes[i] = ty_void(); f->cval[i] = 0; f->cval_hi[i] = 0; f->isconst[i] = 0; }
         f->vcap = nc;
     }
     f->vtypes[id] = t;

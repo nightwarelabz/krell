@@ -72,7 +72,79 @@ static void roundtrip(Module *m, const char *what) {
     mod_free(d);
 }
 
+/* WP38: decode determinism over dead value ids. Optimizing a module
+ * leaves gaps in its value numbering; the encoded stream carries only
+ * the surviving ids, so decode registers values sparsely and the
+ * type slots of dead ids are never written by the stream. Verify
+ * after decode must not depend on what the heap left in those slots
+ * (binary.c reg_value grew vtypes without clearing the new region;
+ * cval/isconst were cleared, vtypes was not). Build DCE bait, let the
+ * optimizer gut it, then decode+verify 100 times under heap poison:
+ * every attempt must verify. */
+static void prime_heap(void) {
+    static const size_t sizes[] = { 160, 176, 320, 336, 640, 656, 1280, 1296, 2560, 2576, 5120 };
+    uint32_t s = 0x12345678u;
+    for (int r = 0; r < 3; r++)
+        for (unsigned k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) {
+            uint8_t *p = malloc(sizes[k]);
+            if (!p) continue;
+            for (size_t i = 0; i < sizes[k]; i++) { s = s * 1664525u + 1013904223u; p[i] = (uint8_t)(s >> 24); }
+            free(p);
+        }
+}
+
+static void test_decode_dead_ids(void) {
+    Module *m = mod_new();
+    Func *f = mod_add_func(m, "bait", ty_i64(), 0);
+    Type pa[1] = { ty_i64() };
+    int b0 = func_add_block(f, pa, 1);
+    int x = f->blocks[b0].arg_vals[0];
+    int acc = x;
+    for (int i = 0; i < 300; i++) {
+        int c = emit(f, b0, ins_iconst(ty_i64(), 1000 + i * 7));
+        int t = emit(f, b0, ins_bin(OP_MUL, ty_i64(), x, c));
+        (void)emit(f, b0, ins_bin(OP_XOR, ty_i64(), t, c)); /* dead */
+        if (i % 97 == 0) acc = emit(f, b0, ins_bin(OP_ADD, ty_i64(), acc, t));
+    }
+    emit(f, b0, ins_ret(acc));
+    Cost *cost = cost_load("x86_64");
+    CHECK(cost != NULL, "dead-id case: cost table loads");
+    if (!cost) { mod_free(m); return; }
+    OptStats st;
+    opt_optimize(m, cost, &st);
+    size_t n; uint8_t *enc = mod_encode(m, &n);
+    char err[128];
+    Module *d = mod_decode(enc, n, err, sizeof err);
+    CHECK(d != NULL, "dead-id case: sparse module decodes");
+    if (!d) { free(enc); mod_free(m); return; }
+    Func *df = &d->funcs[0];
+    char *seen = calloc((size_t)df->nvalues, 1);
+    for (int bi = 0; bi < df->nblocks; bi++) {
+        Block *b = &df->blocks[bi];
+        for (int i = 0; i < b->nargs; i++) seen[b->arg_vals[i]] = 1;
+        for (int i = 0; i < b->nins; i++) if (b->ins[i].result >= 0) seen[b->ins[i].result] = 1;
+    }
+    int dead = 0;
+    for (int i = 0; i < df->nvalues; i++) if (!seen[i]) dead++;
+    free(seen);
+    CHECK(dead > 100, "dead-id case: optimized module carries many dead ids");
+    mod_free(d);
+    int bad = 0;
+    for (int it = 0; it < 100; it++) {
+        prime_heap();
+        Module *dd = mod_decode(enc, n, err, sizeof err);
+        if (!dd) { bad++; continue; }
+        if (mod_verify(dd)) bad++;
+        mod_free(dd);
+    }
+    CHECK(bad == 0, "dead-id case: decode+verify is heap-independent (100 poisoned attempts)");
+    printf("dead-id decode determinism survived (%d dead ids)\n", dead);
+    free(enc);
+    mod_free(m);
+}
+
 int main(void) {
+    test_decode_dead_ids();
     Module *m = build_varied();
     const char *e = mod_verify(m);
     if (e) { printf("ORIGINAL verify: %s\n", e); mod_dump(m, stdout); }
