@@ -4181,6 +4181,578 @@ static void opt_share_range_subs(Func *f, OptStats *st) {
     free(sole);
 }
 
+/* ================= WP37-C: place-value digit groups =================
+ * Reassociated Horner evaluation over digit runs.
+ *
+ * WP37-B's post-mortem (wp37b/GATES.md) measured why a plain x4 unroll
+ * of the parse loop cannot win on this host: the per-byte recurrence
+ * cur = cur*10 + d is ONE serial dependency chain, and the loop is
+ * front-end/alignment bound, so cutting instructions per byte without
+ * creating independent work just re-enters the same layout lottery.
+ * This pass changes the arithmetic structure instead. When a group of
+ * G consecutive bytes are all digits, the group is evaluated as a
+ * polynomial with a pair tree --
+ *   group = (d0*B + d1)*B^2 + (d2*B + d3)        (G = 4, B = base)
+ * -- whose two half-chains are independent of each other and of the
+ * accumulator until one final combine, and the accumulator advances
+ * once per group: acc' = acc * B^G + group. The serial chain per byte
+ * drops from (mul+add) to (mul+add)/G.
+ *
+ * Exactness: the transform is polynomial evaluation reassociated in
+ * the ring Z/2^64. Wrapping u64 add/mul are associative, commutative
+ * and distributive, so Horner reassociation is bit-exact for every
+ * input, including digit runs long enough to overflow (the rig in
+ * wp37c-gates hammers 25- and 40-digit runs). No approximation, no
+ * fast-math-style license: the same identity the interpreter computes,
+ * associated differently.
+ *
+ * Shape admitted (the safety line sits exactly here). A loop header H
+ * (condbr on icmp.slt ind, bound; ind an i64 H parameter) whose true
+ * edge reaches a byte-test block B and a digit block D:
+ *   - B has H as its only predecessor, D has B as its only one.
+ *   - B contains only iconsts and: one gep (i8 element) indexed by
+ *     the loop index, one i8 load through it, one zext to i64, one
+ *     sub ve-O (the digit value dv), one icmp.ule dv, R; its condbr
+ *     sends the true edge to D. (This is the canonical range-folded
+ *     form opt_share_range_subs produces, which is why this pass runs
+ *     after it.)
+ *   - D contains only iconsts and: acc2 = acc*B + dv (one mul by an
+ *     iconst B, one add), ind2 = ind + 1 (one add), and an
+ *     unconditional br back to H passing acc2 / ind2 in the acc / ind
+ *     slots. The mul constant must equal R+1 (the digit base the
+ *     range test admits) and B^G must fit comfortably in i64.
+ *   - Every other H slot on D's back edge translates (through the
+ *     B/D parameter plumbing) to a value visible from B, so the group
+ *     block can pass exactly what D passes.
+ *   - Index monotonicity, needed for the bounds check to be exact:
+ *     ind's one outside (entry) edge argument is an iconst >= 0 and
+ *     every back edge delivers ind unchanged or ind + (iconst >= 0),
+ *     with ind's "view" in each source block resolvable through
+ *     unique-predecessor parameter plumbing. Then ind >= 0 always,
+ *     and with ind < bound on the body edge, bound - ind is exact in
+ *     i64 (no wrap), so "bound - ind >= G" decides precisely whether
+ *     bytes ind..ind+G-1 are in bounds.
+ *
+ * Transform: B's digit edge is redirected to a bounds block
+ * (bound - ind >= G, else fall through to D unchanged), then a chain
+ * of per-position digit tests for bytes ind+1 .. ind+G-1 (any failure
+ * falls through to D, the original single-step block, with the exact
+ * arguments B used to pass). The group block runs only when all G
+ * bytes are proven digits and in bounds; it evaluates the pair tree
+ * from dv (byte ind's digit value, already computed in B) and the
+ * chain's digit values, folds it into acc, advances ind by G, and
+ * branches to H with D's own slot values everywhere else. Delimiters
+ * at any group position, end-of-input at any position, empty runs and
+ * run-exit flushing are all handled by the untouched original blocks:
+ * the group path is a pure shortcut over a state the scalar loop
+ * would have reached byte by byte. */
+
+#ifndef DG_GROUP
+#define DG_GROUP 4
+#endif
+
+static void dg_push(Block *b, Instr in) {
+    if (b->nins + 1 > b->cap) {
+        b->cap = b->cap ? b->cap * 2 : 8;
+        b->ins = realloc(b->ins, sizeof(Instr) * (size_t)b->cap);
+    }
+    b->ins[b->nins++] = in;
+}
+
+static int dg_new_iconst(Func *f, Block *b, int64_t v) {
+    Instr in = ins_iconst(ty_i64(), v);
+    in.result = lr_new_value(f, ty_i64());
+    f->isconst[in.result] = 1;
+    f->cval[in.result] = (uint64_t)v;
+    dg_push(b, in);
+    return in.result;
+}
+
+static int dg_new_bin(Func *f, Block *b, uint8_t op, int a, int bb) {
+    Instr in = ins_bin(op, ty_i64(), a, bb);
+    in.result = lr_new_value(f, ty_i64());
+    dg_push(b, in);
+    return in.result;
+}
+
+/* number of terminator edges (br counts once, condbr per matching
+ * target) from any block to block X */
+static int dg_pred_edges(Func *f, int X) {
+    int n = 0;
+    for (int q = 0; q < f->nblocks; q++) {
+        Block *qb = &f->blocks[q];
+        if (qb->nins < 1) continue;
+        Instr *t = &qb->ins[qb->nins - 1];
+        if (t->op == OP_BR && t->blk == X) n++;
+        else if (t->op == OP_CONDBR) {
+            if (t->blk == X) n++;
+            if (t->blk2 == X) n++;
+        }
+    }
+    return n;
+}
+
+/* translate value v from block X's scope to predecessor P's scope
+ * along the edge P -> X: if v is one of X's parameters, the value P
+ * passes for it; otherwise v itself (an outer value visible in both).
+ * Returns -1 if the edge cannot be found. */
+static int dg_to_pred_scope(Func *f, int X, int P, int v) {
+    Block *xb = &f->blocks[X];
+    for (int t = 0; t < xb->nargs; t++) {
+        if (xb->arg_vals[t] == v) {
+            Block *pb = &f->blocks[P];
+            if (pb->nins < 1) return -1;
+            Instr *pt = &pb->ins[pb->nins - 1];
+            if (pt->op == OP_BR && pt->blk == X) return pt->args[t];
+            if (pt->op == OP_CONDBR && pt->blk == X) return pt->args[t];
+            if (pt->op == OP_CONDBR && pt->blk2 == X) return pt->args2[t];
+            return -1;
+        }
+    }
+    return v;
+}
+
+/* the value in H's scope that B-scope value v corresponds to along
+ * the H -> B edge (inverse direction of dg_to_pred_scope usage:
+ * B params map to the H edge arguments) */
+static int dg_b_to_h_scope(Func *f, int h, int b, int v) {
+    return dg_to_pred_scope(f, b, h, v);
+}
+
+/* the B-scope view of an H-scope value v: if B takes parameters and
+ * the H -> B edge passes v for some parameter, that parameter;
+ * otherwise v itself (it dominates H, hence B). */
+static int dg_h_to_b_scope(Func *f, int h, int b, int v) {
+    Block *B = &f->blocks[b];
+    Block *H = &f->blocks[h];
+    if (B->nargs > 0) {
+        Instr *ht = &H->ins[H->nins - 1];
+        for (int t = 0; t < B->nargs; t++)
+            if (ht->args[t] == v) return B->arg_vals[t];
+    }
+    return v;
+}
+
+/* ind as seen inside block X, resolved through unique-predecessor
+ * parameter plumbing back to H's ind parameter; -1 if unresolvable */
+static int dg_indview(Func *f, int h, int si, int X, int depth) {
+    if (depth > 32) return -1;
+    if (X == h) return f->blocks[h].arg_vals[si];
+    int P = -1, cnt = 0;
+    int32_t *ea = NULL;
+    for (int q = 0; q < f->nblocks; q++) {
+        Block *qb = &f->blocks[q];
+        if (qb->nins < 1) continue;
+        Instr *t = &qb->ins[qb->nins - 1];
+        if (t->op == OP_BR && t->blk == X) { cnt++; P = q; ea = t->args; }
+        else if (t->op == OP_CONDBR) {
+            if (t->blk == X) { cnt++; P = q; ea = t->args; }
+            if (t->blk2 == X) { cnt++; P = q; ea = t->args2; }
+        }
+    }
+    if (cnt != 1 || P < 0) return -1;
+    Block *xb = &f->blocks[X];
+    if (xb->nargs == 0) return dg_indview(f, h, si, P, depth + 1);
+    int pv = dg_indview(f, h, si, P, depth + 1);
+    if (pv < 0) return -1;
+    for (int t = 0; t < xb->nargs; t++)
+        if (ea[t] == pv) return xb->arg_vals[t];
+    return -1;
+}
+
+/* Emit into block blk the combine for a proven digit prefix of
+ * length k: pair-tree over dvs[0..k-1], acc' = accB * Mc^k + tree,
+ * ind' = gidx + k, then br to h. Slots other than si/sa come from
+ * tmpl (B-scope values); slots flagged in reconst_is are recreated
+ * as iconsts inside blk (their originals live inside D). */
+static void dg_emit_combine(Func *f, int blk, const int *dvs, int k, int64_t Mc,
+                            int accB, int gidx, int h, int si, int sa,
+                            const int32_t *tmpl, const uint8_t *reconst_is,
+                            const int64_t *reconst) {
+    Block *GR = &f->blocks[blk];
+    int hnargs = f->blocks[h].nargs;
+    int32_t *args = malloc(sizeof(int32_t) * (size_t)hnargs);
+    for (int j = 0; j < hnargs; j++) {
+        if (j == si || j == sa) { args[j] = -1; continue; }
+        args[j] = reconst_is[j] ? dg_new_iconst(f, GR, reconst[j]) : tmpl[j];
+    }
+    int vals[8], lens[8], cnt = k;
+    for (int i = 0; i < k; i++) { vals[i] = dvs[i]; lens[i] = 1; }
+    while (cnt > 1) {
+        int w = 0;
+        for (int i = 0; i + 1 < cnt; i += 2) {
+            int64_t pw = 1;
+            for (int e = 0; e < lens[i + 1]; e++) pw *= Mc;
+            int wc = dg_new_iconst(f, GR, pw);
+            int m = dg_new_bin(f, GR, OP_MUL, vals[i], wc);
+            int s = dg_new_bin(f, GR, OP_ADD, m, vals[i + 1]);
+            vals[w] = s; lens[w] = lens[i] + lens[i + 1]; w++;
+        }
+        if (cnt % 2) { vals[w] = vals[cnt - 1]; lens[w] = lens[cnt - 1]; w++; }
+        cnt = w;
+    }
+    int64_t pwG = 1;
+    for (int e = 0; e < k; e++) pwG *= Mc;
+    int wcG = dg_new_iconst(f, GR, pwG);
+    int am = dg_new_bin(f, GR, OP_MUL, accB, wcG);
+    int accnew = dg_new_bin(f, GR, OP_ADD, am, vals[0]);
+    int cG = dg_new_iconst(f, GR, k);
+    int indnew = dg_new_bin(f, GR, OP_ADD, gidx, cG);
+    args[si] = indnew;
+    args[sa] = accnew;
+    Instr br = ins_br(h, args, hnargs);
+    dg_push(GR, br);
+}
+
+static bool dg_try(Func *f, int h, OptStats *st) {
+    const int G = DG_GROUP;
+    Block *H = &f->blocks[h];
+    if (H->nins != 2 || H->nargs < 3) return false;
+    Instr *icmp = &H->ins[0];
+    Instr *ht = &H->ins[1];
+    if (icmp->op != OP_ICMP || icmp->pred != IC_SLT || icmp->result < 0) return false;
+    if (ht->op != OP_CONDBR || ht->a != icmp->result) return false;
+    int si = -1;
+    for (int j = 0; j < H->nargs; j++) if (H->arg_vals[j] == icmp->a) si = j;
+    if (si < 0) return false;
+    if (H->arg_types[si].kind != TY_INT || H->arg_types[si].bits != 64) return false;
+    int bound = icmp->b;
+    int b = ht->blk, x = ht->blk2;
+    if (b < 0 || b >= f->nblocks || b == h) return false;
+    if (x < 0 || x >= f->nblocks || x == h || x == b) return false;
+    if (dg_pred_edges(f, b) != 1) return false;
+    Block *B = &f->blocks[b];
+    if (B->nins < 2) return false;
+    Instr *bt = &B->ins[B->nins - 1];
+    if (bt->op != OP_CONDBR) return false;
+
+    /* ---- scan B: the canonical byte test ---- */
+    int gep_res = -1, load_res = -1, ve = -1, dv = -1, test = -1;
+    int ptrB = -1, gidx = -1, d = -1;
+    int64_t offO = 0, rngR = 0;
+    int n_gep = 0, n_load = 0, n_zext = 0, n_sub = 0, n_icmp = 0;
+    for (int i = 0; i < B->nins - 1; i++) {
+        Instr *in = &B->ins[i];
+        switch (in->op) {
+        case OP_ICONST: break;
+        case OP_GEP:
+            n_gep++;
+            if (in->ety.kind == TY_INT && in->ety.bits == 8) {
+                gep_res = in->result; ptrB = in->a; gidx = in->b;
+            }
+            break;
+        case OP_LOAD:
+            n_load++;
+            if (in->ty.kind == TY_INT && in->ty.bits == 8) load_res = in->result;
+            break;
+        case OP_ZEXT:
+            n_zext++;
+            if (in->ty.kind == TY_INT && in->ty.bits == 64) ve = in->result;
+            break;
+        case OP_SUB:
+            n_sub++;
+            if (in->ty.kind == TY_INT && in->ty.bits == 64) {
+                int64_t o;
+                if (opt_find_iconst(f, in->b, &o)) { dv = in->result; offO = o; }
+            }
+            break;
+        case OP_ICMP:
+            n_icmp++;
+            if (in->pred == IC_ULE) {
+                int64_t r;
+                if (opt_find_iconst(f, in->b, &r)) { test = in->result; rngR = r; }
+            }
+            break;
+        default: return false;
+        }
+    }
+    if (n_gep != 1 || n_load != 1 || n_zext != 1 || n_sub != 1 || n_icmp != 1) return false;
+    if (gep_res < 0 || load_res < 0 || ve < 0 || dv < 0 || test < 0) return false;
+    /* chain integrity: load(gep), zext(load), sub(zext), icmp(sub) */
+    {
+        Instr *ld = NULL, *zx = NULL, *sb = NULL, *ic = NULL;
+        for (int i = 0; i < B->nins - 1; i++) {
+            Instr *in = &B->ins[i];
+            if (in->result == load_res) ld = in;
+            if (in->result == ve) zx = in;
+            if (in->result == dv) sb = in;
+            if (in->result == test) ic = in;
+        }
+        if (!ld || ld->a != gep_res) return false;
+        if (!zx || zx->a != load_res) return false;
+        if (!sb || sb->a != ve) return false;
+        if (!ic || ic->a != dv) return false;
+        if (bt->a != test) return false;
+    }
+    d = bt->blk;
+    if (d < 0 || d >= f->nblocks || d == h || d == b) return false;
+    if (bt->blk2 == d) return false;
+    if (dg_pred_edges(f, d) != 1) return false;
+    if (dg_b_to_h_scope(f, h, b, gidx) != icmp->a) return false;
+
+    /* ---- scan D: the digit step ---- */
+    Block *D = &f->blocks[d];
+    if (D->nins < 2) return false;
+    Instr *dt = &D->ins[D->nins - 1];
+    if (dt->op != OP_BR || dt->blk != h || dt->nargs != H->nargs) return false;
+    int mul_res = -1, acc2 = -1, accD = -1;
+    int64_t Mc = 0;
+    int n_mul = 0, n_add = 0;
+    Instr *adds[2] = { NULL, NULL };
+    for (int i = 0; i < D->nins - 1; i++) {
+        Instr *in = &D->ins[i];
+        switch (in->op) {
+        case OP_ICONST: break;
+        case OP_MUL: {
+            n_mul++;
+            if (in->ty.kind != TY_INT || in->ty.bits != 64) return false;
+            int64_t mc;
+            if (opt_find_iconst(f, in->b, &mc)) { mul_res = in->result; accD = in->a; Mc = mc; }
+            else if (opt_find_iconst(f, in->a, &mc)) { mul_res = in->result; accD = in->b; Mc = mc; }
+            break;
+        }
+        case OP_ADD:
+            if (n_add < 2) adds[n_add] = in;
+            n_add++;
+            break;
+        default: return false;
+        }
+    }
+    if (n_mul != 1 || n_add != 2 || mul_res < 0 || accD < 0) return false;
+    /* acc add: combines mul result with B's digit value */
+    for (int i = 0; i < 2; i++) {
+        Instr *ad = adds[i];
+        int o1 = dg_to_pred_scope(f, d, b, ad->a);
+        int o2 = dg_to_pred_scope(f, d, b, ad->b);
+        if ((ad->a == mul_res && o2 == dv) || (ad->b == mul_res && o1 == dv))
+            acc2 = ad->result;
+    }
+    if (acc2 < 0) return false;
+    /* ind add: result feeds slot si; base is the byte index, step 1 */
+    int indadd_res = -1;
+    for (int i = 0; i < 2; i++) {
+        Instr *ad = adds[i];
+        if (ad->result != dt->args[si]) continue;
+        int o1 = dg_to_pred_scope(f, d, b, ad->a);
+        int o2 = dg_to_pred_scope(f, d, b, ad->b);
+        int64_t k1, k2;
+        if (o1 == gidx && opt_find_iconst(f, ad->b, &k1)) { if (k1 == 1) indadd_res = ad->result; }
+        if (o2 == gidx && opt_find_iconst(f, ad->a, &k2)) { if (k2 == 1) indadd_res = ad->result; }
+    }
+    if (indadd_res < 0) return false;
+    /* acc slot: D's back edge passes acc2 in exactly one slot, and the
+     * mul operand chain resolves to that slot's H parameter */
+    int sa = -1;
+    for (int j = 0; j < H->nargs; j++) if (dt->args[j] == acc2) sa = j;
+    if (sa < 0 || sa == si) return false;
+    int accB = dg_to_pred_scope(f, d, b, accD);
+    if (accB < 0) return false;
+    if (dg_b_to_h_scope(f, h, b, accB) != H->arg_vals[sa]) return false;
+    /* base consistency: mul constant == admitted digit range + 1 */
+    if (Mc != rngR + 1 || rngR < 1) return false;
+    /* B^G must stay well inside i64 */
+    {
+        __int128 p = 1;
+        for (int i = 0; i < G; i++) { p *= Mc; if (p >= ((__int128)1 << 62)) return false; }
+    }
+    /* ---- group-block arguments for every other slot ---- */
+    int hn = H->nargs;
+    int32_t *gargs = malloc(sizeof(int32_t) * (size_t)hn);
+    int64_t *greconst = malloc(sizeof(int64_t) * (size_t)hn);
+    uint8_t *greconst_is = calloc((size_t)hn, 1);
+    /* defblk table (value -> defining block), for the slot checks */
+    int nv = f->nvalues > 0 ? f->nvalues : 1;
+    int *defblk = malloc(sizeof(int) * (size_t)nv);
+    for (int v = 0; v < nv; v++) defblk[v] = -1;
+    for (int bi = 0; bi < f->nblocks; bi++) {
+        Block *bl = &f->blocks[bi];
+        for (int k = 0; k < bl->nargs; k++)
+            if (bl->arg_vals[k] >= 0 && bl->arg_vals[k] < nv) defblk[bl->arg_vals[k]] = bi;
+        for (int i = 0; i < bl->nins; i++)
+            if (bl->ins[i].result >= 0 && bl->ins[i].result < nv) defblk[bl->ins[i].result] = bi;
+    }
+    for (int j = 0; j < hn; j++) {
+        if (j == si || j == sa) continue;
+        int vB = dg_to_pred_scope(f, d, b, dt->args[j]);
+        if (vB < 0) { free(gargs); free(greconst); free(greconst_is); free(defblk); return false; }
+        int db = (vB >= 0 && vB < nv) ? defblk[vB] : -1;
+        if (db == d) {
+            /* defined inside D: only an iconst may be recreated */
+            int64_t cv;
+            if (!opt_find_iconst(f, vB, &cv)) { free(gargs); free(greconst); free(greconst_is); free(defblk); return false; }
+            greconst_is[j] = 1; greconst[j] = cv; gargs[j] = -1;
+        } else {
+            gargs[j] = vB;
+        }
+    }
+    free(defblk);
+
+    /* ---- region + index monotonicity ---- */
+    {
+        int nb = f->nblocks;
+        uint8_t *region = calloc((size_t)nb, 1);
+        int *stack = malloc(sizeof(int) * (size_t)nb);
+        int sp = 0;
+        region[b] = 1; stack[sp++] = b;
+        while (sp > 0) {
+            int q = stack[--sp];
+            Block *qb = &f->blocks[q];
+            if (qb->nins < 1) continue;
+            Instr *t = &qb->ins[qb->nins - 1];
+            int tg[2], nt = 0;
+            if (t->op == OP_BR) tg[nt++] = t->blk;
+            else if (t->op == OP_CONDBR) { tg[nt++] = t->blk; tg[nt++] = t->blk2; }
+            for (int i = 0; i < nt; i++) {
+                int u = tg[i];
+                if (u >= 0 && u < nb && u != h && !region[u]) { region[u] = 1; stack[sp++] = u; }
+            }
+        }
+        free(stack);
+        /* exactly one outside edge into H, carrying an iconst >= 0 */
+        int outside = 0;
+        bool ok = true;
+        for (int q = 0; q < nb && ok; q++) {
+            if (q == h || region[q]) continue;
+            Block *qb = &f->blocks[q];
+            if (qb->nins < 1) continue;
+            Instr *t = &qb->ins[qb->nins - 1];
+            int32_t *ea = NULL;
+            if (t->op == OP_BR && t->blk == h) ea = t->args;
+            else if (t->op == OP_CONDBR && t->blk == h) ea = t->args;
+            else if (t->op == OP_CONDBR && t->blk2 == h) ea = t->args2;
+            if (ea) {
+                outside++;
+                int64_t iv0;
+                if (!opt_find_iconst(f, ea[si], &iv0) || iv0 < 0) ok = false;
+            }
+        }
+        if (!ok || outside != 1) { free(region); free(gargs); free(greconst); free(greconst_is); return false; }
+        /* every back edge: ind unchanged or ind + (iconst >= 0) */
+        for (int q = 0; q < nb && ok; q++) {
+            if (!region[q]) continue;
+            Block *qb = &f->blocks[q];
+            if (qb->nins < 1) continue;
+            Instr *t = &qb->ins[qb->nins - 1];
+            int32_t *ea = NULL;
+            if (t->op == OP_BR && t->blk == h) ea = t->args;
+            else if (t->op == OP_CONDBR && t->blk == h) ea = t->args;
+            else if (t->op == OP_CONDBR && t->blk2 == h) ea = t->args2;
+            if (!ea) continue;
+            int iv = dg_indview(f, h, si, q, 0);
+            if (iv < 0) { ok = false; break; }
+            int av = ea[si];
+            if (av == iv) continue;
+            Instr *ad = NULL;
+            for (int i = 0; i < qb->nins - 1; i++)
+                if (qb->ins[i].result == av) { ad = &qb->ins[i]; break; }
+            if (!ad || ad->op != OP_ADD) { ok = false; break; }
+            int64_t kk;
+            bool good = (ad->a == iv && opt_find_iconst(f, ad->b, &kk) && kk >= 0) ||
+                        (ad->b == iv && opt_find_iconst(f, ad->a, &kk) && kk >= 0);
+            if (!good) { ok = false; break; }
+        }
+        free(region);
+        if (!ok) { free(gargs); free(greconst); free(greconst_is); return false; }
+    }
+
+    /* ---- snapshot what the transform needs (indices + value ids) ---- */
+    int boundB = dg_h_to_b_scope(f, h, b, bound);
+    int32_t *d_edge_args = ids_dup(bt->args, bt->nargs);
+    int d_edge_n = bt->nargs;
+
+    /* ---- create blocks: bounds, per-position checks, group ----
+     * Fail edges of the checks at position k >= 2 go to PARTIAL blocks,
+     * not back to the scalar step: bytes ind..ind+k-1 are already
+     * proven digits, so the partial block folds exactly those k digits
+     * with the same polynomial identity (acc * B^k + poly_k) and
+     * rejoins the header. A failed speculation thus still does
+     * grouped work instead of one scalar step plus a retried full
+     * check at the next position -- on run tails (the common case:
+     * runs are rarely multiples of G) this is the difference between
+     * the transform paying for its checks and not. Position k == 1
+     * fails to D itself: a 1-digit partial IS the scalar step. */
+    int cb = func_add_block(f, NULL, 0);
+    int ck[8];
+    for (int k = 1; k < G; k++) ck[k] = func_add_block(f, NULL, 0);
+    int part[8];
+    for (int k = 2; k < G; k++) part[k] = func_add_block(f, NULL, 0);
+    int grp = func_add_block(f, NULL, 0);
+
+    /* bounds block: bound - ind >= G ? first check : D (original args) */
+    {
+        Block *CB = &f->blocks[cb];
+        int rem = dg_new_bin(f, CB, OP_SUB, boundB, gidx);
+        int cG = dg_new_iconst(f, CB, G);
+        Instr ein = ins_make(OP_ICMP, ty_i1());
+        ein.a = rem; ein.b = cG; ein.pred = IC_SGE;
+        ein.result = lr_new_value(f, ty_i1());
+        dg_push(CB, ein);
+        Instr tin = ins_condbr(ein.result, ck[1], NULL, 0,
+                               d, ids_dup(d_edge_args, d_edge_n), d_edge_n);
+        dg_push(CB, tin);
+    }
+    /* per-position digit checks for bytes ind+1 .. ind+G-1 */
+    int dvs[8];
+    dvs[0] = dv;
+    for (int k = 1; k < G; k++) {
+        Block *CK = &f->blocks[ck[k]];
+        int next = (k + 1 < G) ? ck[k + 1] : grp;
+        int ck_k = dg_new_iconst(f, CK, k);
+        int idxk = dg_new_bin(f, CK, OP_ADD, gidx, ck_k);
+        Instr gep = ins_make(OP_GEP, ty_ptr());
+        gep.a = ptrB; gep.b = idxk; gep.ety = ty_i8();
+        gep.result = lr_new_value(f, ty_ptr());
+        dg_push(CK, gep);
+        Instr ld = ins_make(OP_LOAD, ty_i8());
+        ld.a = gep.result;
+        ld.result = lr_new_value(f, ty_i8());
+        dg_push(CK, ld);
+        Instr zx = ins_un(OP_ZEXT, ty_i64(), ld.result);
+        zx.result = lr_new_value(f, ty_i64());
+        dg_push(CK, zx);
+        int ok_c = dg_new_iconst(f, CK, offO);
+        int dvk = dg_new_bin(f, CK, OP_SUB, zx.result, ok_c);
+        int rk_c = dg_new_iconst(f, CK, rngR);
+        Instr ein = ins_make(OP_ICMP, ty_i1());
+        ein.a = dvk; ein.b = rk_c; ein.pred = IC_ULE;
+        ein.result = lr_new_value(f, ty_i1());
+        dg_push(CK, ein);
+        dvs[k] = dvk;
+        int failt = (k >= 2) ? part[k] : d;
+        Instr tin = ins_condbr(ein.result, next, NULL, 0,
+                               failt, failt == d ? ids_dup(d_edge_args, d_edge_n) : NULL,
+                               failt == d ? d_edge_n : 0);
+        dg_push(CK, tin);
+    }
+    /* partial combines for proven prefixes of length 2..G-1, then the
+     * full group combine */
+    for (int k = 2; k < G; k++)
+        dg_emit_combine(f, part[k], dvs, k, Mc, accB, gidx, h, si, sa,
+                        gargs, greconst_is, greconst);
+    dg_emit_combine(f, grp, dvs, G, Mc, accB, gidx, h, si, sa,
+                    gargs, greconst_is, greconst);
+    /* rewire B's digit edge to the bounds block */
+    {
+        Block *Bn = &f->blocks[b];
+        Instr *btn = &Bn->ins[Bn->nins - 1];
+        btn->blk = cb;
+        btn->args = NULL;
+        btn->nargs = 0;
+    }
+    free(d_edge_args);
+    free(gargs); free(greconst); free(greconst_is);
+    st->rewritten++;
+    if (getenv("DG_DEBUG"))
+        fprintf(stderr, "dg: fired in %s block %d G=%d\n", f->name, h, G);
+    return true;
+}
+
+static void opt_digit_groups(Func *f, OptStats *st) {
+    int nb0 = f->nblocks;
+    for (int h = 0; h < nb0; h++)
+        dg_try(f, h, st);
+}
+
 void opt_optimize(Module *m, const Cost *cost, OptStats *st) {
     OptStats local = { 0, 0, 0, 0 };
     if (!st) st = &local;
@@ -4218,6 +4790,11 @@ void opt_optimize(Module *m, const Cost *cost, OptStats *st) {
          * on block-argument identity, and nothing after it pattern-matches
          * the load/extract shapes it removes). */
         opt_fextract(f, st);
+        /* WP37-C: place-value digit groups; runs last, on the final
+         * block structure — it pattern-matches the range-folded byte
+         * test opt_share_range_subs produces, and nothing after it
+         * pattern-matches block structure. */
+        opt_digit_groups(f, st);
     }
     const char *ve = mod_verify(m);
     if (ve && snap) {
