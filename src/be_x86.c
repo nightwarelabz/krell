@@ -1892,10 +1892,76 @@ static void emit_instr(Ctx *c, int bi, int ii) {
         store_gp(c, in->result, R11);
         break;
     case OP_GEP: {
-        load_gp(c, R11, in->a);
         int esz = (int)mem_size_of(in->ety, c->vl);
         int64_t imm;
-        if (be_iconst_val(f, in->b, &imm)) {
+        bool idx_const = be_iconst_val(f, in->b, &imm);
+        /* WP39: direct-LEA GEP emission. When the result has a GP
+         * register home and the base is register-resident, the address
+         * is computed by a single lea into the result home, reading the
+         * base and index from their own homes -- replacing the legacy
+         * staging sequence (load base into R11, load index into RAX,
+         * lea into R11, store R11 into the result home: 4 instructions
+         * for what lea does in 1). The legacy sequence remains for
+         * every shape this does not provably cover: stack-homed result
+         * or base, chain-skipped index (WP36 discipline: its root is
+         * materialized by the legacy path), non-power-of-two element
+         * size with a variable index, an index that must be staged
+         * through RAX while the base or the result home is RAX (the
+         * staging would clobber an operand or the destination), and a
+         * constant displacement that does not fit a lea disp32.
+         * The clobber model is unchanged: OP_GEP still claims XB_RAX
+         * for a variable index, which the RAX-staging subpath below
+         * honours, and the blessings (base/index may live in RAX)
+         * stay sound because lea reads both operands before writing
+         * its destination, and the staging subpath is refused when
+         * either the base or the destination is RAX. */
+        {
+            Loc *dl = &c->bf->loc[in->result];
+            Loc *al = &c->bf->loc[in->a];
+            int dreg = (dl->is_reg && dl->cls == BCLS_GP) ? dl->idx : -1;
+            bool a_reg = al->is_reg && al->cls == BCLS_GP;
+            bool idx_chain = !idx_const && c->chain_skip && in->b >= 0 &&
+                             in->b < f->nvalues && c->chain_skip[in->b];
+            if (dreg >= 0 && a_reg && !idx_chain) {
+                const char *basereg = G64[al->idx];
+                if (idx_const) {
+                    int64_t disp = imm * (int64_t)esz;
+                    if (imm >= INT32_MIN / (esz ? esz : 1) &&
+                        imm <= INT32_MAX / (esz ? esz : 1)) {
+                        if (disp == 0) {
+                            if (dreg != al->idx)
+                                E(c, "  mov %s, %s", G64[dreg], basereg);
+                        } else if (disp > 0) {
+                            E(c, "  lea %s, [%s + %lld]", G64[dreg], basereg,
+                              (long long)disp);
+                        } else {
+                            E(c, "  lea %s, [%s - %lld]", G64[dreg], basereg,
+                              (long long)-disp);
+                        }
+                        break;
+                    }
+                } else if (esz == 1 || esz == 2 || esz == 4 || esz == 8) {
+                    Loc *bl = &c->bf->loc[in->b];
+                    Type it2 = f->vtypes[in->b];
+                    if (bl->is_reg && bl->cls == BCLS_GP && it2.bits == 64) {
+                        E(c, "  lea %s, [%s + %s*%d]", G64[dreg], basereg,
+                          G64[bl->idx], esz);
+                        break;
+                    }
+                    if (dreg != RAX && al->idx != RAX) {
+                        load_gp(c, RAX, in->b);
+                        if (it2.bits < 64) {
+                            E(c, "  shl rax, %d", 64 - it2.bits);
+                            E(c, "  sar rax, %d", 64 - it2.bits);
+                        }
+                        E(c, "  lea %s, [%s + rax*%d]", G64[dreg], basereg, esz);
+                        break;
+                    }
+                }
+            }
+        }
+        load_gp(c, R11, in->a);
+        if (idx_const) {
             if (imm * esz != 0) E(c, "  add r11, %lld", (long long)(imm * esz));
         } else {
             if (c->chain_skip && in->b >= 0 && in->b < f->nvalues && c->chain_skip[in->b]) {

@@ -448,6 +448,81 @@ int main(void) {
             mod_free(dm);
         }
     }
+    /* GEP element type is part of a GEP's identity (WP-GEPETY
+     * regression): two GEPs with the same base and index but different
+     * element types compute DIFFERENT addresses. The builder once
+     * hash-consed them into a single GEP — ety was missing from the
+     * hash-cons identity in ir.c — rewiring the second load to the
+     * first GEP's address. This case must go through surface_parse:
+     * the bug lives in the surface->IR builder path and the IR-built
+     * battery cannot see it. Image pattern: byte k = 0x10 + k,
+     * little-endian loads.
+     *   gepety(j=3):     v16 = bytes 6..7 = 5910, v8 = byte 3 = 19
+     *                    -> 5910*1000 + 19 = 5910019
+     *                    (buggy build: 5910022 — i8 load read byte 6)
+     *   gepety_rev(j=3): same addresses, GEPs in the opposite order
+     *                    -> 5910019 (buggy build: 5139019)
+     *   gepety3264(j=2): v32 = bytes 8..11 = 454695192, low halfword
+     *                    of the i64 load = bytes 16..17 = 8480
+     *                    -> 454695192*100000 + 8480 = 45469519208480
+     *                    (buggy build: 45469519206424) */
+    {
+        static const char *GEPETY =
+        "fn gepety(ptr, i64) -> i64 {\n"
+        "  entry(p: ptr, j: i64):\n"
+        "    %g16 = gep i16 p, j\n"
+        "    %v16 = load i16, %g16\n"
+        "    %e16 = zext i64 %v16\n"
+        "    %g8 = gep i8 p, j\n"
+        "    %v8 = load i8, %g8\n"
+        "    %e8 = zext i64 %v8\n"
+        "    %hi = mul i64 %e16, 1000\n"
+        "    %r = add i64 %hi, %e8\n"
+        "    ret %r\n"
+        "}\n"
+        "fn gepety_rev(ptr, i64) -> i64 {\n"
+        "  entry(p: ptr, j: i64):\n"
+        "    %g8 = gep i8 p, j\n"
+        "    %v8 = load i8, %g8\n"
+        "    %e8 = zext i64 %v8\n"
+        "    %g16 = gep i16 p, j\n"
+        "    %v16 = load i16, %g16\n"
+        "    %e16 = zext i64 %v16\n"
+        "    %hi = mul i64 %e16, 1000\n"
+        "    %r = add i64 %hi, %e8\n"
+        "    ret %r\n"
+        "}\n"
+        "fn gepety3264(ptr, i64) -> i64 {\n"
+        "  entry(p: ptr, j: i64):\n"
+        "    %g32 = gep i32 p, j\n"
+        "    %v32 = load i32, %g32\n"
+        "    %e32 = zext i64 %v32\n"
+        "    %g64 = gep i64 p, j\n"
+        "    %v64 = load i64, %g64\n"
+        "    %lo = and i64 %v64, 65535\n"
+        "    %hi = mul i64 %e32, 100000\n"
+        "    %r = add i64 %hi, %lo\n"
+        "    ret %r\n"
+        "}\n";
+        Module *gm = surface_parse(GEPETY, err, sizeof err);
+        if (!gm) { printf("FAIL gepety parse: %s\n", err); failures++; }
+        else {
+            const char *gve = mod_verify(gm);
+            if (gve) { printf("FAIL gepety verify: %s\n", gve); failures++; }
+            else {
+                Interp *git = interp_new(gm);
+                size_t gms; uint8_t *gmem = interp_mem(git, &gms);
+                uint64_t gbase = interp_alloc(git, 256, 16);
+                for (int k = 0; k < 64; k++) gmem[gbase + k] = (uint8_t)(0x10 + k);
+                (void)gms;
+                check(git, "gepety", (uint64_t[]){ gbase, 3 }, 2, 5910019);
+                check(git, "gepety_rev", (uint64_t[]){ gbase, 3 }, 2, 5910019);
+                check(git, "gepety3264", (uint64_t[]){ gbase, 2 }, 2, 45469519208480ull);
+                interp_free(git);
+            }
+            mod_free(gm);
+        }
+    }
     /* binary round-trip (the main PROG uses no v2 feature: version 1) */
     size_t blen; uint8_t *bytes = mod_encode(m, &blen);
     if (!bytes || bytes[4] != 1) { printf("FAIL: v1 module encoded as version %d\n", bytes ? bytes[4] : -1); failures++; }

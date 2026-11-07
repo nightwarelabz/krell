@@ -336,6 +336,12 @@ static uint64_t hash_ins(const Instr *in) {
     uint64_t h = 1469598103934665603ull;
     h = (h ^ (uint64_t)in->op) * 1099511628211ull;
     h = (h ^ (uint64_t)ty_pack(in->ty)) * 1099511628211ull;
+    /* WP-GEPETY: the element type is part of a GEP's identity — two GEPs
+     * with the same base and index but different ety compute different
+     * addresses and must never hash-cons to one value. ety is only
+     * semantically load-bearing for OP_GEP (see krell.h), but hashing
+     * it for every op keeps the identity complete by construction. */
+    h = (h ^ (uint64_t)ty_pack(in->ety)) * 1099511628211ull;
     h = (h ^ (uint64_t)(uint32_t)in->a) * 1099511628211ull;
     h = (h ^ (uint64_t)(uint32_t)in->b) * 1099511628211ull;
     h = (h ^ (uint64_t)(uint32_t)in->c) * 1099511628211ull;
@@ -349,6 +355,7 @@ static uint64_t hash_ins(const Instr *in) {
 }
 static bool ins_eq(const Instr *x, const Instr *y) {
     return x->op == y->op && ty_pack(x->ty) == ty_pack(y->ty) &&
+           ty_pack(x->ety) == ty_pack(y->ety) &&
            x->a == y->a && x->b == y->b && x->c == y->c &&
            x->imm == y->imm && x->imm2 == y->imm2 && x->pred == y->pred && x->aux == y->aux &&
            x->callee == y->callee && x->callee_extern == y->callee_extern;
