@@ -63,6 +63,7 @@ extern void memcpy_(void *, const void *, uint64_t);
 extern void memset_(void *, int32_t, uint64_t);
 extern int32_t vecext(const void *);
 extern int32_t gepneg(const void *);
+extern int64_t gepdirect(const void *, uint64_t, uint64_t);
 
 static uint64_t dbits(double d) { uint64_t b; memcpy(&b, &d, 8); return b; }
 static uint64_t fbits(float f) { uint32_t b; memcpy(&b, &f, 4); return b; }
@@ -210,6 +211,7 @@ static uint64_t run_bcase(const FInfo *fi, uint8_t *img, const uint64_t *args) {
     if (strcmp(fi->name, "memset_") == 0) { memset_(base + args[0], (int32_t)args[1], args[2]); return 0; }
     if (strcmp(fi->name, "vecext") == 0) return (uint64_t)(uint32_t)vecext(base + args[0]);
     if (strcmp(fi->name, "gepneg") == 0) return (uint64_t)(uint32_t)gepneg(base + args[0]);
+    if (strcmp(fi->name, "gepdirect") == 0) return (uint64_t)gepdirect(base + args[0], args[1], args[2]);
     printf("unknown B function %s\n", fi->name);
     failures++;
     return 0;

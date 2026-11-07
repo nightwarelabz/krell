@@ -1179,5 +1179,53 @@ Module *build_battery(void) {
         int w1 = B(f, b, OP_ADD, ty_i64(), u2, u3);
         emit(f, b, ins_ret(B(f, b, OP_ADD, ty_i64(), w0, w1)));
     }
+    /* 48 gepdirect(ptr p, i64 i, i64 j) -> i64 : WP39 direct-LEA GEP
+     * witness. Five GEPs off one register-resident base: a variable
+     * i64 index at esz 8 (reg/reg lea), the same index + 1 (an add
+     * the chain pass may skip -- the legacy materialization must stay
+     * correct), a constant index (lea disp form), an i32 index at
+     * esz 2 (RAX sign-extension staging form), and a variable index
+     * at esz 1. Indices are masked into [0,8) / [0,4) so every case
+     * stays inside the driver's 256-byte image. A staging-form GEP
+     * that swapped base/index, lost the sign extension, or wrote its
+     * result over a still-live operand reads the wrong cell here. */
+    {
+        Func *f = mod_add_func(m, "gepdirect", ty_i64(), 0);
+        int b = func_add_block(f, (Type[]){ ty_ptr(), ty_i64(), ty_i64() }, 3);
+        int p = ARG(f, b, 0), i = ARG(f, b, 1), j = ARG(f, b, 2);
+        int im = B(f, b, OP_AND, ty_i64(), i, K(f, b, ty_i64(), 7));
+        int jm = B(f, b, OP_AND, ty_i64(), j, K(f, b, ty_i64(), 3));
+        Instr g1 = ins_make(OP_GEP, ty_ptr()); g1.a = p; g1.b = im; g1.ety = ty_i64();
+        int gp1 = emit(f, b, g1);
+        Instr l1 = ins_make(OP_LOAD, ty_i64()); l1.a = gp1;
+        int v1 = emit(f, b, l1);
+        int ip1 = B(f, b, OP_ADD, ty_i64(), im, K(f, b, ty_i64(), 1));
+        Instr g2 = ins_make(OP_GEP, ty_ptr()); g2.a = p; g2.b = ip1; g2.ety = ty_i64();
+        int gp2 = emit(f, b, g2);
+        Instr l2 = ins_make(OP_LOAD, ty_i64()); l2.a = gp2;
+        int v2 = emit(f, b, l2);
+        Instr g3 = ins_make(OP_GEP, ty_ptr()); g3.a = p; g3.b = K(f, b, ty_i64(), 2); g3.ety = ty_i64();
+        int gp3 = emit(f, b, g3);
+        Instr l3 = ins_make(OP_LOAD, ty_i64()); l3.a = gp3;
+        int v3 = emit(f, b, l3);
+        int jt = U(f, b, OP_TRUNC, ty_i32(), jm);
+        Instr g4 = ins_make(OP_GEP, ty_ptr()); g4.a = p; g4.b = jt; g4.ety = ty_i16();
+        int gp4 = emit(f, b, g4);
+        Instr l4 = ins_make(OP_LOAD, ty_i16()); l4.a = gp4;
+        int v4 = U(f, b, OP_ZEXT, ty_i64(), emit(f, b, l4));
+        Instr g5 = ins_make(OP_GEP, ty_ptr()); g5.a = p; g5.b = im; g5.ety = ty_i8();
+        int gp5 = emit(f, b, g5);
+        Instr l5 = ins_make(OP_LOAD, ty_i8()); l5.a = gp5;
+        int v5 = U(f, b, OP_ZEXT, ty_i64(), emit(f, b, l5));
+        int s = B(f, b, OP_ADD, ty_i64(), v1,
+                  B(f, b, OP_MUL, ty_i64(), v2, K(f, b, ty_i64(), 3)));
+        s = B(f, b, OP_ADD, ty_i64(), s,
+              B(f, b, OP_MUL, ty_i64(), v3, K(f, b, ty_i64(), 5)));
+        s = B(f, b, OP_ADD, ty_i64(), s,
+              B(f, b, OP_MUL, ty_i64(), v4, K(f, b, ty_i64(), 7)));
+        s = B(f, b, OP_ADD, ty_i64(), s,
+              B(f, b, OP_MUL, ty_i64(), v5, K(f, b, ty_i64(), 11)));
+        emit(f, b, ins_ret(s));
+    }
     return m;
 }

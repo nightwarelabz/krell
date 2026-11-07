@@ -73,6 +73,7 @@ static const FSpec FUNCS[] = {
     { "memset_", 3, { AK_PTR, AK_GP, AK_GP }, RK_VOID },
     { "vecext",  1, { AK_PTR }, RK_GP },
     { "gepneg",  1, { AK_PTR }, RK_GP },
+    { "gepdirect", 3, { AK_PTR, AK_GP, AK_GP }, RK_GP },
     { "w128",    2, { AK_GP, AK_GP }, RK_GP },
     { "vtable",  2, { AK_GP, AK_GP }, RK_GP },
     { "alchk",   2, { AK_F64, AK_F64 }, RK_GP },
@@ -341,6 +342,8 @@ static void gen_cases(void) {
         push_bcase("vecext", (uint64_t[]){ 64 });
     for (int i = 0; i < 12; i++)
         push_bcase("gepneg", (uint64_t[]){ 64 });
+    for (int i = 0; i < 12; i++)
+        push_bcase("gepdirect", (uint64_t[]){ 64, rnd(), rnd() });
     (void)nscalar; (void)nbcases; (void)scalar_pos; (void)bcase_pos;
 }
 
